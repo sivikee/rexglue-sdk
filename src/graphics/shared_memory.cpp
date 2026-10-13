@@ -263,6 +263,8 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
 
+  OnRangeWrittenByGpu(start, length);
+
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true);
@@ -461,11 +463,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 
-  if (upload_ranges_.empty()) {
-    return true;
-  }
-
-  return UploadRanges(upload_ranges_);
+  bool uploaded = upload_ranges_.empty() || UploadRanges(upload_ranges_);
+  OnRangesRequested(merged_ranges);
+  return uploaded;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {

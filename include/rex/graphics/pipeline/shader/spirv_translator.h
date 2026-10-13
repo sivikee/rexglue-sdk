@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,6 +27,16 @@ namespace rex::graphics {
 
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
+  // Maximum number of control flow jumps per invocation before giving up on a
+  // (likely runaway) guest loop. OBLIVION_MAX_JUMPS overrides it (debugging).
+  static uint32_t GetMaxJumpCount() {
+    static const uint32_t max_jump_count = [] {
+      const char* env = std::getenv("OBLIVION_MAX_JUMPS");
+      return env ? uint32_t(std::strtoul(env, nullptr, 10)) : uint32_t(1024);
+    }();
+    return max_jump_count;
+  }
+
   union Modification {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
@@ -972,6 +983,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;
+  // Number of jumps taken, to break out of runaway guest loops.
+  spv::Id var_main_jump_count_;
   // float4[register_count()].
   spv::Id var_main_registers_;
   // Memory export variables are created only when needed.

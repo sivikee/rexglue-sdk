@@ -140,6 +140,12 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
+  // Notifications for backends tracking which ranges the current submission
+  // accesses: ranges requested for reading (in bytes, after the uploads for the
+  // request have been issued), and ranges written by the GPU.
+  virtual void OnRangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {}
+  virtual void OnRangeWrittenByGpu(uint32_t start, uint32_t length) {}
+
  private:
   memory::Memory& memory_;
 

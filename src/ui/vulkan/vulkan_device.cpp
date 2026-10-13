@@ -240,6 +240,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_spirv_1_4, 1, 2)
+      // #179. Requires VK_KHR_external_memory (core in 1.1).
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_external_memory_host)
     }
   }
 
@@ -801,6 +803,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+  }
+  if (device->extensions_.ext_EXT_external_memory_host) {
+#include <rex/ui/vulkan/functions/device_ext_external_memory_host.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

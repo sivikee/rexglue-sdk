@@ -36,6 +36,9 @@ class ByteStream;
 
 namespace rex::graphics {
 
+// Number of guest frames (swaps) processed so far - for frame rate display.
+extern std::atomic<uint64_t> g_guest_swap_count;
+
 class GraphicsSystem;
 class Shader;
 
@@ -171,6 +174,22 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // Writes a value the guest uses to know how far the GPU has progressed
+  // (fences). Backends whose GPU reads guest memory directly (no upload
+  // snapshots) defer it until the preceding work has completed on the host GPU,
+  // like the real GPU would write it, because the guest reuses memory once it
+  // sees the fence. The value is already in guest byte order.
+  void WriteGuestGpuProgress(uint32_t address, uint32_t value);
+  virtual bool DeferGuestGpuProgressWrite(uint32_t address, uint32_t value) { return false; }
+  enum class GuestGpuProgressFlush {
+    // Write the deferred values whose work has completed.
+    kPoll,
+    // Also submit the work deferred values are waiting for (when idle).
+    kSubmit,
+    // Await all the work and write all deferred values (when waiting for them).
+    kAwait,
+  };
+  virtual void FlushGuestGpuProgressWrites(GuestGpuProgressFlush flush) {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

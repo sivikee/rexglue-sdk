@@ -199,6 +199,8 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    // Importing host memory (the guest memory on unified memory systems).
+    bool ext_EXT_external_memory_host = false;  // #179
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -212,6 +214,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_0.inc>
     // VK_KHR_swapchain (#2)
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+    // VK_EXT_external_memory_host (#179)
+#include <rex/ui/vulkan/functions/device_ext_external_memory_host.inc>
     // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)

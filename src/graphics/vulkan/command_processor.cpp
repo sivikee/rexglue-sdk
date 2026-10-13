@@ -9,6 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <set>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <fmt/format.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -64,12 +70,19 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(vulkan_imported_memory_fence_sync, 1, "GPU/Vulkan",
+                     "When the guest memory is aliased as the shared memory buffer, write "
+                     "guest fences only after the preceding host GPU work completes: "
+                     "0 - immediately (glitches), 1 - deferred until completion, "
+                     "2 - block until completion (slow)");
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+std::vector<std::string> g_dbg_draw_log;
+
 
 namespace {
 
@@ -2261,6 +2274,12 @@ void VulkanCommandProcessor::SparseBindBuffer(VkBuffer buffer, uint32_t bind_cou
   sparse_bind_wait_stage_mask_ |= wait_stage_mask;
 }
 
+static uint64_t g_dbg_submit_count = 0;
+static uint64_t g_perf_draws = 0;
+static uint64_t g_perf_fence_syncs = 0;
+static uint64_t g_perf_rptr_syncs = 0;
+static uint64_t g_perf_swaps = 0;
+
 void VulkanCommandProcessor::OnGammaRamp256EntryTableValueWritten() {
   gamma_ramp_256_entry_table_current_frame_ = UINT32_MAX;
 }
@@ -3660,6 +3679,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           pixel_shader = nullptr;
         }
       }
+      // Debug: log the light loop constants of listed pixel shaders (unique).
+      static const char* log_psconst_env = std::getenv("OBLIVION_LOG_PSCONST");
+      if (log_psconst_env && pixel_shader &&
+          std::strstr(log_psconst_env,
+                      fmt::format("{:016X}", pixel_shader->ucode_data_hash()).c_str())) {
+        auto c = [&](uint32_t index, uint32_t component) {
+          float value;
+          uint32_t bits = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + index * 4 + component];
+          std::memcpy(&value, &bits, sizeof(value));
+          return value;
+        };
+        static std::set<std::string> seen_psconst;
+        std::string line = fmt::format(
+            "PSCONST {:016X} c6=({} {} {} {}) c254=({} {} {} {}) c255=({} {} {} {})",
+            pixel_shader->ucode_data_hash(), c(6, 0), c(6, 1), c(6, 2), c(6, 3), c(254, 0),
+            c(254, 1), c(254, 2), c(254, 3), c(255, 0), c(255, 1), c(255, 2), c(255, 3));
+        if (seen_psconst.size() < 200 && seen_psconst.insert(line).second) {
+          REXGPU_WARN("{}", line);
+        }
+      }
+      // Debug: keep the draw but drop listed pixel shaders (depth-only).
+      static const char* null_ps_env = std::getenv("OBLIVION_NULL_PS");
+      if (null_ps_env && pixel_shader &&
+          std::strstr(null_ps_env, fmt::format("{:016X}", pixel_shader->ucode_data_hash()).c_str())) {
+        pixel_shader = nullptr;
+      }
     }
   } else {
     // Disabling pixel shader for this case is also required by the pipeline
@@ -3867,6 +3912,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
+  }
+  {
+    static const char* skip_prim_env = std::getenv("OBLIVION_SKIP_PRIM");
+    static const char* limit_env = std::getenv("OBLIVION_DRAW_LIMIT");
+    static const char* skip_ps_env = std::getenv("OBLIVION_SKIP_PS");
+    if (skip_prim_env && uint32_t(prim_type) == uint32_t(std::atoi(skip_prim_env))) return true;
+    if (limit_env) {
+      uint32_t draws_in_sub = 0;
+      for (const auto& l : g_dbg_draw_log) draws_in_sub += (l.rfind("draw", 0) == 0);
+      if (draws_in_sub >= uint32_t(std::atoi(limit_env))) return true;
+    }
+    static const char* strip_limit_env = std::getenv("OBLIVION_STRIP_LIMIT");
+    if (strip_limit_env && uint32_t(prim_type) == 6) {
+      uint32_t strips_in_sub = 0;
+      for (const auto& l : g_dbg_draw_log) strips_in_sub += (l.find(" prim=6 ") != std::string::npos);
+      if (strips_in_sub >= uint32_t(std::atoi(strip_limit_env))) return true;
+    }
+    static const char* skip_vs_env = std::getenv("OBLIVION_SKIP_VS");
+    if (skip_vs_env && std::strstr(skip_vs_env, fmt::format("{:016X}", vertex_shader->ucode_data_hash()).c_str())) return true;
+    static const char* strip_above_env = std::getenv("OBLIVION_SKIP_STRIP_ABOVE");
+    if (strip_above_env && uint32_t(prim_type) == 6 &&
+        primitive_processing_result.host_draw_vertex_count > uint32_t(std::atoi(strip_above_env))) return true;
+    if (skip_ps_env && pixel_shader &&
+        fmt::format("{:016X}", pixel_shader->ucode_data_hash()) == skip_ps_env) return true;
   }
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
@@ -4115,12 +4184,52 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
 
+  ++g_perf_draws;
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
+    if (DbgDrawLogEnabled())
+    g_dbg_draw_log.push_back(fmt::format("draw VS {:016X} PS {:016X} verts={} prim={}",
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        primitive_processing_result.host_draw_vertex_count, uint32_t(prim_type)));
+    static const char* skip_strip_call_env2 = std::getenv("OBLIVION_SKIP_STRIP_CALL");
+    if (!(skip_strip_call_env2 && uint32_t(prim_type) == 6))
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
+    if (DbgDrawLogEnabled())
+    g_dbg_draw_log.push_back(fmt::format("drawidx VS {:016X} PS {:016X} verts={} prim={} hostprim={} ibtype={} reset={} ifmt={} base={:#x} vst={}",
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        primitive_processing_result.host_draw_vertex_count, uint32_t(prim_type),
+        uint32_t(primitive_processing_result.host_primitive_type),
+        uint32_t(primitive_processing_result.index_buffer_type),
+        int(primitive_processing_result.host_primitive_reset_enabled),
+        uint32_t(primitive_processing_result.host_index_format),
+        primitive_processing_result.guest_index_base,
+        uint32_t(primitive_processing_result.host_vertex_shader_type)));
+    if (DbgDrawLogEnabled() && primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16) {
+      const uint16_t* gi = memory_->TranslatePhysical<const uint16_t*>(
+          primitive_processing_result.guest_index_base);
+      uint32_t n = primitive_processing_result.host_draw_vertex_count, cffff = 0, mx = 0, mn = 0xFFFFFFFF;
+      for (uint32_t k = 0; k < n; ++k) {
+        uint16_t r = gi[k];
+        if (r == 0xFFFF) { ++cffff; continue; }
+        uint32_t v = primitive_processing_result.host_shader_index_endian == xenos::Endian::k8in16
+                         ? uint32_t(uint16_t((r >> 8) | (r << 8))) : r;
+        mx = std::max(mx, v); mn = std::min(mn, v);
+      }
+      xenos::xe_gpu_vertex_fetch_t vf0 = regs.GetVertexFetch(0);
+      g_dbg_draw_log.back() += fmt::format(" ffff={} min={} max={} end={} vf0addr={:#x} vf0bytes={} ri={:#x} rie={}",
+          cffff, mn, mx, uint32_t(primitive_processing_result.host_shader_index_endian),
+          vf0.address << 2, vf0.size << 2, regs[XE_GPU_REG_VGT_MULTI_PRIM_IB_RESET_INDX],
+          int(regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena));
+      if (std::getenv("OBLIVION_IDX_STATS")) {
+        static std::set<std::string> seen;
+        if (seen.insert(g_dbg_draw_log.back()).second) REXGPU_INFO("IDXSTAT {}", g_dbg_draw_log.back());
+      }
+    }
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
       case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
@@ -4150,6 +4259,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
+    static const char* skip_strip_call_env = std::getenv("OBLIVION_SKIP_STRIP_CALL");
+    if (!(skip_strip_call_env && uint32_t(prim_type) == 6))
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
@@ -5087,6 +5198,64 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
 }
 
+bool VulkanCommandProcessor::DeferGuestGpuProgressWrite(uint32_t address, uint32_t value) {
+  // With the guest memory aliased as the shared memory buffer (no upload
+  // snapshots), the host GPU reads guest memory when it executes the commands,
+  // not when they're recorded. The guest reuses memory (dynamic vertex data
+  // rings, for instance) once it sees a fence, so only write fences after the
+  // preceding work has completed on the host GPU.
+  int32_t mode = REXCVAR_GET(vulkan_imported_memory_fence_sync);
+  if (!mode || !shared_memory_ || !shared_memory_->guest_memory_imported() || device_lost_) {
+    return false;
+  }
+  ++g_perf_fence_syncs;
+  if (mode >= 2) {
+    // Blocking - complete all the work now and write immediately.
+    FlushGuestGpuProgressWrites(GuestGpuProgressFlush::kAwait);
+    return false;
+  }
+  // The work recorded so far: the open submission, or the last one if none is
+  // open.
+  uint64_t submission = GetCurrentSubmission() - (submission_open_ ? 0 : 1);
+  deferred_guest_gpu_progress_writes_.push_back({submission, address, value});
+  return true;
+}
+
+void VulkanCommandProcessor::FlushGuestGpuProgressWrites(GuestGpuProgressFlush flush) {
+  if (deferred_guest_gpu_progress_writes_.empty()) {
+    if (flush == GuestGpuProgressFlush::kAwait) {
+      CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+    }
+    return;
+  }
+  switch (flush) {
+    case GuestGpuProgressFlush::kPoll:
+      CheckSubmissionFenceAndDeviceLoss(0);
+      break;
+    case GuestGpuProgressFlush::kSubmit:
+      // Make sure the work the deferred writes wait for can complete.
+      if (submission_open_ && CanEndSubmissionImmediately() &&
+          deferred_guest_gpu_progress_writes_.back().submission >= GetCurrentSubmission()) {
+        EndSubmission(false);
+      }
+      CheckSubmissionFenceAndDeviceLoss(0);
+      break;
+    case GuestGpuProgressFlush::kAwait:
+      CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+      break;
+  }
+  uint64_t completed = GetCompletedSubmission();
+  while (!deferred_guest_gpu_progress_writes_.empty()) {
+    const DeferredGuestGpuProgressWrite& write = deferred_guest_gpu_progress_writes_.front();
+    // Write everything if the device is lost, so the guest doesn't hang.
+    if (write.submission > completed && !device_lost_) {
+      break;
+    }
+    memory::store(memory_->TranslatePhysical(write.address), write.value);
+    deferred_guest_gpu_progress_writes_.pop_front();
+  }
+}
+
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
   return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines());
 }
@@ -5230,6 +5399,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+  if (is_swap) {
+    ++g_perf_swaps;
+  }
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -5385,6 +5557,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    shared_memory_->RecordHoistedUploads(command_buffer.buffer);
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
@@ -5418,6 +5591,40 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+      if (submit_result == VK_SUCCESS && std::getenv("OBLIVION_SYNC_GPU")) {
+        auto t0 = std::chrono::steady_clock::now();
+        VkResult wr = dfn.vkWaitForFences(device, 1, &fence, VK_TRUE, 20000000000ull);
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms > 50.0) {
+          REXGPU_ERROR("OBLIVION_SYNC_GPU: submission #{} took {:.1f} ms, {} cmds", g_dbg_submit_count, ms, g_dbg_draw_log.size());
+        }
+        if (wr != VK_SUCCESS) {
+          REXGPU_ERROR("OBLIVION_SYNC_GPU: submission #{} FAILED (VkResult {}), {} draws:",
+                       g_dbg_submit_count, int(wr), g_dbg_draw_log.size());
+          for (const auto& l : g_dbg_draw_log) REXGPU_ERROR("  {}", l);
+          submit_result = wr;
+        }
+      }
+      ++g_dbg_submit_count;
+      g_dbg_draw_log.clear();
+      static const bool perf_stats = std::getenv("OBLIVION_PERF_STATS") != nullptr;
+      static uint64_t perf_draws_last = 0;
+      static auto perf_time_last = std::chrono::steady_clock::now();
+      if (perf_stats && g_dbg_submit_count % 120 == 0) {
+        auto now = std::chrono::steady_clock::now();
+        double s = std::chrono::duration<double>(now - perf_time_last).count();
+        REXGPU_WARN(
+            "PERF 120 submissions in {:.2f} s: draws {} dispatches {} (groups {}) copies {} "
+            "({:.1f} MB) buf2img {} fences {} pending {} swaps {}",
+            s, g_perf_draws - perf_draws_last, g_perf_dispatches, g_perf_dispatch_groups,
+            g_perf_copies, g_perf_copy_bytes / 1048576.0, g_perf_buf2img, g_perf_fence_syncs,
+            deferred_guest_gpu_progress_writes_.size(), g_perf_swaps);
+        g_perf_fence_syncs = g_perf_rptr_syncs = g_perf_swaps = 0;
+        perf_time_last = now;
+        perf_draws_last = g_perf_draws;
+        g_perf_dispatches = g_perf_dispatch_groups = g_perf_copies = g_perf_copy_bytes =
+            g_perf_buf2img = 0;
+      }
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");

@@ -508,9 +508,13 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_tfetch_gradients_v_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float3_,
                                  "xe_var_tfetch_gradients_v", const_float3_0_);
+    var_main_jump_count_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+                                 "xe_var_jump_count", const_uint_0_);
     if (register_count()) {
       spv::Id type_register_array =
-          builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
+          // +1 scratch element for out-of-bounds dynamically indexed writes.
+          builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count() + 1), 1);
       var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                                      type_register_array, "xe_var_registers");
     }
@@ -1562,7 +1566,19 @@ void SpirvShaderTranslator::ProcessJumpInstruction(const ParsedJumpInstruction& 
     // Unreachable for some reason.
     return;
   }
-  main_switch_next_pc_phi_operands_.push_back(builder_->makeIntConstant(int(instr.target_address)));
+  // Guard against runaway loops (a guest loop with a garbage iteration count
+  // hangs the GPU, which on macOS takes down the whole display) - after too
+  // many jumps, go to the impossible program counter -1 instead, ending the
+  // shader.
+  spv::Id jump_count = builder_->createBinOp(
+      spv::OpIAdd, type_uint_, builder_->createLoad(var_main_jump_count_, spv::NoPrecision),
+      builder_->makeUintConstant(1));
+  builder_->createStore(jump_count, var_main_jump_count_);
+  main_switch_next_pc_phi_operands_.push_back(builder_->createTriOp(
+      spv::OpSelect, type_int_,
+      builder_->createBinOp(spv::OpULessThanEqual, type_bool_, jump_count,
+                            builder_->makeUintConstant(GetMaxJumpCount())),
+      builder_->makeIntConstant(int(instr.target_address)), builder_->makeIntConstant(-1)));
   main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
   builder_->createBranch(main_loop_continue_);
 }
@@ -3501,6 +3517,33 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& oper
       GetStorageAddressingIndex(operand.storage_addressing_mode, operand.storage_index,
                                 operand.storage_source == InstructionStorageSource::kConstantFloat);
   EnsureBuildPointAvailable();
+  // Dynamically indexed (a0 / aL relative) accesses may go out of bounds - for
+  // example, Oblivion's lit pixel shaders index c[10+a0] with a0 derived from a
+  // register that may be uninitialized. Robust buffer access makes such reads
+  // return zero on most Vulkan drivers, but Metal (via MoltenVK) doesn't
+  // bounds-check, causing GPU page faults and hangs. Load from index 0 and
+  // return zero instead when out of bounds.
+  spv::Id dynamic_in_bounds = spv::NoResult;
+  if (operand.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute) {
+    uint32_t array_size = 0;
+    switch (operand.storage_source) {
+      case InstructionStorageSource::kRegister:
+        array_size = register_count();
+        break;
+      case InstructionStorageSource::kConstantFloat:
+        array_size = current_shader().constant_register_map().float_count;
+        break;
+      default:
+        break;
+    }
+    if (array_size) {
+      dynamic_in_bounds = builder_->createBinOp(
+          spv::OpULessThan, type_bool_, builder_->createUnaryOp(spv::OpBitcast, type_uint_, index),
+          builder_->makeUintConstant(array_size));
+      index = builder_->createTriOp(spv::OpSelect, type_int_, dynamic_in_bounds, index,
+                                    const_int_0_);
+    }
+  }
   spv::Id vec4_pointer = spv::NoResult;
   switch (operand.storage_source) {
     case InstructionStorageSource::kRegister:
@@ -3525,7 +3568,17 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& oper
       assert_unhandled_case(operand.storage_source);
   }
   assert_true(vec4_pointer != spv::NoResult);
-  return builder_->createLoad(vec4_pointer, spv::NoPrecision);
+  spv::Id value = builder_->createLoad(vec4_pointer, spv::NoPrecision);
+  if (dynamic_in_bounds != spv::NoResult) {
+    // Vector condition - a scalar one for a vector OpSelect requires SPIR-V 1.4.
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.resize(4, dynamic_in_bounds);
+    value = builder_->createTriOp(
+        spv::OpSelect, type_float4_,
+        builder_->createCompositeConstruct(type_bool4_, id_vector_temp_util_), value,
+        const_float4_0_);
+  }
+  return value;
 }
 
 spv::Id SpirvShaderTranslator::ApplyOperandModifiers(spv::Id operand_value,
@@ -3624,6 +3677,18 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
       // id_vector_temp_util_ usage in it.
       spv::Id register_index =
           GetStorageAddressingIndex(result.storage_addressing_mode, result.storage_index);
+      if (result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute) {
+        // Redirect out-of-bounds dynamically indexed writes to the extra scratch
+        // element at register_count() (see the register array declaration) -
+        // Metal doesn't bounds-check thread memory.
+        register_index = builder_->createTriOp(
+            spv::OpSelect, type_int_,
+            builder_->createBinOp(spv::OpULessThan, type_bool_,
+                                  builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                                          register_index),
+                                  builder_->makeUintConstant(register_count())),
+            register_index, builder_->makeIntConstant(int(register_count())));
+      }
       id_vector_temp_util_.clear();
       // Array element.
       id_vector_temp_util_.push_back(register_index);
@@ -4059,14 +4124,24 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords
   uint32_t binding_count_log2 = GetSharedMemoryStorageBufferCountLog2();
 
   if (!binding_count_log2) {
-    // Single binding - load directly.
+    // Single binding - load directly, but zero if out of bounds like the
+    // multi-binding path. Not relying on robust buffer access: Metal (via
+    // MoltenVK) doesn't bounds-check storage buffers, and guest vertex fetch
+    // constants may contain addresses above 512 MB (such as 0x84000000), which
+    // cause GPU page faults and hangs there.
+    spv::Id in_bounds = builder_->createBinOp(
+        spv::OpULessThan, type_bool_,
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_, address_dwords_int),
+        builder_->makeUintConstant(uint32_t(1) << (29 - 2)));
     id_vector_temp_.clear();
     // The only SSBO struct member.
     id_vector_temp_.push_back(const_int_0_);
-    id_vector_temp_.push_back(address_dwords_int);
-    return builder_->createLoad(
+    id_vector_temp_.push_back(
+        builder_->createTriOp(spv::OpSelect, type_int_, in_bounds, address_dwords_int, const_int_0_));
+    spv::Id value = builder_->createLoad(
         builder_->createAccessChain(storage_class, buffers_shared_memory_, id_vector_temp_),
         spv::NoPrecision);
+    return builder_->createTriOp(spv::OpSelect, type_uint_, in_bounds, value, const_uint_0_);
   }
 
   // The memory is split into multiple bindings - check which binding to load

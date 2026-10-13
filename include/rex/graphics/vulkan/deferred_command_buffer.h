@@ -19,7 +19,21 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/api.h>
 
+#include <cstdlib>
+#include <string>
 namespace rex::graphics::vulkan {
+extern std::vector<std::string> g_dbg_draw_log;
+// Debug: per-submission command log, only collected when a debug option that
+// needs it is set (it costs CPU time on every draw otherwise).
+// Debug: cheap per-submission work counters (OBLIVION_PERF_STATS).
+inline uint64_t g_perf_dispatches = 0, g_perf_dispatch_groups = 0, g_perf_copies = 0,
+                g_perf_copy_bytes = 0, g_perf_buf2img = 0;
+inline bool DbgDrawLogEnabled() {
+  static const bool enabled = std::getenv("OBLIVION_SYNC_GPU") || std::getenv("OBLIVION_DRAW_LIMIT") ||
+                             std::getenv("OBLIVION_STRIP_LIMIT") || std::getenv("OBLIVION_IDX_STATS");
+  return enabled;
+}
+
 
 class VulkanCommandProcessor;
 
@@ -177,6 +191,11 @@ class DeferredCommandBuffer {
   }
   void CmdVkCopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer, uint32_t region_count,
                        const VkBufferCopy* regions) {
+    g_perf_copies += region_count;
+    for (uint32_t i = 0; i < region_count; ++i) g_perf_copy_bytes += regions[i].size;
+    if (DbgDrawLogEnabled())
+    for (uint32_t i = 0; i < region_count; ++i)
+      g_dbg_draw_log.push_back("copybuf size=" + std::to_string(regions[i].size));
     std::memcpy(CmdCopyBufferEmplace(src_buffer, dst_buffer, region_count), regions,
                 sizeof(VkBufferCopy) * region_count);
   }
@@ -206,6 +225,13 @@ class DeferredCommandBuffer {
   void CmdVkCopyBufferToImage(VkBuffer src_buffer, VkImage dst_image,
                               VkImageLayout dst_image_layout, uint32_t region_count,
                               const VkBufferImageCopy* regions) {
+    g_perf_buf2img += region_count;
+    if (DbgDrawLogEnabled())
+    for (uint32_t i = 0; i < region_count; ++i)
+      g_dbg_draw_log.push_back("buf2img " + std::to_string(regions[i].imageExtent.width) + "x" +
+                               std::to_string(regions[i].imageExtent.height) + "x" +
+                               std::to_string(regions[i].imageExtent.depth) + " mip=" +
+                               std::to_string(regions[i].imageSubresource.mipLevel));
     std::memcpy(CmdCopyBufferToImageEmplace(src_buffer, dst_image, dst_image_layout, region_count),
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
@@ -225,6 +251,13 @@ class DeferredCommandBuffer {
   }
 
   void CmdVkDispatch(uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z) {
+    ++g_perf_dispatches;
+    g_perf_dispatch_groups += uint64_t(group_count_x) * group_count_y * group_count_z;
+    if (DbgDrawLogEnabled())
+    g_dbg_draw_log.push_back("dispatch " + std::to_string(group_count_x) + "," +
+                             std::to_string(group_count_y) + "," + std::to_string(group_count_z));
+    static const bool skip_dispatch = std::getenv("OBLIVION_SKIP_DISPATCH") != nullptr;
+    if (skip_dispatch) return;
     auto& args = *reinterpret_cast<ArgsVkDispatch*>(
         WriteCommand(Command::kVkDispatch, sizeof(ArgsVkDispatch)));
     args.group_count_x = group_count_x;

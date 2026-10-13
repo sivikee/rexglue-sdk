@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -3214,6 +3215,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       return false;
   }
   input_assembly_state.primitiveRestartEnable = description.primitive_restart ? VK_TRUE : VK_FALSE;
+  if (std::getenv("OBLIVION_FORCE_RESTART") &&
+      (input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+       input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)) {
+    input_assembly_state.primitiveRestartEnable = VK_TRUE;
+  }
 
   VkPipelineViewportStateCreateInfo viewport_state;
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;

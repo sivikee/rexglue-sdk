@@ -8,6 +8,8 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */
+#include <atomic>
+#include <cstdint>
 
 #include <rex/system/gpu_plugin.h>
 
@@ -103,3 +105,9 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
 }
 
 }  // namespace rex::system
+
+namespace rex::graphics {
+// Guest frame (swap) counter, declared in rex/graphics/command_processor.h. Lives
+// in the runtime rather than the GPU plugin so the app can read it too.
+std::atomic<uint64_t> g_guest_swap_count{0};
+}  // namespace rex::graphics

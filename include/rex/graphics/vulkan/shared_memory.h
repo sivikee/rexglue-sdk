@@ -48,16 +48,26 @@ class VulkanSharedMemory : public SharedMemory {
   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
 
   VkBuffer buffer() const { return buffer_; }
+  bool guest_memory_imported() const { return guest_memory_imported_; }
+  // Records the uploads deferred to the beginning of the submission - must be
+  // called when the submission's command buffer is being recorded, before its
+  // commands. Also resets the per-submission access tracking.
+  void RecordHoistedUploads(VkCommandBuffer command_buffer);
 
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  void OnRangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) override;
+  void OnRangeWrittenByGpu(uint32_t start, uint32_t length) override;
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
+  // Creates buffer_ aliasing the guest physical memory itself (unified memory
+  // systems with VK_EXT_external_memory_host), so no uploads are needed.
+  bool ImportGuestMemory(const VkBufferCreateInfo& buffer_create_info);
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
@@ -66,12 +76,35 @@ class VulkanSharedMemory : public SharedMemory {
   uint32_t buffer_memory_type_;
   // Single for non-sparse, every allocation so far for sparse.
   std::vector<VkDeviceMemory> buffer_memory_;
+  // buffer_ aliases the guest physical memory - the GPU sees CPU writes
+  // directly, uploads only mark ranges as valid.
+  bool guest_memory_imported_ = false;
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+  VkBuffer upload_buffer_previous_ = VK_NULL_HANDLE;
+  std::vector<std::pair<uint32_t, uint32_t>> stream_upload_page_ranges_;
+
+  // Stages a page range to an upload buffer and either queues the copy for the
+  // beginning of the submission (hoisted) or into the command stream.
+  bool StageUploadRange(uint32_t page_start, uint32_t page_count, bool hoisted);
+  void FlushStreamUploadRegions();
+
+  // Pages accessed (requested, uploaded or written by the GPU) in the current
+  // submission - uploads of other pages can be done at its beginning.
+  std::vector<uint64_t> submission_touched_pages_;
+  void TouchSubmissionPages(uint32_t page_start, uint32_t page_count);
+  void TouchSubmissionBytes(uint32_t start, uint32_t length);
+  bool AreSubmissionPagesTouched(uint32_t page_start, uint32_t page_count) const;
+  struct HoistedUpload {
+    VkBuffer source;
+    VkBufferCopy region;
+  };
+  std::vector<HoistedUpload> hoisted_uploads_;
+  std::vector<VkBufferCopy> hoisted_upload_regions_;
 };
 
 }  // namespace rex::graphics::vulkan

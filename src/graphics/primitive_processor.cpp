@@ -36,6 +36,9 @@ REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
                     "Force convert triangle fans to lists");
 
+REXCVAR_DEFINE_BOOL(force_convert_triangle_strips_to_lists, false, "GPU",
+                    "Force convert indexed triangle strips to lists");
+
 REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
                      "Minimum indices for primitive processor cache")
     .range(0, 1000000);
@@ -375,8 +378,13 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       case xenos::PrimitiveType::kLineList:
       case xenos::PrimitiveType::kLineStrip:
       case xenos::PrimitiveType::kTriangleList:
-      case xenos::PrimitiveType::kTriangleStrip:
         // Supported natively on all backends.
+        break;
+      case xenos::PrimitiveType::kTriangleStrip:
+        if (REXCVAR_GET(force_convert_triangle_strips_to_lists) &&
+            vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+          host_primitive_type = xenos::PrimitiveType::kTriangleList;
+        }
         break;
       case xenos::PrimitiveType::kRectangleList:
         if (expand_rectangle_lists_in_vs_) {
@@ -657,6 +665,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
             break;
           case xenos::PrimitiveType::kQuadList:
             host_index_count_getter = GetQuadListTriangleListIndexCount;
+            break;
+          case xenos::PrimitiveType::kTriangleStrip:
+            host_index_count_getter = GetTriangleStripListIndexCount;
             break;
           default:
             assert_unhandled_case(guest_primitive_type);

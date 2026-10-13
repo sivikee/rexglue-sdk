@@ -423,6 +423,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
+  bool DeferGuestGpuProgressWrite(uint32_t address, uint32_t value) override;
+  void FlushGuestGpuProgressWrites(GuestGpuProgressFlush flush) override;
+  // Guest GPU progress (fence) writes waiting for their submission to complete
+  // on the host GPU, in order.
+  struct DeferredGuestGpuProgressWrite {
+    uint64_t submission;
+    uint32_t address;
+    uint32_t value;
+  };
+  std::deque<DeferredGuestGpuProgressWrite> deferred_guest_gpu_progress_writes_;
 
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();

@@ -82,6 +82,7 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 
 namespace rex::graphics {
 
+
 using namespace rex::graphics::xenos;
 
 namespace {
@@ -228,6 +229,8 @@ void CommandProcessor::WorkerThreadMain() {
 
         rex::thread::MaybeYield();
         loop_count++;
+        // Let deferred GPU progress writes through while idle.
+        FlushGuestGpuProgressWrites(GuestGpuProgressFlush::kSubmit);
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -243,6 +246,7 @@ void CommandProcessor::WorkerThreadMain() {
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
+    FlushGuestGpuProgressWrites(GuestGpuProgressFlush::kPoll);
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
@@ -608,6 +612,12 @@ void CommandProcessor::MakeCoherent() {
   regs_volatile[XE_GPU_REG_COHER_STATUS_HOST] = 0;
 }
 
+void CommandProcessor::WriteGuestGpuProgress(uint32_t address, uint32_t value) {
+  if (!DeferGuestGpuProgressWrite(address, value)) {
+    memory::store(memory_->TranslatePhysical(address), value);
+  }
+}
+
 void CommandProcessor::PrepareForWait() {}
 
 void CommandProcessor::ReturnFromWait() {}
@@ -959,6 +969,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  g_guest_swap_count.fetch_add(1, std::memory_order_relaxed);
 
   ++counter_;
   return true;
@@ -1030,6 +1041,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      // The awaited value may be a deferred GPU progress write.
+      FlushGuestGpuProgressWrites(GuestGpuProgressFlush::kAwait);
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1108,7 +1121,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    WriteGuestGpuProgress(addr, write_data);
     write_addr += 4;
   }
 
@@ -1169,7 +1182,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      WriteGuestGpuProgress(write_reg_addr, write_data);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1214,7 +1227,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  WriteGuestGpuProgress(address, data_value);
   return true;
 }
 
