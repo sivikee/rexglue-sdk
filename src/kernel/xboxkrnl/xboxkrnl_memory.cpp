@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -171,6 +172,15 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
     heap = REX_KERNEL_MEMORY()->LookupHeapByType(false, page_size);
     heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down, &address);
   }
+#if REX_PLATFORM_SWITCH
+  {
+    static std::atomic<int> n{0};
+    if (((adjusted_base && adjusted_base < 0x40000000) || (address && address < 0x40000000)) && n++ < 40) {
+      REXKRNL_WARN("[dbg] NtAllocateVirtualMemory base={:08X} size={:08X} type={:X} -> {:08X}",
+                   adjusted_base, adjusted_size, (uint32_t)alloc_type, address);
+    }
+  }
+#endif
   if (!address) {
     // Failed - assume no memory available.
     return X_STATUS_NO_MEMORY;

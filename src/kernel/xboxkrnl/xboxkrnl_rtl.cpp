@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
@@ -24,6 +25,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
@@ -377,6 +379,20 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 }
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+#if REX_PLATFORM_SWITCH
+  if (cs.guest_address() < 0x10000000) {
+    static std::atomic<int> bad{0};
+    if (bad++ < 5) {
+      auto* c = rex::runtime::current_ppc_context();
+      REXKRNL_ERROR(
+          "RtlEnterCriticalSection on invalid guest address {:08X} (lr={:08X} r28={:08X} r3={:016X} "
+          "mem[8204052C]={:08X})",
+          cs.guest_address(), uint32_t(c->lr), c->r28.u32, c->r3.u64,
+          uint32_t(rex::byte_swap(*reinterpret_cast<uint32_t*>(REX_KERNEL_MEMORY()->TranslateVirtual(0x8204052C)))));
+    }
+    return;
+  }
+#endif
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
 
@@ -408,6 +424,11 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+#if REX_PLATFORM_SWITCH
+  if (cs.guest_address() < 0x10000000) {
+    return 1;
+  }
+#endif
   uint32_t thread = XThread::GetCurrentThread()->guest_object();
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
@@ -427,6 +448,11 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+#if REX_PLATFORM_SWITCH
+  if (cs.guest_address() < 0x10000000) {
+    return;  // see RtlEnterCriticalSection: no guest memory below 0x40000000 on Switch
+  }
+#endif
   assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
 
   // Drop recursion count - if it isn't zero we still have the lock.

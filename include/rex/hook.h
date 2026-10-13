@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/function.h>
 #include <rex/system/kernel_state.h>
@@ -37,6 +38,22 @@
   extern "C" REX_FUNC(subroutine) {                              \
     ZoneNamedN(___tracy_hook_zone, #subroutine, TracyIsStarted); \
     rex::ppc::HostToGuestFunction<function>(ctx, base);          \
+  }
+#elif REX_PLATFORM_SWITCH
+// Switch bring-up: optional kernel-import trace (rex::g_import_trace, toggled by the app).
+namespace rex {
+extern volatile int g_import_trace;
+void TraceImport(const char* name, uint32_t lr, uint32_t r3_in, uint32_t r3_out);
+}  // namespace rex
+#define REX_HOOK(subroutine, function)                     \
+  extern "C" REX_FUNC(subroutine) {                        \
+    if (rex::g_import_trace) {                             \
+      uint32_t lr_ = uint32_t(ctx.lr), r3_ = ctx.r3.u32;   \
+      rex::ppc::HostToGuestFunction<function>(ctx, base);  \
+      rex::TraceImport(#subroutine, lr_, r3_, ctx.r3.u32); \
+    } else {                                               \
+      rex::ppc::HostToGuestFunction<function>(ctx, base);  \
+    }                                                      \
   }
 #else
 #define REX_HOOK(subroutine, function)                  \

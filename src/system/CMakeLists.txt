@@ -50,6 +50,8 @@ set(REXSYSTEM_SOURCES
 
 # Switch has no dlopen of arbitrary shared objects: build everything static
 if(REX_SWITCH)
+    # headless null-Xenos GPU (no D3D12/Vulkan), injected via RuntimeConfig::graphics
+    list(APPEND REXSYSTEM_SOURCES ../graphics/null_graphics_system.cpp)
     add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
 else()
     add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})

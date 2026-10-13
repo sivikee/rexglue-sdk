@@ -171,6 +171,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   if (XFAILED(result)) {
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
+#if REX_PLATFORM_SWITCH
+    REXKRNL_INFO("[open] {}", target_path);  // boot-progress marker (Switch bring-up)
+#endif
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }
   return result;
@@ -274,6 +277,13 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     io_status_block->status = result;
     io_status_block->information = 0;
   }
+#if REX_PLATFORM_SWITCH
+  if (XFAILED(result) && result != X_STATUS_END_OF_FILE) {
+    REXKRNL_WARN("[read] NtReadFile failed: handle={:#x} len={:#x} offset={} -> {:#x} (file={})",
+                 (uint32_t)file_handle, (uint32_t)buffer_length, (int64_t)byte_offset, result,
+                 file ? std::string(file->entry()->path()) : std::string("<none>"));
+  }
+#endif
 
   if (ev && signal_event) {
     ev->Set(0, false);

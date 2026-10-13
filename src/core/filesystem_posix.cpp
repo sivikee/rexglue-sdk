@@ -184,7 +184,7 @@ class PosixFileHandle : public FileHandle {
   PosixFileHandle(std::filesystem::path path, int handle)
       : FileHandle(std::move(path)), handle_(handle) {}
   ~PosixFileHandle() override {
-    close(handle_);
+    if (handle_ >= 0) close(handle_);
     handle_ = -1;
   }
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
@@ -240,6 +240,16 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
   // No O_APPEND for kFileAppendData: writes go through pwrite with an explicit
   // offset, which O_APPEND would override.
   int handle = open(path.c_str(), open_access);
+#if REX_PLATFORM_SWITCH
+  // newlib/fsdev cannot open() a directory; the guest still opens directories (to enumerate
+  // them), so hand back a handle without a descriptor (reads fail, enumeration uses the path).
+  if (handle == -1) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+      return std::make_unique<PosixFileHandle>(path, -1);
+    }
+  }
+#endif
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;
