@@ -78,6 +78,12 @@ extern PPCFuncMapping PPCFuncMappings[];
     [[clang::musttail]] return __imp__##name(ctx, base);                            \
   }                                                                                 \
   extern "C" void __imp__##name([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#elif defined(__GNUC__) && !defined(__clang__)
+// GCC rejects attributes in front of `extern "C"` (clang accepts them): attach them to the
+// declarator instead, otherwise the weak alias is silently dropped.
+#define DEFINE_REX_FUNC(name)                                                         \
+  extern "C" __attribute__((alias("__imp__" #name), weak, noinline)) REX_FUNC(name); \
+  REX_EXTERN(__imp__##name)
 #else
 #define DEFINE_REX_FUNC(name)                                       \
   __attribute__((alias("__imp__" #name)))                           \

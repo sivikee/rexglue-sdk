@@ -60,16 +60,17 @@ elseif(REX_SWITCH)
         atomic_posix.cpp
         clock_posix.cpp
         dbg_posix.cpp
-        dynlib_switch.cpp  # STUB (fibers: REX_FATAL)
+        dynlib_switch.cpp                # STUB (no dlopen)
         exception_handler_switch.cpp     # demand-commit only
         filesystem_posix.cpp
-        fiber_switch.cpp  # STUB (fibers: REX_FATAL)
+        fiber_switch.cpp                 # thread fibers only
+        libc_switch.cpp                  # newlib gaps: pread, pwrite, creat, posix_memalign...
         mapped_memory_switch.cpp         # read-into-buffer
         math_gcc.cpp
         memory_switch.cpp                # shared-memory segments
         platform/console_posix.cpp
         platform/env_posix.cpp
-        seh_switch.cpp  # STUB (fibers: REX_FATAL)
+        seh_switch.cpp                   # STUB
         socket_posix.cpp
         system_posix.cpp
         threading_posix.cpp
