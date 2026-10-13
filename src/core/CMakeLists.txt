@@ -53,6 +53,27 @@ if(WIN32)
         threading_win.cpp
     )
     target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+elseif(REX_SWITCH)
+    # newlib/libnx: POSIX-like libc, but no mmap/dlopen/signals/ucontext. Files marked
+    # STUB are placeholders for the Switch OS layer (see ports/switch/README.md).
+    target_sources(rexcore PRIVATE
+        atomic_posix.cpp
+        clock_posix.cpp
+        dbg_posix.cpp
+        dynlib_switch.cpp                # STUB
+        exception_handler_switch.cpp     # STUB
+        filesystem_posix.cpp
+        fiber_switch.cpp                 # STUB
+        mapped_memory_switch.cpp         # STUB
+        math_gcc.cpp
+        memory_switch.cpp                # STUB
+        platform/console_posix.cpp
+        platform/env_posix.cpp
+        seh_switch.cpp                   # STUB
+        socket_posix.cpp
+        system_posix.cpp
+        threading_posix.cpp
+    )
 elseif(UNIX)
     # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
     # is selected inside them with #if defined(__APPLE__).
@@ -100,6 +121,9 @@ target_include_directories(rexcore PRIVATE
 
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(REX_SWITCH)
+    # newlib: pthread is built in; libnx is added by the toolchain
+    target_link_libraries(rexcore PRIVATE nx)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()

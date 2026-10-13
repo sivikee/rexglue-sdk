@@ -35,6 +35,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_SWITCH
+// TODO(switch): no native surface type; see src/ui/surface_switch.cpp (stub)
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -398,7 +400,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       SDL_Metal_DestroyView(metal_view);
     }
   }
-#else
+#elif !REX_PLATFORM_SWITCH
   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
     auto* wl_display_ptr = static_cast<struct wl_display*>(

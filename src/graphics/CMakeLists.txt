@@ -96,6 +96,11 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
 
+if(REX_SWITCH)
+    # TODO(switch): the GPU plugin is runtime-loaded (dlopen) and needs a Vulkan/D3D12
+    # backend; neither exists for Switch yet. Skipped entirely in this phase.
+    return()
+endif()
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 

@@ -9,7 +9,7 @@
 #include <rex/platform.h>
 #include <rex/thread.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "This file is POSIX-only");
 
 #include <signal.h>
 
@@ -30,7 +30,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <fcntl.h>
 #endif
+#if !REX_PLATFORM_SWITCH
 #include <sys/syscall.h>
+#endif
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -115,7 +117,7 @@ enum class SignalType {
 };
 
 int GetSystemSignal(SignalType num) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
   // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
   // signals onto the two user-defined signals.
   switch (num) {
@@ -135,7 +137,7 @@ int GetSystemSignal(SignalType num) {
 }
 
 SignalType GetSystemSignalType(int num) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
   switch (num) {
     case SIGUSR1:
       return SignalType::kThreadSuspend;
@@ -156,6 +158,12 @@ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_h
 static void signal_handler(int signal, siginfo_t* info, void* context);
 
 void install_signal_handler(SignalType type) {
+#if REX_PLATFORM_SWITCH
+  // STUB (Switch): newlib/libnx has no sigaction(SA_SIGINFO); thread suspend and
+  // queued user callbacks cannot be delivered asynchronously yet.
+  (void)type;
+  return;
+#else
   bool expected = false;
   if (!signal_handler_installed[static_cast<size_t>(type)].compare_exchange_strong(expected,
                                                                                    true)) {
@@ -168,6 +176,7 @@ void install_signal_handler(SignalType type) {
   if (sigaction(GetSystemSignal(type), &action, nullptr) != 0) {
     signal_handler_installed[static_cast<size_t>(type)] = false;
   }
+#endif  // REX_PLATFORM_SWITCH
 }
 
 // TODO(dougvj)
@@ -178,6 +187,9 @@ void EnableAffinityConfiguration() {}
 uint32_t current_thread_system_id() {
 #if defined(__APPLE__)
   return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+#elif REX_PLATFORM_SWITCH
+  // newlib pthread_t is a small integer id
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_self()));
 #else
   return static_cast<uint32_t>(syscall(SYS_gettid));
 #endif
@@ -655,6 +667,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       pthread_attr_destroy(&attr);
       return false;
     }
+#if !REX_PLATFORM_SWITCH  // STUB (Switch): no SCHED_FIFO; map to svcSetThreadPriority later
     if (params.initial_priority != 0) {
       sched_param sched{};
       sched.sched_priority = params.initial_priority + 1;
@@ -667,6 +680,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
         return false;
       }
     }
+#endif
     if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
       pthread_attr_destroy(&attr);
       return false;
@@ -759,12 +773,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if defined(__APPLE__)
   uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
 #else
-  uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+  uint32_t system_id() const {
+#if REX_PLATFORM_SWITCH
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thread_));
+#else
+    return static_cast<uint32_t>(thread_);
+#endif
+  }
 #endif
 
   uint64_t affinity_mask() {
     WaitStarted();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
     // macOS doesn't expose Linux-style pthread affinity masks; report every
     // logical processor as available.
     auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
@@ -795,7 +815,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_affinity_mask(uint64_t mask) {
     WaitStarted();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
     // no-op so higher layers can build and run.
     (void)mask;
@@ -821,6 +841,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   int priority() {
     WaitStarted();
+#if REX_PLATFORM_SWITCH
+    return 0;  // STUB (Switch): svcGetThreadPriority
+#else
     int policy;
     sched_param param{};
     int ret = pthread_getschedparam(thread_, &policy, &param);
@@ -829,10 +852,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
     }
 
     return param.sched_priority;
+#endif
   }
 
   void set_priority(int new_priority) {
     WaitStarted();
+#if REX_PLATFORM_SWITCH
+    (void)new_priority;  // STUB (Switch): svcSetThreadPriority
+    return;
+#else
     sched_param param{};
     param.sched_priority = new_priority;
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
@@ -849,6 +877,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
           break;
       }
     }
+#endif
   }
 
   void QueueUserCallback(std::function<void()> callback) {
@@ -868,7 +897,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
-#if defined(__APPLE__)
+#if REX_PLATFORM_SWITCH
+    // STUB (Switch): no signals; callbacks only run when the target drains them in an
+    // alertable wait.
+    int result = 0;
+#elif defined(__APPLE__)
     // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
     // without the sigval payload.
     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));

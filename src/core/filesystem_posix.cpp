@@ -37,7 +37,7 @@
 
 // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
 // explicit *64 forms for legacy 32-bit off_t distributions.
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_SWITCH
 using rex_off64_t = off_t;
 #define rex_fseeko64 fseeko
 #define rex_ftello64 ftello

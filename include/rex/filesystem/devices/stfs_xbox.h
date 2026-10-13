@@ -42,6 +42,19 @@ inline uint64_t decode_fat_timestamp(const uint32_t date, const uint32_t time) {
 
 #if REX_PLATFORM_WIN32
   time_t timet = _mkgmtime(&tm);
+#elif REX_PLATFORM_SWITCH
+  // newlib has no timegm(): days-from-civil (Howard Hinnant)
+  time_t timet;
+  {
+    int64_t y = int64_t(tm.tm_year) + 1900 - (tm.tm_mon < 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t mp = (tm.tm_mon + 9) % 12;
+    int64_t doy = (153 * mp + 2) / 5 + tm.tm_mday - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + doe - 719468;
+    timet = time_t(days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+  }
 #else
   time_t timet = timegm(&tm);
 #endif

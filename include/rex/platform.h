@@ -28,7 +28,12 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
+#if defined(__SWITCH__) || defined(REX_PLATFORM_SWITCH)
+// Nintendo Switch homebrew (devkitA64 + libnx, newlib libc). POSIX-ish, but NOT Linux.
+#ifndef REX_PLATFORM_SWITCH
+#define REX_PLATFORM_SWITCH 1
+#endif
+#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
 #define REX_PLATFORM_MAC 1
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
@@ -44,6 +49,9 @@
 
 // Ensure all platform macros are always defined (0 when inactive)
 // so they can be used in static_assert and regular expressions.
+#ifndef REX_PLATFORM_SWITCH
+#define REX_PLATFORM_SWITCH 0
+#endif
 #ifndef REX_PLATFORM_MAC
 #define REX_PLATFORM_MAC 0
 #endif

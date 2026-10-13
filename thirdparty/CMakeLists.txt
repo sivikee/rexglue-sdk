@@ -179,6 +179,10 @@ set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL ON CACHE BOOL "" FORCE)
 add_subdirectory(spdlog)
 target_compile_options(spdlog PRIVATE -w)
+if(REX_SWITCH)
+    # newlib struct tm has no tm_gmtoff
+    target_compile_definitions(spdlog PUBLIC SPDLOG_NO_TZ_OFFSET)
+endif()
 
 #=============================================================================
 # utfcpp - UTF-8 string library (header-only)
@@ -301,7 +305,17 @@ if(UNIX AND NOT APPLE)
     set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
 endif()
 
+if(REX_SWITCH)
+    # SDL3 has no Nintendo Switch backend (devkitPro only ships SDL2). Expose the
+    # vendored SDL3 *headers only* so rexui/rexinput/rexaudio compile. Linking is
+    # NOT possible yet: window/input/audio must be reimplemented on libnx/SDL2.
+    # See ports/switch/README.md ("Stubs").
+    add_library(SDL3-headers-only INTERFACE)
+    target_include_directories(SDL3-headers-only INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/sdl3/include)
+    add_library(SDL3::SDL3 ALIAS SDL3-headers-only)
+else()
 add_subdirectory(sdl3)
+endif()
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
@@ -427,6 +441,19 @@ configure_file(
   COPYONLY
 )
 
+# Nintendo Switch (newlib/libnx): FFmpeg's checked-in config.h has no entry for it.
+# Derive an overlay config from the linux-aarch64 one with the Linux-only probes
+# turned off, and put it ahead of the FFmpeg source dir in the include path.
+if(REX_SWITCH)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg/config_linux_aarch64.h" _ffcfg)
+    foreach(_sym LINUX_PERF_EVENT_H SYS_RESOURCE_H SCHED_GETAFFINITY GETRUSAGE SETRLIMIT
+                 MPROTECT MMAP MEMALIGN GETADDRINFO STRERROR_R SYSCONF)
+        string(REGEX REPLACE "#define HAVE_${_sym} 1" "#define HAVE_${_sym} 0" _ffcfg "${_ffcfg}")
+    endforeach()
+    string(REPLACE "--target-os=linux" "--target-os=none" _ffcfg "${_ffcfg}")
+    file(WRITE "${FFMPEG_OVERLAY_BUILD_DIR}/config.h" "${_ffcfg}")
+endif()
+
 # Common defines for both libraries
 set(FFMPEG_COMMON_DEFINES
     HAVE_AV_CONFIG_H
@@ -551,6 +578,10 @@ if(IS_ARM64)
         HAVE_ARMV8=1
         HAVE_INLINE_ASM=1
     )
+endif()
+
+if(REX_SWITCH)
+    target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
 endif()
 
 target_include_directories(libavutil

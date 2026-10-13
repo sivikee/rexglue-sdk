@@ -72,6 +72,10 @@ elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_mac.cpp
     )
+elseif(REX_SWITCH)
+    set(REXUI_PLATFORM_SOURCES
+        surface_switch.cpp  # STUB (see ports/switch/README.md)
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -146,7 +150,7 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 # Platform-specific dependencies
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT REX_SWITCH)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every

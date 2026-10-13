@@ -10,9 +10,14 @@
 #include <rex/chrono/clock.h>
 #include <rex/platform.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "This file is POSIX-only");
 
 #include <sys/time.h>
+
+#if REX_PLATFORM_SWITCH && !defined(CLOCK_MONOTONIC_RAW)
+// newlib/libnx: no RAW clock; CLOCK_MONOTONIC is backed by the system tick.
+#define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
+#endif
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>

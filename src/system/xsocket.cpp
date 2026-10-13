@@ -27,7 +27,9 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#if !REX_PLATFORM_SWITCH
 #include <netinet/ip.h>
+#endif
 #include <sys/socket.h>
 #endif
 

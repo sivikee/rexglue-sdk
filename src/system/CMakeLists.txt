@@ -48,7 +48,12 @@ set(REXSYSTEM_SOURCES
     xex_module.cpp
 )
 
-add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+# Switch has no dlopen of arbitrary shared objects: build everything static
+if(REX_SWITCH)
+    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
+else()
+    add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+endif()
 add_library(rex::runtime ALIAS rexruntime)
 add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)

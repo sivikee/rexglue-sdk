@@ -18,12 +18,24 @@ project(ReXGlue
 #==========================================================
 # Build Options
 #==========================================================
+# Nintendo Switch homebrew (devkitA64 + libnx). Selected by devkitPro's Switch.cmake
+# toolchain file (CMAKE_SYSTEM_NAME=NintendoSwitch). See ports/switch/README.md.
+set(REX_SWITCH FALSE)
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(REX_SWITCH TRUE)
+endif()
+
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
 # Propagate profiling defines globally (compiled out in Release)
+if(REX_SWITCH)
+    # No profiler client for libnx
+    set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
+    set(REXGLUE_ENABLE_PERF_COUNTERS OFF CACHE BOOL "" FORCE)
+endif()
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
 endif()
@@ -34,7 +46,11 @@ endif()
 # Graphics backend selection
 # D3D12: Windows only, ON by default.
 # Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
-if(WIN32)
+if(REX_SWITCH)
+    # Switch has no D3D12/Vulkan path in the SDK yet (a deko3d/GL backend is future work)
+    set(REXGLUE_USE_D3D12 OFF)
+    set(REXGLUE_USE_VULKAN OFF)
+elseif(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
 else()
@@ -42,7 +58,7 @@ else()
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 endif()
 
-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+if(NOT REX_SWITCH AND NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
     message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
 endif()
 
@@ -79,8 +95,13 @@ elseif(APPLE)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 endif()
 
-# Enforce a Clang toolchain (LLVM Clang or Apple's Clang)
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
+# Enforce a Clang toolchain (LLVM Clang or Apple's Clang). devkitA64 only ships GCC,
+# so the Switch port builds with GCC (>= 14 for C++23).
+if(REX_SWITCH)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS "14.0")
+        message(FATAL_ERROR "Switch build expects devkitA64 GCC >= 14 (found ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION})")
+    endif()
+elseif(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
     message(FATAL_ERROR "ReXGlue requires the Clang compiler (LLVM Clang or AppleClang). Please set CMAKE_CXX_COMPILER to clang++")
 endif()
 
@@ -114,7 +135,7 @@ function(rex_config_postfix target)
         RELWITHDEBINFO_POSTFIX "${CMAKE_RELWITHDEBINFO_POSTFIX}")
 endfunction()
 
-if(NOT WIN32)
+if(NOT WIN32 AND NOT REX_SWITCH)
     # Use appropriate code model based on architecture
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
         # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
@@ -129,9 +150,14 @@ if(NOT WIN32)
 endif()
 
 # Global compile options
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC has no -ffp-model; strict FP == no contraction
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX,C>:-ffp-contract=off>)
+else()
+    add_compile_options(-ffp-model=strict)
+endif()
 add_compile_options(
     -fno-strict-aliasing
-    -ffp-model=strict
     $<$<CONFIG:DEBUG>:-g>
     $<$<CONFIG:DEBUG>:-O0>
     $<$<CONFIG:RELEASE>:-O3>
@@ -149,7 +175,11 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
     list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TARGET_PROCESSOR)
 endif()
 
-if(WIN32)
+if(REX_SWITCH)
+    set(REX_PLATFORM "switch-arm64")
+    # newlib hides fileno/strdup/setenv/pread/... without a feature-test macro
+    add_compile_definitions(REX_PLATFORM_SWITCH=1 _GNU_SOURCE)
+elseif(WIN32)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "win-amd64")
     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
@@ -243,6 +273,7 @@ endif()
 # Third-party dependencies (vendored sources only)
 add_subdirectory(thirdparty)
 
+
 # Enable warnings after thirdparty
 add_compile_options(
     -Wall
@@ -259,8 +290,11 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-add_subdirectory(src/codegen)
-add_subdirectory(src/rexglue)
+if(NOT REX_SWITCH)
+    # Codegen tool runs on the PC, never on the Switch
+    add_subdirectory(src/codegen)
+    add_subdirectory(src/rexglue)
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)
@@ -268,7 +302,9 @@ if(REXGLUE_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-include(cmake/rexglue_link_audit.cmake)
+if(NOT REX_SWITCH)
+    include(cmake/rexglue_link_audit.cmake)
+endif()
 
 # Print configuration summary
 message(STATUS "===========================================")
@@ -286,7 +322,7 @@ message(STATUS "  Perf Counters: ${REXGLUE_ENABLE_PERF_COUNTERS}")
 message(STATUS "===========================================")
 
 # SDK install/export rules (skipped when consumed as a subdirectory)
-if(PROJECT_IS_TOP_LEVEL)
+if(PROJECT_IS_TOP_LEVEL AND NOT REX_SWITCH)
     include(cmake/rexglue_devenv.cmake)
     include(cmake/rexglue_install.cmake)
 else()

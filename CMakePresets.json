@@ -7,6 +7,34 @@
     },
     "configurePresets": [
         {
+            "name": "switch-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "toolchainFile": "$env{DEVKITPRO}/cmake/Switch.cmake",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_CXX_STANDARD": "23",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "REXGLUE_BUILD_TESTS": "OFF",
+                "REXGLUE_ENABLE_TRACY": "OFF",
+                "REXGLUE_ENABLE_FIDELITYFX": "OFF",
+                "REXGLUE_ENABLE_PERF_COUNTERS": "OFF",
+                "REXGLUE_USE_VULKAN": "OFF"
+            }
+        },
+        {
+            "name": "switch-release",
+            "displayName": "Nintendo Switch (devkitA64/libnx) Release",
+            "inherits": "switch-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "switch-debug",
+            "displayName": "Nintendo Switch (devkitA64/libnx) Debug",
+            "inherits": "switch-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
             "name": "windows-base",
             "hidden": true,
             "generator": "Ninja Multi-Config",
