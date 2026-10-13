@@ -2506,11 +2506,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
+      // Always go through RequestRange: it is cheap for pages that are still
+      // valid, and it is what re-uploads pages the CPU rewrote in place. Skipping
+      // it when the address/size matched the previous request left vertex
+      // buffers updated in place (e.g. Oblivion's menu quads) stale forever.
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
