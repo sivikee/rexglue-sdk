@@ -1552,6 +1552,10 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
             REXCODEGEN_TRACE(
                 "detectJumpTable: bctr=0x{:08X} found slwi at 0x{:08X} indexReg now r{}", bctrAddr,
                 scanAddr, indexReg);
+            // OBLIVION PATCH: the first scaling shift yields the real index register. Tracing
+            // further back crosses unrelated writers (extsh, control-flow joins) and picks a
+            // stale register, producing a switch on the wrong value.
+            indexReg = 0xFF;
           } else {
             // Non-slwi rlwinm writes to indexReg, stop tracing
             REXCODEGEN_TRACE(
