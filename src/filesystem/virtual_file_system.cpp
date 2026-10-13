@@ -103,6 +103,7 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
 }
 
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
+  static thread_local bool relative_retry = false;
   auto global_lock = global_critical_region_.Acquire();
 
   // Resolve relative paths
@@ -120,6 +121,15 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
   });
   if (it == devices_.cend()) {
+    // OBLIVION PATCH: device-less relative paths (no drive/device prefix) are
+    // treated as relative to the game root, like the title's default D:\ directory.
+    if (!path.empty() && path.front() != '\\' && path.find(':') == std::string_view::npos &&
+        !relative_retry) {
+      relative_retry = true;
+      auto* e = ResolvePath(std::string("game:\\") + std::string(path));
+      relative_retry = false;
+      return e;
+    }
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
