@@ -115,9 +115,11 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
 #if REX_PLATFORM_SWITCH
-// Nintendo Switch: reserves `size` bytes of contiguous address space (virtmem) for the guest
-// arena; MapFileView() must then be given fixed addresses inside it.
-void* ReserveGuestAddressSpace(size_t size);
+// Nintendo Switch: the app hands over a block of its process heap (reserved in __libnx_initheap) that
+// backs committed guest memory; SwitchInitGuestArena() then claims the guest windows inside the
+// stack region and returns the arena base (guest address g is at base + g). See memory_switch.cpp.
+void SwitchSetGuestPool(void* pool, size_t size);
+void* SwitchInitGuestArena();
 // Called from the fault handler: commits the segment backing `address` if it lies inside the
 // guest arena. Returns true if the faulting access can be retried.
 bool HandleGuestMemoryFault(uintptr_t address);

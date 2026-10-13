@@ -162,14 +162,8 @@ bool Memory::Initialize() {
   // we pick, so try a few times.
   mapping_base_ = 0;
 #if REX_PLATFORM_SWITCH
-  // Horizon: the arena must come from the process address space manager (libnx virtmem).
-  {
-    auto mapping_base = reinterpret_cast<uint8_t*>(rex::memory::ReserveGuestAddressSpace(
-        static_cast<size_t>(0x120000000ull) + 0x10000));
-    if (mapping_base && !MapViews(mapping_base)) {
-      mapping_base_ = mapping_base;
-    }
-  }
+  // Horizon: no aliased views; a few linear guest windows inside the stack region (memory_switch.cpp).
+  mapping_base_ = reinterpret_cast<uint8_t*>(rex::memory::SwitchInitGuestArena());
 #else
   for (size_t n = 32; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
@@ -186,7 +180,12 @@ bool Memory::Initialize() {
   }
 #endif
   virtual_membase_ = mapping_base_;
+#if REX_PLATFORM_SWITCH
+  // The "raw physical" view is the A0000000 window itself (no aliasing on Switch).
+  physical_membase_ = mapping_base_ + 0xA0000000ull;
+#else
   physical_membase_ = mapping_base_ + 0x100000000ull;
+#endif
 
   REXSYS_INFO("Guest memory arena mapped: virtual base 0x{:016X}, physical base 0x{:016X}",
               reinterpret_cast<uintptr_t>(virtual_membase_),
@@ -195,34 +194,53 @@ bool Memory::Initialize() {
   // Prepare virtual heaps.
   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
                               0x40000000, 4096);
+#if REX_PLATFORM_SWITCH
+  // Only the windows listed in memory_switch.cpp exist: the XEX heap is capped to 64 MiB
+  // (0x80000000..0x83FFFFFF); LookupHeapByType redirects everything else onto v40000000/vA0000000.
+  heaps_.v40000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x40000000,
+                              0x40000000 - 0x01000000, 64 * 1024);
+  heaps_.v80000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x80000000,
+                              0x04000000, 64 * 1024);
+#else
   heaps_.v40000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x40000000,
                               0x40000000 - 0x01000000, 64 * 1024);
   heaps_.v80000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x80000000,
                               0x10000000, 64 * 1024);
+#endif
   heaps_.v90000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x90000000,
                               0x10000000, 4096);
 
   // Prepare physical heaps.
+#if REX_PLATFORM_SWITCH
+  constexpr uint32_t kPhysSize = 0x1FE00000;  // window is 2 MiB shorter than 512 MiB (memory_switch.cpp)
+#else
+  constexpr uint32_t kPhysSize = 0x20000000;
+#endif
   heaps_.physical.Initialize(this, physical_membase_, memory::HeapType::kGuestPhysical, 0x00000000,
-                             0x20000000, 4096);
+                             kPhysSize, 4096);
   heaps_.vA0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xA0000000,
-                              0x20000000, 64 * 1024, &heaps_.physical);
+                              kPhysSize, 64 * 1024, &heaps_.physical);
   heaps_.vC0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xC0000000,
                               0x20000000, 16 * 1024 * 1024, &heaps_.physical);
   heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
                               0x1FD00000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
+#if !REX_PLATFORM_SWITCH
   heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
                               !REXCVAR_GET(protect_zero)
                                   ? memory::kMemoryProtectRead | memory::kMemoryProtectWrite
                                   : memory::kMemoryProtectNoAccess);
+#endif
+#if !REX_PLATFORM_SWITCH
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
                              memory::kMemoryProtectNoAccess);
+#endif
 
   // GPU writeback.
   // 0xC... is physical, 0x7F... is virtual. We may need to overlay these.
+#if !REX_PLATFORM_SWITCH
   heaps_.vC0000000.AllocFixed(0xC0000000, 0x01000000, 32,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
                               memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
@@ -232,6 +250,7 @@ bool Memory::Initialize() {
   rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
                           rex::memory::AllocationType::kCommit,
                           rex::memory::PageAccess::kReadWrite);
+#endif
 
   // Install MMIO handler for physical address translation and MMIO ranges
   mmio_handler_ = runtime::MMIOHandler::Install(
@@ -428,6 +447,11 @@ const BaseHeap* Memory::LookupHeap(uint32_t address) const {
 }
 
 BaseHeap* Memory::LookupHeapByType(bool physical, uint32_t page_size) {
+#if REX_PLATFORM_SWITCH
+  // Only the 64 KiB virtual heap and the A0000000 physical heap exist on Switch.
+  (void)page_size;
+  return physical ? static_cast<BaseHeap*>(&heaps_.vA0000000) : static_cast<BaseHeap*>(&heaps_.v40000000);
+#endif
   if (physical) {
     if (page_size <= 4096) {
       return &heaps_.vE0000000;
