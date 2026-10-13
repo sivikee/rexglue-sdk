@@ -161,6 +161,16 @@ bool Memory::Initialize() {
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
+#if REX_PLATFORM_SWITCH
+  // Horizon: the arena must come from the process address space manager (libnx virtmem).
+  {
+    auto mapping_base = reinterpret_cast<uint8_t*>(rex::memory::ReserveGuestAddressSpace(
+        static_cast<size_t>(0x120000000ull) + 0x10000));
+    if (mapping_base && !MapViews(mapping_base)) {
+      mapping_base_ = mapping_base;
+    }
+  }
+#else
   for (size_t n = 32; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
     if (!MapViews(mapping_base)) {
@@ -168,6 +178,7 @@ bool Memory::Initialize() {
       break;
     }
   }
+#endif
   if (!mapping_base_) {
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
     assert_always();

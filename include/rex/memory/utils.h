@@ -114,6 +114,15 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
+#if REX_PLATFORM_SWITCH
+// Nintendo Switch: reserves `size` bytes of contiguous address space (virtmem) for the guest
+// arena; MapFileView() must then be given fixed addresses inside it.
+void* ReserveGuestAddressSpace(size_t size);
+// Called from the fault handler: commits the segment backing `address` if it lies inside the
+// guest arena. Returns true if the faulting access can be retried.
+bool HandleGuestMemoryFault(uintptr_t address);
+#endif
+
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
 template <typename T>
