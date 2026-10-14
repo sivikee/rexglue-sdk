@@ -120,6 +120,23 @@ int64_t PoolAlloc(State& s, size_t count) {
   return -1;
 }
 
+// Diagnostic: log every mapped block overlapping the guest windows.
+void LogWindowBlocks(State& s, const char* label) {
+  u32 pi = 0;
+  for (int i = 0; i < kWindowCount; ++i) {
+    u64 a = reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo, end = a + g_windows[i].size;
+    while (a < end) {
+      MemoryInfo m{};
+      if (R_FAILED(svcQueryMemory(&m, &pi, a))) break;
+      if (m.type != 0) {
+        REXLOG_WARN("{}: window {} block {:X}+{:X} type={} perm={} attr={}", label, i, m.addr, m.size, m.type,
+                    m.perm, m.attr);
+      }
+      a = m.addr + m.size;
+    }
+  }
+}
+
 // Commit units [first, first+count) of window `win` (all currently uncommitted and the
 // destination is contiguous in guest space; the pool run is contiguous too).
 bool CommitRun(State& s, int win, size_t first, size_t count) {
@@ -153,6 +170,7 @@ bool CommitRun(State& s, int win, size_t first, size_t count) {
         a = m.addr + m.size;
       }
     }
+    LogWindowBlocks(s, "commit failure");
     for (size_t k = 0; k < count; ++k) {
       s.pool_used[static_cast<size_t>(p) + k] = false;
     }
@@ -281,6 +299,7 @@ void* SwitchInitGuestArena() {
   virtmemUnlock();
   s.total_units = units;
   s.pool_of.assign(units, -1);
+  LogWindowBlocks(s, "guest arena init");
   s.arena_ready = true;
   REXLOG_INFO("Switch guest arena: base {} (stack region {:X}+{:X}), pool {} MiB at {}",
               static_cast<void*>(s.base), stack_addr, stack_size, g_pool_size >> 20,

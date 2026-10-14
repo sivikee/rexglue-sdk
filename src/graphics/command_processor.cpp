@@ -35,6 +35,18 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#if REX_PLATFORM_SWITCH
+#include <atomic>
+namespace rex::graphics {
+// Switch diagnostics read by the app heartbeat: what the command processor is doing right now.
+std::atomic<uint64_t> g_switch_gpu_packets{0};
+std::atomic<uint32_t> g_switch_gpu_opcode{0};
+std::atomic<uint32_t> g_switch_gpu_wait_info{0}, g_switch_gpu_wait_addr{0}, g_switch_gpu_wait_ref{0},
+    g_switch_gpu_wait_mask{0}, g_switch_gpu_wait_value{0};
+std::atomic<uint32_t> g_switch_gpu_waiting{0};
+}  // namespace rex::graphics
+#endif
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
@@ -752,6 +764,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+#if REX_PLATFORM_SWITCH
+  g_switch_gpu_packets.fetch_add(1, std::memory_order_relaxed);
+  g_switch_gpu_opcode.store(opcode, std::memory_order_relaxed);
+#endif
   bool result = false;
   switch (opcode) {
     case PM4_ME_INIT:
@@ -1030,6 +1046,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+#if REX_PLATFORM_SWITCH
+      g_switch_gpu_waiting.store(1, std::memory_order_relaxed);
+      g_switch_gpu_wait_info.store(wait_info, std::memory_order_relaxed);
+      g_switch_gpu_wait_addr.store(poll_reg_addr, std::memory_order_relaxed);
+      g_switch_gpu_wait_ref.store(ref, std::memory_order_relaxed);
+      g_switch_gpu_wait_mask.store(mask, std::memory_order_relaxed);
+      g_switch_gpu_wait_value.store(value, std::memory_order_relaxed);
+#endif
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1051,6 +1075,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+#if REX_PLATFORM_SWITCH
+  g_switch_gpu_waiting.store(0, std::memory_order_relaxed);
+#endif
 
   return true;
 }

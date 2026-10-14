@@ -28,6 +28,9 @@ REXCVAR_DEFINE_STRING(gl_screenshot_dir, "", "GPU",
                       "GL backend: directory for presented-frame screenshots (.ppm); empty disables");
 REXCVAR_DEFINE_INT32(gl_screenshot_swaps, 0, "GPU",
                      "GL backend: write a screenshot every N swaps (0 = only gl_screenshot_first)");
+REXCVAR_DEFINE_INT32(gl_screenshot_from, 0, "GPU",
+                     "GL backend: from this swap index on, screenshot every gl_screenshot_from_every swaps (0 = off)");
+REXCVAR_DEFINE_INT32(gl_screenshot_from_every, 5, "GPU", "GL backend: interval used with gl_screenshot_from");
 REXCVAR_DEFINE_INT32(gl_screenshot_first, 1, "GPU",
                      "GL backend: also screenshot the swap with this index (1-based, 0 = none)");
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
@@ -925,6 +928,16 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   uint32_t base = fetch.base_address << 12;
   uint32_t w = fetch.size_2d.width + 1, h = fetch.size_2d.height + 1;
   bool have = base != 0 && w > 1 && h > 1 && w <= 4096 && h <= 4096;
+  {
+    static uint32_t last_swz = 0xFFFFFFFFu;
+    static uint32_t last_fmt = 0xFFFFFFFFu;
+    if (uint32_t(fetch.swizzle) != last_swz || uint32_t(fetch.format) != last_fmt) {
+      last_swz = uint32_t(fetch.swizzle);
+      last_fmt = uint32_t(fetch.format);
+      REXGPU_INFO("GL swap #{}: frontbuffer fetch swizzle={:03X} format={} endian={}", swap_count_, last_swz, last_fmt,
+                  uint32_t(fetch.endianness));
+    }
+  }
   if (swap_count_ <= 3 || (swap_count_ % 300) == 0) {
     REXGPU_INFO(
         "GL swap #{}: ptr={:08X} {}x{} fetch base={:08X} {}x{} fmt={} endian={} tiled={} pitch={} | draws={} "
@@ -980,6 +993,14 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
             v = uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
             break;
         }
+        // Apply the fetch-constant swizzle to the colour channels (RGBA identity = no change).
+        uint32_t swz = uint32_t(fetch.swizzle);
+        if ((swz & 0x1FF) != 0x88) {
+          uint32_t comp[6] = {v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF, 0, 0xFF};
+          uint32_t r = comp[std::min<uint32_t>(swz & 7, 5)], g = comp[std::min<uint32_t>((swz >> 3) & 7, 5)],
+                   b = comp[std::min<uint32_t>((swz >> 6) & 7, 5)];
+          v = r | (g << 8) | (b << 16) | (v & 0xFF000000u);
+        }
         px[size_t(y) * w + x] = v;
       }
     }
@@ -1012,7 +1033,9 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   if (!dir.empty()) {
     int every = REXCVAR_GET(gl_screenshot_swaps);
     int first = REXCVAR_GET(gl_screenshot_first);
-    bool shot = (first && int(swap_count_) == first) || (every > 0 && (swap_count_ % every) == 0);
+    int from = REXCVAR_GET(gl_screenshot_from), from_every = std::max(1, REXCVAR_GET(gl_screenshot_from_every));
+    bool shot = (first && int(swap_count_) == first) || (every > 0 && (swap_count_ % every) == 0) ||
+                (from > 0 && int(swap_count_) >= from && (swap_count_ % from_every) == 0);
     if (shot) {
       WritePpm(dir + "/shot_" + std::to_string(swap_count_) + ".ppm", sw, sh);
     }

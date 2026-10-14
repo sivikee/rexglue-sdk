@@ -7,6 +7,9 @@
  */
 
 #include <rex/platform.h>
+#if REX_PLATFORM_SWITCH
+#include <switch.h>
+#endif
 #include <rex/thread.h>
 
 static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "This file is POSIX-only");
@@ -1432,6 +1435,12 @@ class PosixThread : public PosixConditionHandle<Thread> {
 thread_local PosixThread* current_thread_ = nullptr;
 
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+#if REX_PLATFORM_SWITCH
+  // libnx pthreads are created with core -2 = pinned to the process' single default core; at one equal
+  // priority Horizon never preempts, so guest threads that poll/yield starve each other (loading hangs).
+  // Allow all three application cores (0..2) and let the kernel balance.
+  svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7);
+#endif
 #if !REX_PLATFORM_ANDROID
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
     assert_always();
