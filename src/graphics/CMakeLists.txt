@@ -97,8 +97,8 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 if(REX_SWITCH)
-    # TODO(switch): the GPU plugin is runtime-loaded (dlopen) and needs a Vulkan/D3D12
-    # backend; neither exists for Switch yet. Skipped entirely in this phase.
+    # Switch: no runtime-loaded plugin. The OpenGL (EGL/Mesa) backend is a static library linked into the app.
+    include(${CMAKE_CURRENT_LIST_DIR}/gl/CMakeLists.cmake)
     return()
 endif()
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
