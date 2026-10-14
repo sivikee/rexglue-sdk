@@ -161,7 +161,9 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller.sdl)), guid_text,
                      static_cast<int>(sizeof(guid_text)));
     info.guid = guid_text;
-    info.synthetic = false;
+    // Virtual pads (an on-screen touch controller) feed player one without taking its
+    // slot, like keyboard and mouse, so a real pad connected later is still player one.
+    info.synthetic = SDL_IsJoystickVirtual(SDL_GetJoystickID(SDL_GetGamepadJoystick(controller.sdl)));
     out.push_back(info);
   }
 }
