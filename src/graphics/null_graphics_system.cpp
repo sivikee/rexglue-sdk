@@ -338,6 +338,7 @@ bool NullGraphicsSystem::ExecuteType3(Reader& r, uint32_t packet) {
       bool is_mem = (info & 0x10) != 0;
       waits_.fetch_add(1, std::memory_order_relaxed);
       int spins = 0;
+      uint32_t total_spins = 0;
       while (running_) {
         uint32_t v;
         if (is_mem) {
@@ -349,6 +350,12 @@ bool NullGraphicsSystem::ExecuteType3(Reader& r, uint32_t packet) {
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (Compare(info, v, mask, ref)) break;
+        if (++total_spins == 2000) {
+          REXGPU_WARN(
+              "NullGraphicsSystem: WAIT_REG_MEM stuck: info={:08X} addr={:08X} ref={:08X} "
+              "mask={:08X} wait={:X} value={:08X}",
+              info, addr, ref, mask, wait, v);
+        }
         if (wait >= 0x100 || ++spins > 100) {
           rex::thread::Sleep(std::chrono::milliseconds(1));
         } else {

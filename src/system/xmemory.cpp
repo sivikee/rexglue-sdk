@@ -1362,7 +1362,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
       // Already reserved.
       REXSYS_ERROR(
           "BaseHeap::AllocFixed attempting to reserve an already reserved "
-          "range (base={:08X} size={:08X} heap={:08X} page={:08X})", base_address, size, heap_base_, page_size_);
+          "range");
       return false;
     }
     if ((allocation_type == memory::kMemoryAllocationCommit) &&

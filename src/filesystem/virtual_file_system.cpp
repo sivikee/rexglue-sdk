@@ -229,9 +229,6 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
-#if REX_PLATFORM_SWITCH
-      REXFS_WARN("[vfs] OpenFile '{}': parent '{}' not found", std::string(path), base_path);
-#endif
       *out_action = FileAction::kDoesNotExist;
       return X_STATUS_NO_SUCH_FILE;
     }
@@ -242,12 +239,6 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
 
-#if REX_PLATFORM_SWITCH
-  if (!entry) {
-    REXFS_WARN("[vfs] OpenFile '{}': entry not found (parent '{}', name '{}')", std::string(path),
-               base_path, rex::string::utf8_find_name_from_guest_path(path));
-  }
-#endif
   if (entry) {
     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
       return X_STATUS_FILE_IS_A_DIRECTORY;

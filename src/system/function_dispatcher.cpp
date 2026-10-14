@@ -13,6 +13,7 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <cstring>
 #include <string>
 
 #include <fmt/format.h>
@@ -26,11 +27,15 @@
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
+#include <rex/system/xthread.h>
 
 #if REX_PLATFORM_SWITCH
 namespace rex {
 volatile int g_import_trace = 0;
 void TraceImport(const char* name, uint32_t lr, uint32_t r3_in, uint32_t r3_out) {
+  auto* th = rex::system::XThread::GetCurrentThread();
+  if (g_import_trace > 1 && (!th || th->thread_id() != uint32_t(g_import_trace - 1))) return;
+  if (std::strstr(name, "CriticalSection")) return;
   REXLOG_INFO("[imp] {} lr={:08X} r3 {:08X} -> {:08X}", name, lr, r3_in, r3_out);
 }
 }  // namespace rex
@@ -48,6 +53,7 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
+#if REX_PLATFORM_SWITCH
   {
     // Best-effort guest call stack (saved-LR chain) to make the trap actionable.
     auto ld = [&](uint32_t a) { return rex::byte_swap(*reinterpret_cast<uint32_t*>(base + a)); };
@@ -62,6 +68,9 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
     REXLOG_ERROR("InvalidFunctionTrap: lr={:08X} r1={:08X} r3={:08X} call stack:{}",
                  uint32_t(ctx.lr), ctx.r1.u32, ctx.r3.u32, stack);
   }
+#else
+  (void)base;
+#endif
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
             ctx.last_indirect_target);
 }
