@@ -65,6 +65,19 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
       stack += fmt::format(" {:08X}", ld(back - 8));
       sp = back;
     }
+    {
+      std::string regs;
+      const uint32_t rv[] = {ctx.r3.u32,ctx.r4.u32,ctx.r5.u32,ctx.r6.u32,ctx.r7.u32,ctx.r8.u32,ctx.r9.u32,ctx.r10.u32,ctx.r11.u32,ctx.r12.u32,ctx.r13.u32,ctx.r14.u32,ctx.r15.u32,ctx.r16.u32,ctx.r17.u32,ctx.r18.u32,ctx.r19.u32,ctx.r20.u32,ctx.r21.u32,ctx.r22.u32,ctx.r23.u32,ctx.r24.u32,ctx.r25.u32,ctx.r26.u32,ctx.r27.u32,ctx.r28.u32,ctx.r29.u32,ctx.r30.u32,ctx.r31.u32};
+      for (int i = 0; i < 29; ++i) regs += fmt::format(" r{}={:08X}", i + 3, rv[i]);
+      REXLOG_ERROR("InvalidFunctionTrap regs:{}", regs);
+      for (uint32_t a : {ctx.r31.u32, ctx.r30.u32}) {
+        if (a >= 0x10000 && a < 0xBFF00000u) {
+          std::string d;
+          for (int k = -4; k < 28; ++k) d += fmt::format(" {:08X}", ld(a + k * 4));
+          REXLOG_ERROR("  mem at {:08X}-16:{}", a, d);
+        }
+      }
+    }
     REXLOG_ERROR("InvalidFunctionTrap: lr={:08X} r1={:08X} r3={:08X} call stack:{}",
                  uint32_t(ctx.lr), ctx.r1.u32, ctx.r3.u32, stack);
   }

@@ -23,10 +23,17 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "Th
 #include <mach/mach_time.h>
 #endif
 
+#if REX_PLATFORM_SWITCH
+#include <switch.h>
+#endif
+
 namespace rex::chrono {
 
 uint64_t Clock::host_tick_frequency_platform() {
-#ifdef __APPLE__
+#if REX_PLATFORM_SWITCH
+  // newlib's clock_gettime/clock_getres are not reliable under libnx: use the ARM system counter.
+  return armGetSystemTickFreq();
+#elif defined(__APPLE__)
   mach_timebase_info_data_t info;
   mach_timebase_info(&info);
   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
@@ -42,7 +49,9 @@ uint64_t Clock::host_tick_frequency_platform() {
 }
 
 uint64_t Clock::host_tick_count_platform() {
-#ifdef __APPLE__
+#if REX_PLATFORM_SWITCH
+  return armGetSystemTick();
+#elif defined(__APPLE__)
   // mach_absolute_time() returns raw hardware ticks; host_tick_frequency_platform()
   // expresses the rate of these same ticks via mach_timebase_info.
   // clock_gettime(CLOCK_MONOTONIC_RAW) returns nanoseconds, which would be
