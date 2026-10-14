@@ -43,6 +43,7 @@ struct NullGraphicsSystem::Reader {
   uint32_t rd;
   uint32_t wr;
   uint32_t remaining() const { return wr >= rd ? wr - rd : size - rd + wr; }
+  uint32_t Peek() const { return bswap(base[rd]); }
   uint32_t Next() {
     uint32_t v = bswap(base[rd]);
     if (++rd >= size) rd = 0;
@@ -160,6 +161,9 @@ void NullGraphicsSystem::Dispatch(uint32_t source, uint32_t cpu) {
   auto* thread = system::XThread::GetCurrentThread();
   if (!thread) return;
   if (cpu == 0xFFFFFFFF) cpu = 2;
+  // The ISR clears this CPU's bit in the GPU-visible sync dword (the CP waits for 0): it reads the
+  // processor number from the thread's PCR, so the interrupt must run "on" the requested CPU.
+  thread->SetActiveCpu(static_cast<uint8_t>(cpu));
   uint64_t args[] = {source, interrupt_data_.load()};
   dispatcher_->ExecuteInterrupt(thread->thread_state(), cb, args, 2);
   interrupts_.fetch_add(1, std::memory_order_relaxed);
@@ -257,8 +261,23 @@ void NullGraphicsSystem::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+namespace {
+// Diagnostics: last packets seen by the worker (dumped when WAIT_REG_MEM is stuck).
+struct PktHist {
+  uint32_t hdr[48];
+  uint32_t first[48];
+  uint32_t n = 0;
+};
+thread_local PktHist g_hist;
+}  // namespace
+
 bool NullGraphicsSystem::ExecutePacket(Reader& r) {
   uint32_t packet = r.Next();
+  {
+    uint32_t i = g_hist.n++ % 48;
+    g_hist.hdr[i] = packet;
+    g_hist.first[i] = r.remaining() ? r.Peek() : 0;
+  }
   if (packet == 0) return true;
   switch (packet >> 30) {
     case 0: {
@@ -350,6 +369,19 @@ bool NullGraphicsSystem::ExecuteType3(Reader& r, uint32_t packet) {
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (Compare(info, v, mask, ref)) break;
+        if (total_spins == 1999 || total_spins % 60000 == 59999) {
+          std::string h;
+          for (uint32_t k = 0; k < 48; ++k) {
+            uint32_t i = (g_hist.n + k) % 48;
+            h += fmt::format(" {:08X}:{:08X}", g_hist.hdr[i], g_hist.first[i]);
+          }
+          REXGPU_WARN("NullGraphicsSystem: packet history (oldest first):{}", h);
+          std::string m;
+          for (int k = -8; k < 24; ++k)
+            m += fmt::format(" {:08X}",
+                             *reinterpret_cast<volatile uint32_t*>(memory_->TranslatePhysical((addr & ~3u) + k * 4)));
+          REXGPU_WARN("NullGraphicsSystem: raw mem at {:08X}-32:{}", addr & ~3u, m);
+        }
         if (++total_spins == 2000) {
           REXGPU_WARN(
               "NullGraphicsSystem: WAIT_REG_MEM stuck: info={:08X} addr={:08X} ref={:08X} "
