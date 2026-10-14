@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 #include <switch.h>
@@ -17,6 +18,11 @@ REXCVAR_DEFINE_BOOL(gl_parallel_compile, false, "GPU", "GL backend: enable GL_KH
 REXCVAR_DEFINE_BOOL(gl_async_compile, true, "GPU", "GL backend: translate and compile shader programs on a worker thread (draws are skipped until ready)");
 REXCVAR_DEFINE_STRING(gl_dump_shaders, "", "GPU",
                       "GL backend: directory to dump generated GLSL of failing/first shaders (empty = off)");
+
+REXCVAR_DEFINE_INT32(gl_debug_ps_strip, 0, "GPU", "GL debug (gl_debug_ps=5): 1 = drop SSBO decl, 2 = drop UBO decls, 4 = drop interpolator input");
+REXCVAR_DEFINE_INT32(gl_debug_vs, 0, "GPU", "GL debug: 1 = vertex shaders output a fullscreen triangle position");
+REXCVAR_DEFINE_INT32(gl_debug_ps, 0, "GPU",
+                     "GL backend debug: 1 = pixel shaders output magenta, 2 = output interpolator 0, 3 = output yellow if system constants flags look sane");
 
 namespace rex::graphics::gl {
 
@@ -92,6 +98,16 @@ GlShader* GlPipelineCache::LoadShader(xenos::ShaderType shader_type, const uint3
   auto it = shaders_.find(hash);
   if (it != shaders_.end()) {
     return it->second.get();
+  }
+  {
+    static int logged = 0;
+    if (logged++ < 40) {
+      REXGPU_INFO("GL LoadShader type={} dwords={} hash={:016X} data={:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                  uint32_t(shader_type), dword_count, hash, dword_count > 0 ? host_address[0] : 0,
+                  dword_count > 1 ? host_address[1] : 0, dword_count > 2 ? host_address[2] : 0,
+                  dword_count > 3 ? host_address[3] : 0, dword_count > 4 ? host_address[4] : 0,
+                  dword_count > 5 ? host_address[5] : 0);
+    }
   }
   auto shader = std::make_unique<GlShader>(shader_type, hash, host_address, dword_count);
   GlShader* ptr = shader.get();
@@ -302,8 +318,95 @@ void GlPipelineCache::StartLink(GlProgram& program) {
     glCompileShader(s);  // asynchronous with GL_KHR_parallel_shader_compile
     return s;
   };
-  program.vs_id = make(GL_VERTEX_SHADER, vs_glsl->source);
-  program.fs_id = ps_glsl ? make(GL_FRAGMENT_SHADER, ps_glsl->source) : 0;
+  std::string vs_source = vs_glsl->source;
+  if (REXCVAR_GET(gl_debug_vs) == 2) {
+    vs_source = "#version 430\nout gl_PerVertex { vec4 gl_Position; };\nvoid main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+  } else if (REXCVAR_GET(gl_debug_vs) == 1) {
+    size_t m = vs_source.find("void main()");
+    if (m != std::string::npos) {
+      vs_source.replace(m, 11, "void xe_vs_orig()");
+      vs_source += "\nvoid main() { xe_vs_orig(); vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+    }
+  }
+  if (REXCVAR_GET(gl_debug_vs) >= 3) {
+    size_t m = vs_source.find("void main()");
+    if (m != std::string::npos) {
+      vs_source.erase(m);
+      int strip = REXCVAR_GET(gl_debug_ps_strip);
+      auto erase_block = [&](const char* marker) {
+        size_t mk = vs_source.find(marker);
+        while (mk != std::string::npos) {
+          size_t st = vs_source.rfind("layout(", mk);
+          size_t en = vs_source.find(";", mk);
+          if (st == std::string::npos || en == std::string::npos) break;
+          vs_source.erase(st, en - st + 1);
+          mk = vs_source.find(marker);
+        }
+      };
+      if (strip & 1) erase_block("xe_shared_memory[4]");
+      if (strip & 2) { erase_block("xe_uniform_system_constants;"); erase_block("xe_uniform_bool_loop_constants;"); erase_block("xe_uniform_fetch_constants;"); erase_block("xe_uniform_float_constants;"); }
+      const char* extra = "";
+      if (REXCVAR_GET(gl_debug_vs) == 4) extra = " if (texelFetch(xe_sm_tbo_0, gl_VertexID & 15).x == 0xDEADBEEFu) gl_Position.z = 0.5;";
+      if (REXCVAR_GET(gl_debug_vs) == 5) extra = " if (xe_uniform_system_constants.flags == 0xFFFFFFFFu) gl_Position.z = 0.5;";
+      if (REXCVAR_GET(gl_debug_vs) == 6) extra = " if (xe_uniform_fetch_constants.fetch_constants[uint(gl_VertexID) & 7u].x == 0xDEADBEEFu) gl_Position.z = 0.5;";
+      vs_source += "void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);"; vs_source += extra; vs_source += " }\n";
+    }
+  }
+  program.vs_id = make(GL_VERTEX_SHADER, vs_source);
+  std::string ps_source = ps_glsl ? ps_glsl->source : std::string();
+  if (ps_glsl && REXCVAR_GET(gl_debug_ps) == 9) {
+    ps_source = "#version 430\nlayout(location = 0) out vec4 xe_out_fragment_data_0;\nvoid main() { xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+  } else if (ps_glsl && REXCVAR_GET(gl_debug_ps) > 0 && REXCVAR_GET(gl_debug_ps) <= 2 && ps_source.find("xe_out_fragment_data_0") != std::string::npos) {
+    size_t m = ps_source.find("void main()");
+    if (m != std::string::npos) {
+      ps_source.replace(m, 11, "void xe_main_orig()");
+      int mode = REXCVAR_GET(gl_debug_ps);
+      if (mode == 2 && ps_source.find("xe_in_interpolator_0") != std::string::npos) {
+        ps_source += "\nvoid main() { xe_main_orig(); xe_out_fragment_data_0 = vec4(xe_in_interpolator_0.xyz, 1.0); }\n";
+      } else {
+        ps_source += "\nvoid main() { xe_main_orig(); xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+      }
+    }
+  }
+  if (ps_glsl && (REXCVAR_GET(gl_debug_ps) == 3 || REXCVAR_GET(gl_debug_ps) == 4)) {
+    auto strip = [&](const char* what) {
+      size_t p;
+      while ((p = ps_source.find(what)) != std::string::npos) ps_source.erase(p, std::strlen(what));
+    };
+    strip("layout(early_fragment_tests) in;");
+    strip("invariant ");
+    strip("precise ");
+    if (REXCVAR_GET(gl_debug_ps) == 4) {
+      size_t m = ps_source.find("void main()");
+      if (m != std::string::npos) {
+        ps_source.replace(m, 11, "void xe_main_orig()");
+        ps_source += "\nvoid main() { xe_main_orig(); xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+      }
+    }
+  }
+  if (ps_glsl && REXCVAR_GET(gl_debug_ps) == 5) {
+    size_t m = ps_source.find("void main()");
+    if (m != std::string::npos) {
+      ps_source.erase(m);
+      int strip = REXCVAR_GET(gl_debug_ps_strip);
+      auto erase_block = [&](const char* marker) {
+        size_t mk = ps_source.find(marker);
+        while (mk != std::string::npos) {
+          size_t st = ps_source.rfind("layout(", mk);
+          size_t en = ps_source.find(";", mk);
+          if (st == std::string::npos || en == std::string::npos) break;
+          ps_source.erase(st, en - st + 1);
+          mk = ps_source.find(marker);
+        }
+      };
+      if (strip & 1) erase_block("xe_shared_memory[4]");
+      if (strip & 2) { erase_block("xe_uniform_system_constants;"); erase_block("xe_uniform_bool_loop_constants;"); erase_block("xe_uniform_fetch_constants;"); erase_block("xe_uniform_float_constants;"); }
+      if (strip & 4) erase_block("xe_in_interpolator_0;");
+      if (strip & 8) { size_t p = ps_source.find("layout(early_fragment_tests) in;"); if (p != std::string::npos) ps_source.erase(p, 32); p = ps_source.find("invariant "); if (p != std::string::npos) ps_source.erase(p, 10); }
+      ps_source += "void main() { xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+    }
+  }
+  program.fs_id = ps_glsl ? make(GL_FRAGMENT_SHADER, ps_source) : 0;
   program.program = glCreateProgram();
   glAttachShader(program.program, program.vs_id);
   if (program.fs_id) {
@@ -384,7 +487,9 @@ void GlPipelineCache::FinishLink(GlProgram& program, bool block) {
     if (dumped_ < 4) {
       ++dumped_;
       dump("vs_ok", vertex->glsl()->source, vertex->shader().ucode_data_hash());
+      dump("vs_ucode", vertex->shader().ucode_disassembly(), vertex->shader().ucode_data_hash());
       if (pixel) {
+        dump("ps_ucode", pixel->shader().ucode_disassembly(), pixel->shader().ucode_data_hash());
         dump("ps_ok", pixel->glsl()->source, pixel->shader().ucode_data_hash());
       }
     }

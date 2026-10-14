@@ -6,6 +6,7 @@
 #include <rex/logging.h>
 
 #include "gl_ext.h"
+#include "spirv_to_glsl.h"
 
 namespace rex::graphics::gl {
 
@@ -16,6 +17,11 @@ bool GlSharedMemory::Initialize() {
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, dummy_);
   uint8_t zeros[256] = {};
   glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(zeros), zeros, GL_STATIC_DRAW);
+  glGenTextures(kChunkCount, tbos_);
+  for (uint32_t i = 0; i < kChunkCount; ++i) {
+    glBindTexture(GL_TEXTURE_BUFFER, tbos_[i]);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, dummy_);
+  }
   return true;
 }
 
@@ -26,6 +32,10 @@ void GlSharedMemory::Shutdown(bool from_destructor) {
       chunks_[i] = 0;
       chunk_sizes_[i] = 0;
     }
+  }
+  if (tbos_[0]) {
+    glDeleteTextures(kChunkCount, tbos_);
+    for (auto& t : tbos_) t = 0;
   }
   if (dummy_) {
     glDeleteBuffers(1, &dummy_);
@@ -69,6 +79,8 @@ bool GlSharedMemory::EnsureChunkSize(uint32_t chunk_index, uint32_t size) {
   }
   chunks_[chunk_index] = buffer;
   chunk_sizes_[chunk_index] = size;
+  glBindTexture(GL_TEXTURE_BUFFER, tbos_[chunk_index]);
+  glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, buffer);
   REXGPU_INFO("GL shared memory: chunk {} resident {} MiB (total {} MiB)", chunk_index, size >> 20,
               total_bytes() >> 20);
   return true;
@@ -110,6 +122,12 @@ bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t
 }
 
 void GlSharedMemory::BindStorageBuffers(uint32_t first_binding) {
+  for (uint32_t i = 0; i < kChunkCount; ++i) {
+    glActiveTexture(GL_TEXTURE0 + kSharedMemoryTboUnitBase + i);
+    glBindTexture(GL_TEXTURE_BUFFER, tbos_[i]);
+    glBindSampler(kSharedMemoryTboUnitBase + i, 0);
+  }
+  glActiveTexture(GL_TEXTURE0);
   for (uint32_t i = 0; i < kChunkCount; ++i) {
     if (chunks_[i]) {
       glBindBufferRange(GL_SHADER_STORAGE_BUFFER, first_binding + i, chunks_[i], 0, chunk_sizes_[i]);

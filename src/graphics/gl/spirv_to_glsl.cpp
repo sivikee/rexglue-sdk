@@ -30,6 +30,50 @@ void DumpBlocks(spirv_cross::CompilerGLSL& comp) {
   dump("UBO", res.uniform_buffers);
   dump("SSBO", res.storage_buffers);
 }
+
+// Eden (and some drivers) cannot run vertex shaders that load from SSBOs; shared memory is therefore read
+// through R32UI texture buffers: xe_shared_memory[k].shared_memory[expr] -> texelFetch(xe_sm_tbo_k, int(expr)).x
+void RewriteSharedMemoryAsTbo(std::string& src) {
+  const std::string decl_marker = "xe_shared_memory[4];";
+  size_t dm = src.find(decl_marker);
+  if (dm == std::string::npos) {
+    return;
+  }
+  size_t ds = src.rfind("layout(", dm);
+  if (ds == std::string::npos) {
+    return;
+  }
+  std::string decls;
+  for (uint32_t i = 0; i < 4; ++i) {
+    decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase + i) +
+             ") uniform usamplerBuffer xe_sm_tbo_" + std::to_string(i) + ";\n";
+  }
+  src.replace(ds, dm + decl_marker.size() - ds, decls);
+  const std::string use = "xe_shared_memory[";
+  size_t pos = 0;
+  while ((pos = src.find(use, pos)) != std::string::npos) {
+    size_t k_begin = pos + use.size();
+    size_t k_end = src.find(']', k_begin);
+    const std::string member = "].shared_memory[";
+    if (k_end == std::string::npos || src.compare(k_end, member.size(), member) != 0) {
+      pos = k_begin;
+      continue;
+    }
+    std::string k = src.substr(k_begin, k_end - k_begin);
+    size_t e_begin = k_end + member.size();
+    size_t depth = 1, e = e_begin;
+    while (e < src.size() && depth) {
+      if (src[e] == '[') ++depth;
+      else if (src[e] == ']') --depth;
+      ++e;
+    }
+    std::string expr = src.substr(e_begin, e - 1 - e_begin);
+    std::string rep = "texelFetch(xe_sm_tbo_" + k + ", int(" + expr + ")).x";
+    src.replace(pos, e - pos, rep);
+    pos += rep.size();
+  }
+}
+
 }  // namespace
 
 bool ConvertSpirvToGlsl(const std::vector<uint8_t>& spirv, uint32_t texture_unit_base,
@@ -87,6 +131,7 @@ bool ConvertSpirvToGlsl(const std::vector<uint8_t>& spirv, uint32_t texture_unit
     remap(res.sampled_images);
     remap(res.storage_images);
     out.source = comp.compile();
+    RewriteSharedMemoryAsTbo(out.source);
     if (out.source.find("gl_CullDistance") != std::string::npos) {
       size_t nl = out.source.find('\n');
       out.source.insert(nl + 1, "#extension GL_ARB_cull_distance : require\n");

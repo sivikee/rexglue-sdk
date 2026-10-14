@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include <switch.h>
 #include <xxhash.h>
 
 #include <rex/cvar.h>
@@ -32,6 +33,8 @@ REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = sw
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
 REXCVAR_DEFINE_INT32(gl_log_draws, 0, "GPU", "GL backend: log the first N draws in detail");
 REXCVAR_DEFINE_INT32(gl_log_draws_from, 0, "GPU", "GL backend: also log 12 draws starting at this draw index (0 = off)");
+REXCVAR_DEFINE_INT32(gl_debug_raster, 0, "GPU", "GL debug bitmask: 1=no scissor 2=no cull 4=force colour write/no blend 8=no depth/stencil 16=viewport=full RT");
+REXCVAR_DEFINE_INT32(gl_max_viewport, 16384, "GPU", "GL backend: max viewport dimension used when computing the host viewport");
 REXCVAR_DEFINE_INT32(gl_dump_rt_swaps, 0, "GPU", "GL backend: dump colour RT 0 to rt_<swap>.ppm every N swaps");
 
 namespace rex::graphics::gl {
@@ -141,6 +144,7 @@ struct GlCommandProcessor::Impl {
   GLuint blit_program = 0;
   GLuint empty_vao = 0;
   GLuint front_tex = 0;
+  GLuint dbg_program = 0;
   uint32_t front_w = 0, front_h = 0;
   std::vector<uint32_t> front_pixels;
 
@@ -181,6 +185,15 @@ bool GlCommandProcessor::SetupContext() {
   glDeleteShader(vs);
   glDeleteShader(fs);
   glGenTextures(1, &impl_->front_tex);
+  {
+    const char* vs_src = "#version 430 core\nvoid main(){ vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+    const char* fs_src = "#version 430 core\nlayout(location=0) out vec4 o;\nvoid main(){ o = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+    GLuint dvs = Compile(GL_VERTEX_SHADER, vs_src), dfs = Compile(GL_FRAGMENT_SHADER, fs_src);
+    impl_->dbg_program = glCreateProgram();
+    glAttachShader(impl_->dbg_program, dvs);
+    glAttachShader(impl_->dbg_program, dfs);
+    glLinkProgram(impl_->dbg_program);
+  }
 
   // Draw path.
   if (glClipControl_) {
@@ -223,8 +236,39 @@ void GlCommandProcessor::ShutdownContext() {
   context_.Shutdown();
 }
 
-Shader* GlCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t,
+Shader* GlCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                        const uint32_t* host_address, uint32_t dword_count) {
+  if (shader_type == xenos::ShaderType::kVertex && dword_count == 24 && host_address[9] == 0x2 + 0x0010F823 && false) {}
+  {
+    static bool scanned = false;
+    if (!scanned && shader_type == xenos::ShaderType::kVertex && dword_count == 24 && host_address[0] == 0 && host_address[9] == 0x0010F825u) {
+      scanned = true;
+      uint64_t total = 0; int hits = 0;
+      uint32_t addr = 0x40000000u;
+      while (addr < 0x90000000u && hits < 8) {
+        auto* heap = memory_->LookupHeap(addr);
+        memory::HeapAllocationInfo info;
+        if (!heap || !heap->QueryRegionInfo(addr, &info) || !info.region_size) { addr += 0x10000; continue; }
+        uint32_t rsz = info.region_size;
+        if ((info.state & memory::kMemoryAllocationCommit) && info.protect) {
+          const uint32_t* base = reinterpret_cast<const uint32_t*>(memory_->TranslateVirtual(addr));
+          if (base) {
+            for (uint32_t i = 0; i + 24 < rsz / 4; ++i) {
+              if (base[i] == 0x30052003u || (base[i] == 0x03200530u && base[i + 1] == 0x00120000u && base[i + 3] == 0x05100000u)) {
+                std::string d;
+                for (int k = 0; k < 27; ++k) { char t[16]; std::snprintf(t, sizeof(t), "%08X ", base[i + k]); d += t; }
+                REXGPU_INFO("GL scan2 hit guest {:08X}: {}", addr + i * 4, d);
+                if (++hits >= 8) break;
+              }
+            }
+            total += rsz;
+          }
+        }
+        addr += rsz;
+      }
+      REXGPU_INFO("GL scan2 done {} MiB hits {}", total >> 20, hits);
+    }
+  }
   return impl_->pipeline_cache->LoadShader(shader_type, host_address, dword_count);
 }
 
@@ -266,6 +310,18 @@ bool GlCommandProcessor::PrepareVertexBuffers(const Shader& vertex_shader) {
       if (!impl_->shared_memory->RequestRange(address, size)) {
         REXGPU_ERROR("GL: failed to request vertex buffer {:08X} size {} in shared memory", address, size);
         return false;
+      }
+      if (dbg_log_vertex_) {
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(address));
+        uint32_t chunk = address >> GlSharedMemory::kChunkSizeLog2;
+        uint32_t host[8] = {};
+        GLuint buf = impl_->shared_memory->chunk(chunk);
+        if (buf) {
+          glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+          glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, address & (GlSharedMemory::kChunkSize - 1), sizeof(host), host);
+        }
+        REXGPU_INFO("GL vfetch#{} addr={:08X} size={} guest={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} | host buf={} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    index, address, size, g[0], g[1], g[2], g[3], g[4], g[5], buf, host[0], host[1], host[2], host[3], host[4], host[5]);
       }
     }
   }
@@ -675,7 +731,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
 
   // Viewport and render targets.
   draw_util::ViewportInfo viewport_info;
-  draw_util::GetHostViewportInfo(regs, 1, 1, true, 16384, 16384, true, normalized_depth_control, false, false,
+  draw_util::GetHostViewportInfo(regs, 1, 1, false, uint32_t(REXCVAR_GET(gl_max_viewport)), uint32_t(REXCVAR_GET(gl_max_viewport)), true, normalized_depth_control, false, false,
                                  pixel_shader && pixel_shader->writes_depth(), viewport_info);
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
@@ -688,6 +744,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     return true;  // no render target to draw to
   }
 
+  dbg_log_vertex_ = (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12);
   if (!PrepareVertexBuffers(*vertex_shader)) {
     return fail("vertex_buffers");
   }
@@ -726,6 +783,14 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
                    viewport_info, impl_->render_targets->bound_depth());
 
   chk("raster");
+  {
+    int dbg = REXCVAR_GET(gl_debug_raster);
+    if (dbg & 1) glDisable(GL_SCISSOR_TEST);
+    if (dbg & 2) glDisable(GL_CULL_FACE);
+    if (dbg & 4) { for (uint32_t i = 0; i < 4; ++i) { glColorMaski(i, 1, 1, 1, 1); glDisablei(GL_BLEND, i); } }
+    if (dbg & 8) { glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); }
+    if (dbg & 16) { glViewport(0, 0, GLsizei(impl_->render_targets->bound_width()), GLsizei(impl_->render_targets->bound_height())); }
+  }
   // Primitive topology.
   GLenum mode;
   switch (ppr.host_primitive_type) {
@@ -756,6 +821,29 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
         viewport_info.xy_offset[1], viewport_info.xy_extent[0], viewport_info.xy_extent[1], used_texture_mask);
   }
 
+  if (REXCVAR_GET(gl_debug_raster) & 32) {
+    glUseProgram(impl_->dbg_program);
+    glBindVertexArray(impl_->empty_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    float px[4] = {-1, -1, -1, -1};
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(100, 100, 1, 1, GL_RGBA, GL_FLOAT, px);
+    if (log_this) REXGPU_INFO("GL dbg32 draw #{}: err={} pixel={:.2f} {:.2f} {:.2f} {:.2f}", draw_count_, glGetError(), px[0], px[1], px[2], px[3]);
+    return true;
+  }
+  if (REXCVAR_GET(gl_debug_raster) & 64) {
+    glUseProgram(impl_->dbg_program);
+  }
+  if (REXCVAR_GET(gl_debug_raster) & 128) {
+    glUseProgram(impl_->dbg_program);
+    glBindVertexArray(impl_->empty_vao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    float px[4] = {-1, -1, -1, -1};
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(100, 100, 1, 1, GL_RGBA, GL_FLOAT, px);
+    if (log_this) REXGPU_INFO("GL dbg128 draw #{}: err={} pixel={:.2f} {:.2f} {:.2f} {:.2f}", draw_count_, glGetError(), px[0], px[1], px[2], px[3]);
+    return true;
+  }
   using IBT = PrimitiveProcessor::ProcessedIndexBufferType;
   if (ppr.index_buffer_type == IBT::kNone) {
     glDrawArrays(mode, 0, GLsizei(ppr.host_draw_vertex_count));
@@ -787,6 +875,17 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     glDrawElements(mode, GLsizei(ppr.host_draw_vertex_count),
                    ppr.host_index_format == xenos::IndexFormat::kInt16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
                    reinterpret_cast<const void*>(offset));
+  }
+  if (log_this) {
+    float px[4] = {-1, -1, -1, -1};
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(100, 100, 1, 1, GL_RGBA, GL_FLOAT, px);
+    GLint fbo_bound = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo_bound);
+    REXGPU_INFO("GL draw #{} post: fbo={} pixel(100,100)={:.3f} {:.3f} {:.3f} {:.3f} ndc_scale=({:.5f},{:.5f},{:.5f}) ndc_off=({:.5f},{:.5f},{:.5f}) z=[{:.3f},{:.3f}] sc=({},{} {}x{}) flags={:08X} cullmode={:08X} mask={:x}",
+                draw_count_, fbo_bound, px[0], px[1], px[2], px[3], viewport_info.ndc_scale[0], viewport_info.ndc_scale[1], viewport_info.ndc_scale[2],
+                viewport_info.ndc_offset[0], viewport_info.ndc_offset[1], viewport_info.ndc_offset[2], viewport_info.z_min, viewport_info.z_max,
+                scissor.offset[0], scissor.offset[1], scissor.extent[0], scissor.extent[1], system_constants_.flags,
+                regs.Get<reg::PA_SU_SC_MODE_CNTL>().value, normalized_color_mask);
   }
   if ((REXCVAR_GET(gl_log_draws) > 0 && int(draw_count_) <= REXCVAR_GET(gl_log_draws)) || (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12)) {
     GLenum err = glGetError();

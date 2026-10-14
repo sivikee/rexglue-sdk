@@ -42,6 +42,7 @@ class GlSharedMemory final : public SharedMemory {
   bool EnsureChunkSize(uint32_t chunk_index, uint32_t size);
 
   GLuint chunks_[kChunkCount] = {};
+  GLuint tbos_[kChunkCount] = {};  // R32UI texture buffer views (shaders read shared memory through these)
   uint32_t chunk_sizes_[kChunkCount] = {};
   GLuint dummy_ = 0;
 };
