@@ -4,12 +4,15 @@
 #include <cstdio>
 #include <string>
 
+#include <switch.h>
 #include <xxhash.h>
+#include "gl_context.h"
 
 #include <rex/cvar.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 
+REXCVAR_DEFINE_BOOL(gl_async_compile, true, "GPU", "GL backend: translate and compile shader programs on a worker thread (draws are skipped until ready)");
 REXCVAR_DEFINE_STRING(gl_dump_shaders, "", "GPU",
                       "GL backend: directory to dump generated GLSL of failing/first shaders (empty = off)");
 
@@ -19,7 +22,8 @@ GlPipelineCache::~GlPipelineCache() {
   Shutdown();
 }
 
-bool GlPipelineCache::Initialize() {
+bool GlPipelineCache::Initialize(GlContext* gl_context) {
+  gl_context_ = gl_context;
   SpirvShaderTranslator::Features features(false);
   features.max_storage_buffer_range = 128 * 1024 * 1024;
   features.full_draw_index_uint32 = true;
@@ -35,10 +39,39 @@ bool GlPipelineCache::Initialize() {
   features.demote_to_helper_invocation = false;
   features.sample_rate_shading = false;
   translator_ = std::make_unique<SpirvShaderTranslator>(features, false, false, false, 1, 1);
+  async_ = REXCVAR_GET(gl_async_compile);
+  if (async_) {
+    worker_context_ = gl_context_->CreateSharedContext();
+    if (!worker_context_) {
+      async_ = false;
+    } else {
+      running_ = true;
+      Thread* t = new Thread();
+      if (R_FAILED(threadCreate(t, &GlPipelineCache::WorkerThunk, this, nullptr, 0x400000, 0x2C, -2)) || R_FAILED(threadStart(t))) {
+        REXGPU_ERROR("GL: failed to start the shader compile thread");
+        running_ = false;
+        async_ = false;
+        delete t;
+      } else {
+        worker_thread_ = t;
+      }
+    }
+  }
   return true;
 }
 
 void GlPipelineCache::Shutdown() {
+  if (worker_thread_) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      running_ = false;
+    }
+    cv_.notify_all();
+    threadWaitForExit(static_cast<Thread*>(worker_thread_));
+    threadClose(static_cast<Thread*>(worker_thread_));
+    delete static_cast<Thread*>(worker_thread_);
+    worker_thread_ = nullptr;
+  }
   for (auto& p : programs_) {
     if (p.second.program) {
       glDeleteProgram(p.second.program);
@@ -140,7 +173,7 @@ bool GlPipelineCache::EnsureShadersTranslated(GlShader::GlTranslation* vertex,
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       if (translated_count_ <= 8 || translated_count_ % 25 == 0) {
         REXGPU_INFO("GL: translated shader #{} {:016X} mod {:016X} ({}) in {:.1f} ms, SPIR-V {} bytes",
-                    translated_count_, t->shader().ucode_data_hash(), t->modification(),
+                    translated_count_.load(), t->shader().ucode_data_hash(), t->modification(),
                     t->shader().type() == xenos::ShaderType::kVertex ? "VS" : "PS", ms,
                     t->translated_binary().size());
       }
@@ -179,14 +212,65 @@ GLuint CompileStage(GLenum type, const std::string& source, std::string& log_out
 const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
                                              GlShader::GlTranslation* pixel) {
   ProgramKey key{vertex, pixel};
+  std::unique_lock<std::mutex> lock(mutex_);
   auto it = programs_.find(key);
   if (it != programs_.end()) {
-    return it->second.failed ? nullptr : &it->second;
+    GlProgram& p = it->second;
+    return (p.ready.load() && !p.failed.load()) ? &p : nullptr;
   }
   GlProgram& program = programs_[key];
   program.vertex = vertex;
   program.pixel = pixel;
+  if (async_) {
+    queue_.emplace_back(vertex, pixel);
+    ++pending_;
+    cv_.notify_one();
+    return nullptr;
+  }
+  BuildProgram(program);
+  return (program.ready.load() && !program.failed.load()) ? &program : nullptr;
+}
+
+void GlPipelineCache::WorkerThunk(void* self) {
+  static_cast<GlPipelineCache*>(self)->WorkerMain();
+}
+
+void GlPipelineCache::WorkerMain() {
+  if (!gl_context_->MakeCurrentWorker(worker_context_)) {
+    REXGPU_ERROR("GL: worker MakeCurrent failed, falling back to synchronous compilation");
+    async_ = false;
+    // Drain jobs synchronously is impossible from here; mark everything failed.
+  }
+  while (running_) {
+    std::pair<GlShader::GlTranslation*, GlShader::GlTranslation*> job;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [&] { return !running_ || !queue_.empty(); });
+      if (!running_) {
+        break;
+      }
+      job = queue_.front();
+      queue_.pop_front();
+    }
+    GlProgram* program;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      program = &programs_.find(ProgramKey{job.first, job.second})->second;
+    }
+    BuildProgram(*program);
+    glFinish();  // make the objects visible to the main context
+    --pending_;
+  }
+  gl_context_->ReleaseCurrentWorker();
+}
+
+void GlPipelineCache::BuildProgram(GlProgram& program) {
+  GlShader::GlTranslation* vertex = program.vertex;
+  GlShader::GlTranslation* pixel = program.pixel;
   program.failed = true;
+  if (!EnsureShadersTranslated(vertex, pixel)) {
+    return;
+  }
   auto dump = [&](const char* tag, const std::string& source, uint64_t hash) {
     std::string dir = REXCVAR_GET(gl_dump_shaders);
     if (dir.empty()) {
@@ -203,7 +287,7 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
   const GlslShader* vs_glsl = vertex->GetOrCreateGlsl();
   const GlslShader* ps_glsl = pixel ? pixel->GetOrCreateGlsl() : nullptr;
   if (!vs_glsl || (pixel && !ps_glsl)) {
-    return nullptr;
+    return;
   }
   auto t0 = std::chrono::steady_clock::now();
   std::string log;
@@ -212,7 +296,7 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
     REXGPU_ERROR("GL: vertex shader {:016X} mod {:016X} failed to compile: {}",
                  vertex->shader().ucode_data_hash(), vertex->modification(), log);
     dump("vs_fail", vs_glsl->source, vertex->shader().ucode_data_hash());
-    return nullptr;
+    return;
   }
   GLuint fs = 0;
   if (pixel) {
@@ -222,7 +306,7 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
                    pixel->shader().ucode_data_hash(), pixel->modification(), log);
       dump("ps_fail", ps_glsl->source, pixel->shader().ucode_data_hash());
       glDeleteShader(vs);
-      return nullptr;
+      return;
     }
   }
   GLuint prog = glCreateProgram();
@@ -250,11 +334,13 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
       dump("ps_link", ps_glsl->source, pixel->shader().ucode_data_hash());
     }
     glDeleteProgram(prog);
-    return nullptr;
+    return;
   }
   double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  if (programs_.size() <= 8 || programs_.size() % 25 == 0) {
-    REXGPU_INFO("GL: linked program #{} in {:.1f} ms", programs_.size(), ms);
+  static std::atomic<uint32_t> linked{0};
+  uint32_t n = ++linked;
+  if (n <= 8 || n % 25 == 0) {
+    REXGPU_INFO("GL: linked program #{} in {:.1f} ms", n, ms);
   }
   if (dumped_ < 4) {
     ++dumped_;
@@ -265,7 +351,7 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
   }
   program.program = prog;
   program.failed = false;
-  return &program;
+  program.ready = true;
 }
 
 }  // namespace rex::graphics::gl

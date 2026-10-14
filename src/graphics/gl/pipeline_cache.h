@@ -4,7 +4,11 @@
  */
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -21,7 +25,8 @@ namespace rex::graphics::gl {
 
 struct GlProgram {
   GLuint program = 0;
-  bool failed = false;
+  std::atomic<bool> failed{false};
+  std::atomic<bool> ready{false};
   GlShader::GlTranslation* vertex = nullptr;
   GlShader::GlTranslation* pixel = nullptr;
 };
@@ -31,7 +36,7 @@ class GlPipelineCache {
   explicit GlPipelineCache(const RegisterFile& register_file) : register_file_(register_file) {}
   ~GlPipelineCache();
 
-  bool Initialize();
+  bool Initialize(class GlContext* gl_context);
   void Shutdown();
 
   GlShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
@@ -50,7 +55,8 @@ class GlPipelineCache {
   // Returns the linked program (or nullptr on failure).
   const GlProgram* GetProgram(GlShader::GlTranslation* vertex, GlShader::GlTranslation* pixel);
 
-  uint32_t translated_shader_count() const { return translated_count_; }
+  uint32_t translated_shader_count() const { return translated_count_.load(); }
+  uint32_t pending_programs() const { return pending_.load(); }
 
  private:
   const RegisterFile& register_file_;
@@ -69,7 +75,19 @@ class GlPipelineCache {
     }
   };
   std::unordered_map<ProgramKey, GlProgram, ProgramKeyHash> programs_;
-  uint32_t translated_count_ = 0;
+  void BuildProgram(GlProgram& program);
+  void WorkerMain();
+  static void WorkerThunk(void* self);
+  class GlContext* gl_context_ = nullptr;
+  void* worker_thread_ = nullptr;
+  void* worker_context_ = nullptr;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::pair<GlShader::GlTranslation*, GlShader::GlTranslation*>> queue_;
+  std::atomic<bool> running_{false};
+  bool async_ = true;
+  std::atomic<uint32_t> pending_{0};
+  std::atomic<uint32_t> translated_count_{0};
   uint32_t dumped_ = 0;
 };
 

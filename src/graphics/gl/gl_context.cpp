@@ -68,6 +68,7 @@ bool GlContext::Initialize() {
     REXGPU_ERROR("GL: eglMakeCurrent failed ({:x})", eglGetError());
     return false;
   }
+  config_ = config;
   display_ = display;
   surface_ = surface;
   context_ = context;
@@ -151,5 +152,27 @@ void LoadGlExtensions(void* (*get_proc_address)(const char*)) {
   glTextureBarrier_ = reinterpret_cast<decltype(glTextureBarrier_)>(get_proc_address("glTextureBarrier"));
   glPolygonOffsetClamp_ =
       reinterpret_cast<decltype(glPolygonOffsetClamp_)>(get_proc_address("glPolygonOffsetClampEXT"));
+}
+}  // namespace rex::graphics::gl
+
+namespace rex::graphics::gl {
+void* GlContext::CreateSharedContext() {
+  EGLint attr[] = {EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
+                   EGL_CONTEXT_MAJOR_VERSION_KHR,       4,
+                   EGL_CONTEXT_MINOR_VERSION_KHR,       3,
+                   EGL_NONE};
+  EGLContext ctx = eglCreateContext(static_cast<EGLDisplay>(display_), static_cast<EGLConfig>(config_),
+                                    static_cast<EGLContext>(context_), attr);
+  if (!ctx) {
+    REXGPU_ERROR("GL: shared context creation failed ({:x})", eglGetError());
+  }
+  return ctx;
+}
+bool GlContext::MakeCurrentWorker(void* shared_context) {
+  return eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        static_cast<EGLContext>(shared_context)) == EGL_TRUE;
+}
+void GlContext::ReleaseCurrentWorker() {
+  eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 }
 }  // namespace rex::graphics::gl

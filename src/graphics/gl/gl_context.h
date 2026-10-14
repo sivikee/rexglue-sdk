@@ -29,6 +29,11 @@ class GlContext {
   bool Initialize();
   void Shutdown();
   void SwapBuffers();
+  // Shared (resource-sharing) context for worker threads: make it current on the worker with
+  // MakeCurrentWorker (surfaceless).
+  void* CreateSharedContext();
+  bool MakeCurrentWorker(void* shared_context);
+  void ReleaseCurrentWorker();
   // Current default framebuffer size (re-queried; docked/handheld change).
   void QuerySurfaceSize(int& width, int& height) const;
   const GlCaps& caps() const { return caps_; }
@@ -37,6 +42,7 @@ class GlContext {
   void* display_ = nullptr;
   void* surface_ = nullptr;
   void* context_ = nullptr;
+  void* config_ = nullptr;
   GlCaps caps_;
 };
 

@@ -60,6 +60,7 @@ class GlCommandProcessor : public CommandProcessor {
   uint32_t swap_count_ = 0;
   uint32_t draw_count_ = 0;
   uint32_t draw_fail_count_ = 0;
+  uint32_t draws_skipped_ = 0;
   uint32_t frame_draws_ = 0;
   SpirvShaderTranslator::SystemConstants system_constants_;
 };

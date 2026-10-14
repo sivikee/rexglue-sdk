@@ -198,7 +198,7 @@ bool GlCommandProcessor::SetupContext() {
   impl_->render_targets = std::make_unique<GlRenderTargets>(*register_file_, *memory_);
   impl_->texture_cache = std::make_unique<GlTextureCache>(*register_file_, *memory_);
   if (!impl_->shared_memory->Initialize() || !impl_->primitive_processor->Initialize() ||
-      !impl_->pipeline_cache->Initialize() || !impl_->render_targets->Initialize() ||
+      !impl_->pipeline_cache->Initialize(&context_) || !impl_->render_targets->Initialize() ||
       !impl_->texture_cache->Initialize()) {
     REXGPU_ERROR("GL: failed to initialise the draw subsystems");
     return false;
@@ -661,12 +661,10 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   auto* ps_translation = pixel_shader ? static_cast<GlShader::GlTranslation*>(
                                             pixel_shader->GetOrCreateTranslation(ps_mod.value))
                                       : nullptr;
-  if (!impl_->pipeline_cache->EnsureShadersTranslated(vs_translation, ps_translation)) {
-    return fail("shader_translation");
-  }
   const GlProgram* program = impl_->pipeline_cache->GetProgram(vs_translation, ps_translation);
   if (!program) {
-    return fail("program");
+    ++draws_skipped_;
+    return true;  // still compiling (async) or failed (logged by the pipeline cache)
   }
 
   uint32_t normalized_color_mask =
@@ -813,10 +811,10 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   if (swap_count_ <= 3 || (swap_count_ % 300) == 0) {
     REXGPU_INFO(
         "GL swap #{}: ptr={:08X} {}x{} fetch base={:08X} {}x{} fmt={} endian={} tiled={} pitch={} | draws={} "
-        "total_draws={} failed={} shaders={}",
+        "total_draws={} failed={} skipped={} shaders={} pending={}",
         swap_count_, frontbuffer_ptr, frontbuffer_width, frontbuffer_height, base, w, h,
         uint32_t(fetch.format), uint32_t(fetch.endianness), uint32_t(fetch.tiled), uint32_t(fetch.pitch) << 5,
-        frame_draws_, draw_count_, draw_fail_count_, impl_->pipeline_cache->translated_shader_count());
+        frame_draws_, draw_count_, draw_fail_count_, draws_skipped_, impl_->pipeline_cache->translated_shader_count(), impl_->pipeline_cache->pending_programs());
   }
   frame_draws_ = 0;
   int sw = 1280, sh = 720;
