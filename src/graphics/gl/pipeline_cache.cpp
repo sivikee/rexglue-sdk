@@ -7,11 +7,13 @@
 #include <switch.h>
 #include <xxhash.h>
 #include "gl_context.h"
+#include "gl_ext.h"
 
 #include <rex/cvar.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 
+REXCVAR_DEFINE_BOOL(gl_parallel_compile, false, "GPU", "GL backend: enable GL_KHR_parallel_shader_compile driver threads");
 REXCVAR_DEFINE_BOOL(gl_async_compile, true, "GPU", "GL backend: translate and compile shader programs on a worker thread (draws are skipped until ready)");
 REXCVAR_DEFINE_STRING(gl_dump_shaders, "", "GPU",
                       "GL backend: directory to dump generated GLSL of failing/first shaders (empty = off)");
@@ -39,9 +41,12 @@ bool GlPipelineCache::Initialize(GlContext* gl_context) {
   features.demote_to_helper_invocation = false;
   features.sample_rate_shading = false;
   translator_ = std::make_unique<SpirvShaderTranslator>(features, false, false, false, 1, 1);
+  if (glMaxShaderCompilerThreadsKHR_ && REXCVAR_GET(gl_parallel_compile)) {
+    glMaxShaderCompilerThreadsKHR_(0xFFFFFFFFu);
+  }
   async_ = REXCVAR_GET(gl_async_compile);
   if (async_) {
-    worker_context_ = gl_context_->CreateSharedContext();
+    worker_context_ = reinterpret_cast<void*>(1);
     if (!worker_context_) {
       async_ = false;
     } else {
@@ -214,35 +219,47 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
   ProgramKey key{vertex, pixel};
   std::unique_lock<std::mutex> lock(mutex_);
   auto it = programs_.find(key);
-  if (it != programs_.end()) {
-    GlProgram& p = it->second;
-    return (p.ready.load() && !p.failed.load()) ? &p : nullptr;
+  if (it == programs_.end()) {
+    GlProgram& program = programs_[key];
+    program.vertex = vertex;
+    program.pixel = pixel;
+    if (async_) {
+      queue_.emplace_back(vertex, pixel);
+      ++pending_;
+      cv_.notify_one();
+      return nullptr;
+    }
+    TranslateProgram(program);
+    if (program.state.load() == GlProgram::kGlslReady) {
+      StartLink(program);
+      FinishLink(program, true);
+    }
+    return program.state.load() == GlProgram::kReady ? &program : nullptr;
   }
-  GlProgram& program = programs_[key];
-  program.vertex = vertex;
-  program.pixel = pixel;
-  if (async_) {
-    queue_.emplace_back(vertex, pixel);
-    ++pending_;
-    cv_.notify_one();
-    return nullptr;
+  GlProgram& p = it->second;
+  switch (p.state.load()) {
+    case GlProgram::kGlslReady:
+      StartLink(p);
+      return nullptr;
+    case GlProgram::kLinking:
+      FinishLink(p, false);
+      return p.state.load() == GlProgram::kReady ? &p : nullptr;
+    case GlProgram::kReady:
+      return &p;
+    default:
+      return nullptr;
   }
-  BuildProgram(program);
-  return (program.ready.load() && !program.failed.load()) ? &program : nullptr;
 }
 
 void GlPipelineCache::WorkerThunk(void* self) {
   static_cast<GlPipelineCache*>(self)->WorkerMain();
 }
 
+// CPU-only worker: Xenos ucode -> SPIR-V -> GLSL. All GL calls stay on the command processor thread.
 void GlPipelineCache::WorkerMain() {
-  if (!gl_context_->MakeCurrentWorker(worker_context_)) {
-    REXGPU_ERROR("GL: worker MakeCurrent failed, falling back to synchronous compilation");
-    async_ = false;
-    // Drain jobs synchronously is impossible from here; mark everything failed.
-  }
   while (running_) {
     std::pair<GlShader::GlTranslation*, GlShader::GlTranslation*> job;
+    GlProgram* program;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait(lock, [&] { return !running_ || !queue_.empty(); });
@@ -251,25 +268,60 @@ void GlPipelineCache::WorkerMain() {
       }
       job = queue_.front();
       queue_.pop_front();
-    }
-    GlProgram* program;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
       program = &programs_.find(ProgramKey{job.first, job.second})->second;
     }
-    BuildProgram(*program);
-    glFinish();  // make the objects visible to the main context
+    TranslateProgram(*program);
     --pending_;
   }
-  gl_context_->ReleaseCurrentWorker();
 }
 
-void GlPipelineCache::BuildProgram(GlProgram& program) {
+void GlPipelineCache::TranslateProgram(GlProgram& program) {
   GlShader::GlTranslation* vertex = program.vertex;
   GlShader::GlTranslation* pixel = program.pixel;
-  program.failed = true;
   if (!EnsureShadersTranslated(vertex, pixel)) {
+    program.state = GlProgram::kFailed;
     return;
+  }
+  const GlslShader* vs_glsl = vertex->GetOrCreateGlsl();
+  const GlslShader* ps_glsl = pixel ? pixel->GetOrCreateGlsl() : nullptr;
+  if (!vs_glsl || (pixel && !ps_glsl)) {
+    program.state = GlProgram::kFailed;
+    return;
+  }
+  program.state = GlProgram::kGlslReady;
+}
+
+void GlPipelineCache::StartLink(GlProgram& program) {
+  const GlslShader* vs_glsl = program.vertex->glsl();
+  const GlslShader* ps_glsl = program.pixel ? program.pixel->glsl() : nullptr;
+  program.link_start = std::chrono::steady_clock::now();
+  auto make = [&](GLenum type, const std::string& source) {
+    GLuint s = glCreateShader(type);
+    const char* src = source.c_str();
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);  // asynchronous with GL_KHR_parallel_shader_compile
+    return s;
+  };
+  program.vs_id = make(GL_VERTEX_SHADER, vs_glsl->source);
+  program.fs_id = ps_glsl ? make(GL_FRAGMENT_SHADER, ps_glsl->source) : 0;
+  program.program = glCreateProgram();
+  glAttachShader(program.program, program.vs_id);
+  if (program.fs_id) {
+    glAttachShader(program.program, program.fs_id);
+  }
+  glLinkProgram(program.program);
+  program.state = GlProgram::kLinking;
+}
+
+void GlPipelineCache::FinishLink(GlProgram& program, bool block) {
+  if (!block) {
+    GLint done = 1;
+    if (glMaxShaderCompilerThreadsKHR_ && REXCVAR_GET(gl_parallel_compile)) {
+      glGetProgramiv(program.program, 0x91B1 /* GL_COMPLETION_STATUS_KHR */, &done);
+    }
+    if (!done) {
+      return;
+    }
   }
   auto dump = [&](const char* tag, const std::string& source, uint64_t hash) {
     std::string dir = REXCVAR_GET(gl_dump_shaders);
@@ -284,74 +336,65 @@ void GlPipelineCache::BuildProgram(GlProgram& program) {
       std::fclose(f);
     }
   };
-  const GlslShader* vs_glsl = vertex->GetOrCreateGlsl();
-  const GlslShader* ps_glsl = pixel ? pixel->GetOrCreateGlsl() : nullptr;
-  if (!vs_glsl || (pixel && !ps_glsl)) {
-    return;
-  }
-  auto t0 = std::chrono::steady_clock::now();
-  std::string log;
-  GLuint vs = CompileStage(GL_VERTEX_SHADER, vs_glsl->source, log);
-  if (!vs) {
-    REXGPU_ERROR("GL: vertex shader {:016X} mod {:016X} failed to compile: {}",
-                 vertex->shader().ucode_data_hash(), vertex->modification(), log);
-    dump("vs_fail", vs_glsl->source, vertex->shader().ucode_data_hash());
-    return;
-  }
-  GLuint fs = 0;
-  if (pixel) {
-    fs = CompileStage(GL_FRAGMENT_SHADER, ps_glsl->source, log);
-    if (!fs) {
-      REXGPU_ERROR("GL: pixel shader {:016X} mod {:016X} failed to compile: {}",
-                   pixel->shader().ucode_data_hash(), pixel->modification(), log);
-      dump("ps_fail", ps_glsl->source, pixel->shader().ucode_data_hash());
-      glDeleteShader(vs);
-      return;
-    }
-  }
-  GLuint prog = glCreateProgram();
-  glAttachShader(prog, vs);
-  if (fs) {
-    glAttachShader(prog, fs);
-  }
-  glLinkProgram(prog);
+  GlShader::GlTranslation* vertex = program.vertex;
+  GlShader::GlTranslation* pixel = program.pixel;
   GLint ok = 0;
-  glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-  glDeleteShader(vs);
-  if (fs) {
-    glDeleteShader(fs);
-  }
+  glGetProgramiv(program.program, GL_LINK_STATUS, &ok);
+  std::string log;
   if (!ok) {
+    auto shader_log = [&](GLuint s, const char* what) {
+      GLint cs = 0;
+      glGetShaderiv(s, GL_COMPILE_STATUS, &cs);
+      if (!cs) {
+        GLint len = 0;
+        glGetShaderiv(s, GL_INFO_LOG_LENGTH, &len);
+        log.assign(size_t(len > 1 ? len : 1), 0);
+        glGetShaderInfoLog(s, len, nullptr, log.data());
+        REXGPU_ERROR("GL: {} shader failed to compile: {}", what, log);
+      }
+    };
+    shader_log(program.vs_id, "vertex");
+    if (program.fs_id) {
+      shader_log(program.fs_id, "pixel");
+    }
     GLint len = 0;
-    glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+    glGetProgramiv(program.program, GL_INFO_LOG_LENGTH, &len);
     log.assign(size_t(len > 1 ? len : 1), 0);
-    glGetProgramInfoLog(prog, len, nullptr, log.data());
+    glGetProgramInfoLog(program.program, len, nullptr, log.data());
     REXGPU_ERROR("GL: program link failed (vs {:016X}, ps {:016X}): {}",
                  vertex->shader().ucode_data_hash(),
                  pixel ? pixel->shader().ucode_data_hash() : uint64_t(0), log);
-    dump("vs_link", vs_glsl->source, vertex->shader().ucode_data_hash());
-    if (ps_glsl) {
-      dump("ps_link", ps_glsl->source, pixel->shader().ucode_data_hash());
+    dump("vs_fail", vertex->glsl()->source, vertex->shader().ucode_data_hash());
+    if (pixel) {
+      dump("ps_fail", pixel->glsl()->source, pixel->shader().ucode_data_hash());
     }
-    glDeleteProgram(prog);
-    return;
-  }
-  double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  static std::atomic<uint32_t> linked{0};
-  uint32_t n = ++linked;
-  if (n <= 8 || n % 25 == 0) {
-    REXGPU_INFO("GL: linked program #{} in {:.1f} ms", n, ms);
-  }
-  if (dumped_ < 4) {
-    ++dumped_;
-    dump("vs_ok", vs_glsl->source, vertex->shader().ucode_data_hash());
-    if (ps_glsl) {
-      dump("ps_ok", ps_glsl->source, pixel->shader().ucode_data_hash());
+    glDeleteProgram(program.program);
+    program.program = 0;
+    program.state = GlProgram::kFailed;
+  } else {
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          program.link_start)
+                    .count();
+    static uint32_t linked = 0;
+    uint32_t n = ++linked;
+    if (n <= 8 || n % 25 == 0) {
+      REXGPU_INFO("GL: program #{} ready {:.0f} ms after the link was issued (block={})", n, ms,
+                  int(block));
     }
+    if (dumped_ < 4) {
+      ++dumped_;
+      dump("vs_ok", vertex->glsl()->source, vertex->shader().ucode_data_hash());
+      if (pixel) {
+        dump("ps_ok", pixel->glsl()->source, pixel->shader().ucode_data_hash());
+      }
+    }
+    program.state = GlProgram::kReady;
   }
-  program.program = prog;
-  program.failed = false;
-  program.ready = true;
+  glDeleteShader(program.vs_id);
+  if (program.fs_id) {
+    glDeleteShader(program.fs_id);
+  }
+  program.vs_id = program.fs_id = 0;
 }
 
 }  // namespace rex::graphics::gl

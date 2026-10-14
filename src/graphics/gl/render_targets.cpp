@@ -569,3 +569,22 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
 }
 
 }  // namespace rex::graphics::gl
+
+namespace rex::graphics::gl {
+bool GlRenderTargets::DebugReadColor(uint32_t base, std::vector<uint8_t>& rgba, uint32_t& w, uint32_t& h) {
+  for (auto& kv : color_targets_) {
+    if (kv.second.base != base) continue;
+    ColorTarget& t = kv.second;
+    w = t.width;
+    h = t.height;
+    rgba.resize(size_t(w) * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo_);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.texture, 0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    return true;
+  }
+  return false;
+}
+}  // namespace rex::graphics::gl

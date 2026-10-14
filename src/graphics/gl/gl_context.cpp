@@ -145,8 +145,10 @@ void (*glBufferStorage_)(GLenum, GLsizeiptr, const void*, GLbitfield) = nullptr;
 void (*glClipControl_)(GLenum, GLenum) = nullptr;
 void (*glTextureBarrier_)() = nullptr;
 void (*glPolygonOffsetClamp_)(GLfloat, GLfloat, GLfloat) = nullptr;
+void (*glMaxShaderCompilerThreadsKHR_)(GLuint) = nullptr;
 
 void LoadGlExtensions(void* (*get_proc_address)(const char*)) {
+  glMaxShaderCompilerThreadsKHR_ = reinterpret_cast<decltype(glMaxShaderCompilerThreadsKHR_)>(get_proc_address("glMaxShaderCompilerThreadsKHR"));
   glBufferStorage_ = reinterpret_cast<decltype(glBufferStorage_)>(get_proc_address("glBufferStorage"));
   glClipControl_ = reinterpret_cast<decltype(glClipControl_)>(get_proc_address("glClipControl"));
   glTextureBarrier_ = reinterpret_cast<decltype(glTextureBarrier_)>(get_proc_address("glTextureBarrier"));

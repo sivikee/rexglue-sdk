@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -25,8 +26,10 @@ namespace rex::graphics::gl {
 
 struct GlProgram {
   GLuint program = 0;
-  std::atomic<bool> failed{false};
-  std::atomic<bool> ready{false};
+  enum State : int { kQueued = 0, kGlslReady, kLinking, kReady, kFailed };
+  std::atomic<int> state{kQueued};
+  GLuint vs_id = 0, fs_id = 0;
+  std::chrono::steady_clock::time_point link_start;
   GlShader::GlTranslation* vertex = nullptr;
   GlShader::GlTranslation* pixel = nullptr;
 };
@@ -75,7 +78,9 @@ class GlPipelineCache {
     }
   };
   std::unordered_map<ProgramKey, GlProgram, ProgramKeyHash> programs_;
-  void BuildProgram(GlProgram& program);
+  void TranslateProgram(GlProgram& program);
+  void StartLink(GlProgram& program);
+  void FinishLink(GlProgram& program, bool block);
   void WorkerMain();
   static void WorkerThunk(void* self);
   class GlContext* gl_context_ = nullptr;

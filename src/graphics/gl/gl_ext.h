@@ -44,6 +44,7 @@ extern void (*glBufferStorage_)(GLenum target, GLsizeiptr size, const void* data
 extern void (*glClipControl_)(GLenum origin, GLenum depth);
 extern void (*glTextureBarrier_)();
 extern void (*glPolygonOffsetClamp_)(GLfloat factor, GLfloat units, GLfloat clamp);
+extern void (*glMaxShaderCompilerThreadsKHR_)(GLuint count);
 
 void LoadGlExtensions(void* (*get_proc_address)(const char*));
 

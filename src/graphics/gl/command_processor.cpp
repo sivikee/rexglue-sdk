@@ -31,6 +31,8 @@ REXCVAR_DEFINE_INT32(gl_screenshot_first, 1, "GPU",
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
 REXCVAR_DEFINE_INT32(gl_log_draws, 0, "GPU", "GL backend: log the first N draws in detail");
+REXCVAR_DEFINE_INT32(gl_log_draws_from, 0, "GPU", "GL backend: also log 12 draws starting at this draw index (0 = off)");
+REXCVAR_DEFINE_INT32(gl_dump_rt_swaps, 0, "GPU", "GL backend: dump colour RT 0 to rt_<swap>.ppm every N swaps");
 
 namespace rex::graphics::gl {
 
@@ -410,6 +412,7 @@ void GlCommandProcessor::UploadAndBindConstants(const Shader* vertex_shader, con
     impl_->ubo_ring_offset += aligned;
   };
   upload(kUboBindingSystem, &system_constants_, sizeof(system_constants_));
+  if (glGetError() != GL_NO_ERROR) { REXGPU_WARN("GL: error after system constants upload (offset {})", impl_->ubo_ring_offset); }
 
   auto pack_floats = [&](const Shader& shader, uint32_t reg_base, std::vector<float>& out) {
     const Shader::ConstantRegisterMap& map = shader.constant_register_map();
@@ -705,15 +708,24 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     used_texture_mask |= pixel_shader->GetUsedTextureMaskAfterTranslation();
   }
 
+  bool log_this = (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12);
+  auto chk = [&](const char* what) { if (log_this) { GLenum e = glGetError(); if (e != GL_NO_ERROR) REXGPU_WARN("GL draw #{}: error {} after {}", draw_count_, GlErrorString(e), what); } };
+  chk("textures");
   UpdateSystemConstants(primitive_polygonal, ppr, viewport_info, used_texture_mask, normalized_depth_control);
+  { static int isp_logged = 0; if (isp_logged++ < 3) REXGPU_INFO("GL: program {} glIsProgram={} (async)", program->program, int(glIsProgram(program->program))); }
+  chk("sysconst");
   glUseProgram(program->program);
+  { static int up_logged = 0; GLenum e = glGetError(); if (e != GL_NO_ERROR && up_logged++ < 6) { GLint ls = -1, att = -1; glGetProgramiv(program->program, GL_LINK_STATUS, &ls); glGetProgramiv(program->program, GL_ATTACHED_SHADERS, &att); std::string ex; for (GLuint i = 1; i <= 12; ++i) ex += glIsProgram(i) ? "1" : "0"; REXGPU_WARN("GL: glUseProgram({}) error {} link={} attached={} isprog={} exists[1..12]={}", program->program, GlErrorString(e), ls, att, int(glIsProgram(program->program)), ex); } }
   UploadAndBindConstants(vertex_shader, pixel_shader);
+  chk("ubo");
   impl_->shared_memory->BindStorageBuffers(kSsboBindingSharedMemory);
+  chk("ssbo");
   ApplyRasterState(primitive_polygonal, normalized_depth_control, impl_->render_targets->bound_color_mask()
                                                                       ? normalized_color_mask
                                                                       : 0,
                    viewport_info, impl_->render_targets->bound_depth());
 
+  chk("raster");
   // Primitive topology.
   GLenum mode;
   switch (ppr.host_primitive_type) {
@@ -733,7 +745,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
   }
 
-  if (REXCVAR_GET(gl_log_draws) > 0 && int(draw_count_) <= REXCVAR_GET(gl_log_draws)) {
+  if ((REXCVAR_GET(gl_log_draws) > 0 && int(draw_count_) <= REXCVAR_GET(gl_log_draws)) || (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12)) {
     REXGPU_INFO(
         "GL draw #{}: prim={}->{} idx={} host_idx={} ibtype={} vs={:016X} ps={:016X} colormask={:x} "
         "rt={}x{} vp=({},{} {}x{}) tex_mask={:x}",
@@ -776,7 +788,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
                    ppr.host_index_format == xenos::IndexFormat::kInt16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
                    reinterpret_cast<const void*>(offset));
   }
-  if (REXCVAR_GET(gl_log_draws) > 0 && int(draw_count_) <= REXCVAR_GET(gl_log_draws)) {
+  if ((REXCVAR_GET(gl_log_draws) > 0 && int(draw_count_) <= REXCVAR_GET(gl_log_draws)) || (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12)) {
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
       REXGPU_WARN("GL draw #{}: GL error {}", draw_count_, GlErrorString(err));
@@ -898,6 +910,28 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
     bool shot = (first && int(swap_count_) == first) || (every > 0 && (swap_count_ % every) == 0);
     if (shot) {
       WritePpm(dir + "/shot_" + std::to_string(swap_count_) + ".ppm", sw, sh);
+    }
+  }
+  {
+    int every_rt = REXCVAR_GET(gl_dump_rt_swaps);
+    std::string rdir = REXCVAR_GET(gl_screenshot_dir);
+    if (every_rt > 0 && !rdir.empty() && (swap_count_ % every_rt) == 0) {
+      std::vector<uint8_t> rgba;
+      uint32_t rw = 0, rh = 0;
+      if (impl_->render_targets->DebugReadColor(0, rgba, rw, rh)) {
+        std::string path = rdir + "/rt_" + std::to_string(swap_count_) + ".ppm";
+        if (FILE* f = fopen(path.c_str(), "wb")) {
+          fprintf(f, "P6\n%u %u\n255\n", rw, rh);
+          std::vector<uint8_t> row(size_t(rw) * 3);
+          for (uint32_t y = 0; y < rh; ++y) {
+            for (uint32_t x = 0; x < rw; ++x) {
+              for (int k = 0; k < 3; ++k) row[x * 3 + k] = rgba[(size_t(y) * rw + x) * 4 + k];
+            }
+            fwrite(row.data(), 1, row.size(), f);
+          }
+          fclose(f);
+        }
+      }
     }
   }
   context_.SwapBuffers();

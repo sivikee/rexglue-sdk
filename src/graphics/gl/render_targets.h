@@ -64,6 +64,7 @@ class GlRenderTargets {
   bool Resolve(uint32_t& extent_start_out, uint32_t& extent_length_out);
 
   void EndFrame() { ++frame_; }
+  bool DebugReadColor(uint32_t base, std::vector<uint8_t>& rgba, uint32_t& w, uint32_t& h);
 
  private:
   struct FbKey {

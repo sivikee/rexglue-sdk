@@ -362,6 +362,15 @@ bool GlTextureCache::Upload(Texture& t) {
     }
   }
   t.host_swizzle = hf.swizzle;
+  {
+    static uint32_t upload_logs = 0;
+    if (upload_logs++ < 40) {
+      const uint8_t* m = memory_.TranslatePhysical(info.memory.base_address);
+      uint32_t nz = 0;
+      for (uint32_t i = 0; i < 4096; ++i) nz += m[i] != 0;
+      REXGPU_INFO("GL texture upload: base={:08X} {}x{} fmt={} endian={} tiled={} pitch={} levels={} nonzero_bytes_in_first4k={}", info.memory.base_address, w, h, uint32_t(info.format), uint32_t(info.endianness), uint32_t(info.is_tiled), info.pitch, levels, nz);
+    }
+  }
   return true;
 }
 
