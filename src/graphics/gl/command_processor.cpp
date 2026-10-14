@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include <switch.h>
+#include <rex/input/switch/switch_input_driver.h>
 #include <xxhash.h>
 
 #include <rex/cvar.h>
@@ -915,6 +916,9 @@ bool GlCommandProcessor::IssueCopy() {
 void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                    uint32_t frontbuffer_height) {
   ++swap_count_;
+#if REX_PLATFORM_SWITCH
+  rex::input::switchpad::g_swap_counter.store(swap_count_, std::memory_order_relaxed);
+#endif
   // Decode the guest front buffer (fetch constant 0 is set by VdSwap) on the CPU: 32bpp, 32x32 tiled,
   // endian-swapped. Resolves write guest memory on the CPU in this backend, so this is the real image.
   xenos::xe_gpu_texture_fetch_t fetch = register_file_->GetTextureFetch(0);

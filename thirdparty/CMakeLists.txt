@@ -330,7 +330,7 @@ endif()
 #=============================================================================
 # SPIR-V toolchain (only when Vulkan backend is enabled)
 #=============================================================================
-if(REXGLUE_USE_VULKAN)
+if(REXGLUE_USE_VULKAN OR REX_SWITCH)
     # SPIRV-Headers
     set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
@@ -353,7 +353,11 @@ if(REXGLUE_USE_VULKAN)
 
     # Set policy minimum for older glslang versions with outdated cmake_minimum_required
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-    add_subdirectory(glslang)
+    if(REX_SWITCH)
+        add_subdirectory(glslang EXCLUDE_FROM_ALL)
+    else()
+        add_subdirectory(glslang)
+    endif()
     # Create alias for older glslang versions that don't provide it
     if(NOT TARGET glslang::SPIRV)
         add_library(glslang::SPIRV ALIAS SPIRV)

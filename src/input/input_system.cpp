@@ -17,11 +17,15 @@
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
-#include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
-#include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
+#if REX_PLATFORM_SWITCH
+#include <rex/input/switch/switch_input_driver.h>
+#else
+#include <rex/input/mnk/mnk_input_driver.h>
+#include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/xinput/xinput_input_driver.h>
+#endif
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
@@ -325,6 +329,12 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
   auto input = std::make_unique<InputSystem>(nullptr);
 
   if (!tool_mode) {
+#if REX_PLATFORM_SWITCH
+    auto switch_driver = std::make_unique<switchpad::SwitchInputDriver>(nullptr, 0);
+    if (switch_driver->Setup() == X_STATUS_SUCCESS) {
+      input->AddDriver(std::move(switch_driver));
+    }
+#else
 #if REX_PLATFORM_WIN32
     if (REXCVAR_GET(input_backend) == "xinput") {
       auto xinput_driver = std::make_unique<xinput::XinputInputDriver>(nullptr, 0);
@@ -346,6 +356,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
       input->AddDriver(std::move(mnk_driver));
     }
+#endif
   }
 
   // NOP driver (primary in tool mode, fallback otherwise)

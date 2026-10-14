@@ -899,7 +899,15 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
+#if REX_PLATFORM_SWITCH
+    static bool warned_once = false;  // fires per guest thread start: one line is enough
+    if (!warned_once) {
+      warned_once = true;
+      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    }
+#else
     REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+#endif
   }
 }
 
