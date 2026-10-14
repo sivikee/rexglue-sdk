@@ -44,6 +44,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       demote_to_helper_invocation(all),
       sample_rate_shading(all) {}
 
+#if !REX_PLATFORM_SWITCH
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
       full_draw_index_uint32(vulkan_device->properties().fullDrawIndexUint32),
@@ -71,6 +72,8 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
     spirv_version = spv::Spv_1_0;
   }
 }
+
+#endif  // !REX_PLATFORM_SWITCH
 
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
     uint32_t dynamic_addressable_register_count,
@@ -268,8 +271,6 @@ void SpirvShaderTranslator::StartTranslation() {
       {"compute_memexport_vertex_count", offsetof(SystemConstants, compute_memexport_vertex_count),
        type_uint_},
       {"user_clip_planes", offsetof(SystemConstants, user_clip_planes), type_float4_array_6},
-      {"vertex_index_min", offsetof(SystemConstants, vertex_index_min), type_uint_},
-      {"vertex_index_max", offsetof(SystemConstants, vertex_index_max), type_uint_},
       {"ndc_scale", offsetof(SystemConstants, ndc_scale), type_float3_},
       {"point_vertex_diameter_min", offsetof(SystemConstants, point_vertex_diameter_min),
        type_float_},
@@ -309,6 +310,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"vertex_index_min", offsetof(SystemConstants, vertex_index_min), type_uint_},
+      {"vertex_index_max", offsetof(SystemConstants, vertex_index_max), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));

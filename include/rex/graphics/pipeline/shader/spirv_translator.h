@@ -20,7 +20,9 @@
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/translator.h>
 #include <rex/graphics/xenos.h>
+#if !REX_PLATFORM_SWITCH
 #include <rex/ui/vulkan/device.h>
+#endif
 
 namespace rex::graphics {
 
@@ -223,6 +225,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_reset;
     // Number of guest vertices processed by the memexport compute dispatch.
     uint32_t compute_memexport_vertex_count;
+    // std140: the float4 array must be 16-byte aligned (SPIRV-Cross / GL reject the block otherwise).
+    uint32_t _pad_std140_clip_planes;
     float user_clip_planes[6][4];
 
     float ndc_scale[3];
@@ -238,6 +242,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // One bit per texture fetch constant indicating that it references a
     // draw-resolution-scaled texture.
     uint32_t textures_resolution_scaled;
+    uint32_t _pad_std140_swizzled_signs[3];
 
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
@@ -374,7 +379,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kSpirvMagicToolId = 26;
 
   struct Features {
+#if !REX_PLATFORM_SWITCH
     explicit Features(const ui::vulkan::VulkanDevice* vulkan_device);
+#endif
     explicit Features(bool all = false);
 
     unsigned int spirv_version;
@@ -849,8 +856,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantVertexIndexReset,
     kSystemConstantComputeMemExportVertexCount,
     kSystemConstantUserClipPlanes,
-    kSystemConstantVertexIndexMin,
-    kSystemConstantVertexIndexMax,
     kSystemConstantNdcScale,
     kSystemConstantPointVertexDiameterMin,
     kSystemConstantNdcOffset,
@@ -879,6 +884,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    // Last in the structure (offset order must match the member order for SPIRV-Cross layout checks).
+    kSystemConstantVertexIndexMin,
+    kSystemConstantVertexIndexMax,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

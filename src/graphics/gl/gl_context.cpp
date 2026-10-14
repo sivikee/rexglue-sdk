@@ -1,4 +1,5 @@
 #include "gl_context.h"
+#include "gl_ext.h"
 
 #include <cstring>
 
@@ -74,6 +75,7 @@ bool GlContext::Initialize() {
     REXGPU_ERROR("GL: gladLoadGLLoader failed");
     return false;
   }
+  LoadGlExtensions([](const char* n) -> void* { return reinterpret_cast<void*>(eglGetProcAddress(n)); });
   auto str = [](GLenum n) {
     const GLubyte* s = glGetString(n);
     return s ? std::string(reinterpret_cast<const char*>(s)) : std::string();
@@ -135,4 +137,19 @@ void GlContext::QuerySurfaceSize(int& width, int& height) const {
   height = h;
 }
 
+}  // namespace rex::graphics::gl
+
+namespace rex::graphics::gl {
+void (*glBufferStorage_)(GLenum, GLsizeiptr, const void*, GLbitfield) = nullptr;
+void (*glClipControl_)(GLenum, GLenum) = nullptr;
+void (*glTextureBarrier_)() = nullptr;
+void (*glPolygonOffsetClamp_)(GLfloat, GLfloat, GLfloat) = nullptr;
+
+void LoadGlExtensions(void* (*get_proc_address)(const char*)) {
+  glBufferStorage_ = reinterpret_cast<decltype(glBufferStorage_)>(get_proc_address("glBufferStorage"));
+  glClipControl_ = reinterpret_cast<decltype(glClipControl_)>(get_proc_address("glClipControl"));
+  glTextureBarrier_ = reinterpret_cast<decltype(glTextureBarrier_)>(get_proc_address("glTextureBarrier"));
+  glPolygonOffsetClamp_ =
+      reinterpret_cast<decltype(glPolygonOffsetClamp_)>(get_proc_address("glPolygonOffsetClampEXT"));
+}
 }  // namespace rex::graphics::gl

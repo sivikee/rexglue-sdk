@@ -1,0 +1,97 @@
+/**
+ * @file        graphics/gl/render_targets.h
+ * @brief       Simplified render target management for the GL backend.
+ *
+ * Instead of the full EDRAM emulation of the SDK's RenderTargetCache (ownership transfers, dump/load
+ * shaders), every EDRAM base tile used as a render target gets its own host texture, keyed by
+ * (base tile, format, pitch). Resolves (copies to guest memory) read the host texture back and write the
+ * guest-format, tiled, endian-swapped data on the CPU, so everything that follows (textures, the front
+ * buffer) flows through guest memory like on the console. MSAA is ignored (1 sample); aliasing of EDRAM
+ * regions between different render targets is not tracked.
+ */
+#pragma once
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <tuple>
+#include <vector>
+
+#include <glad/glad.h>
+
+#include <rex/graphics/register_file.h>
+#include <rex/graphics/util/draw.h>
+#include <rex/graphics/xenos.h>
+#include <rex/memory.h>
+
+namespace rex::graphics::gl {
+
+class GlRenderTargets {
+ public:
+  struct ColorTarget {
+    GLuint texture = 0;
+    uint32_t base = 0;
+    uint32_t width = 0, height = 0;
+    xenos::ColorRenderTargetFormat format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
+    GLenum internal_format = GL_RGBA8;
+    uint64_t last_used = 0;
+  };
+  struct DepthTarget {
+    GLuint texture = 0;
+    uint32_t base = 0;
+    uint32_t width = 0, height = 0;
+    uint64_t last_used = 0;
+  };
+
+  GlRenderTargets(const RegisterFile& register_file, memory::Memory& memory)
+      : regs_(register_file), memory_(memory) {}
+  ~GlRenderTargets() { Shutdown(); }
+
+  bool Initialize();
+  void Shutdown();
+
+  // Binds the framebuffer for the draw. color_mask is the normalized 4-bit-per-RT write mask. Returns
+  // false if nothing can be drawn (no targets). width/height_needed are in pixels.
+  bool BindForDraw(uint32_t color_mask, bool depth_stencil_used, uint32_t width_needed,
+                   uint32_t height_needed);
+  uint32_t bound_width() const { return bound_width_; }
+  uint32_t bound_height() const { return bound_height_; }
+  uint32_t bound_color_mask() const { return bound_color_mask_; }
+  bool bound_depth() const { return bound_depth_; }
+
+  // Performs a resolve (copy and/or clear). Returns false on failure; extent_out receives the modified
+  // guest physical memory range (length 0 if nothing was written).
+  bool Resolve(uint32_t& extent_start_out, uint32_t& extent_length_out);
+
+  void EndFrame() { ++frame_; }
+
+ private:
+  struct FbKey {
+    GLuint color[4];
+    GLuint depth;
+    bool operator<(const FbKey& o) const {
+      return std::tie(color[0], color[1], color[2], color[3], depth) <
+             std::tie(o.color[0], o.color[1], o.color[2], o.color[3], o.depth);
+    }
+  };
+
+  ColorTarget* GetColorTarget(uint32_t base, xenos::ColorRenderTargetFormat format, uint32_t width,
+                              uint32_t height, bool create);
+  DepthTarget* GetDepthTarget(uint32_t base, uint32_t width, uint32_t height, bool create);
+  static GLenum GetInternalFormat(xenos::ColorRenderTargetFormat format);
+  GLuint GetFramebuffer(const FbKey& key);
+  void InvalidateFramebuffersUsing(GLuint texture);
+
+  const RegisterFile& regs_;
+  memory::Memory& memory_;
+  std::map<std::pair<uint32_t, uint32_t>, ColorTarget> color_targets_;  // key: (base, format)
+  std::map<uint32_t, DepthTarget> depth_targets_;                       // key: base
+  std::map<FbKey, GLuint> framebuffers_;
+  GLuint read_fbo_ = 0;
+  uint32_t bound_width_ = 0, bound_height_ = 0, bound_color_mask_ = 0;
+  bool bound_depth_ = false;
+  uint64_t frame_ = 0;
+  uint32_t resolve_count_ = 0;
+};
+
+}  // namespace rex::graphics::gl

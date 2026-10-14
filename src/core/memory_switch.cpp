@@ -144,6 +144,15 @@ bool CommitRun(State& s, int win, size_t first, size_t count) {
     REXLOG_ERROR("  dst: base={:X} size={:X} type={} perm={} attr={}; src: base={:X} size={:X} type={} perm={} attr={}",
                  mi_dst.addr, mi_dst.size, mi_dst.type, mi_dst.perm, mi_dst.attr, mi_src.addr,
                  mi_src.size, mi_src.type, mi_src.perm, mi_src.attr);
+    {
+      u64 a = reinterpret_cast<u64>(dst), end = a + count * kUnit;
+      for (int n = 0; n < 8 && a < end; ++n) {
+        MemoryInfo m{};
+        svcQueryMemory(&m, &pi, a);
+        REXLOG_ERROR("  dst walk: block {:X}+{:X} type={} perm={} attr={}", m.addr, m.size, m.type, m.perm, m.attr);
+        a = m.addr + m.size;
+      }
+    }
     for (size_t k = 0; k < count; ++k) {
       s.pool_used[static_cast<size_t>(p) + k] = false;
     }
