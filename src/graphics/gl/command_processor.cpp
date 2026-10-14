@@ -318,7 +318,7 @@ bool GlCommandProcessor::PrepareVertexBuffers(const Shader& vertex_shader) {
         GLuint buf = impl_->shared_memory->chunk(chunk);
         if (buf) {
           glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
-          glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, address & (GlSharedMemory::kChunkSize - 1), sizeof(host), host);
+          glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, (address & (GlSharedMemory::kChunkSize - 1)) - impl_->shared_memory->chunk_window_lo(chunk), sizeof(host), host);
         }
         REXGPU_INFO("GL vfetch#{} addr={:08X} size={} guest={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} | host buf={} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
                     index, address, size, g[0], g[1], g[2], g[3], g[4], g[5], buf, host[0], host[1], host[2], host[3], host[4], host[5]);
@@ -776,6 +776,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   UploadAndBindConstants(vertex_shader, pixel_shader);
   chk("ubo");
   impl_->shared_memory->BindStorageBuffers(kSsboBindingSharedMemory);
+  impl_->shared_memory->SetBaseUniform(program->sm_base_location);
   chk("ssbo");
   ApplyRasterState(primitive_polygonal, normalized_depth_control, impl_->render_targets->bound_color_mask()
                                                                       ? normalized_color_mask
@@ -854,7 +855,8 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
       case IBT::kGuestDMA: {
         uint32_t chunk = ppr.guest_index_base >> GlSharedMemory::kChunkSizeLog2;
         buffer = impl_->shared_memory->chunk(chunk);
-        offset = GLintptr(ppr.guest_index_base & (GlSharedMemory::kChunkSize - 1));
+        offset = GLintptr((ppr.guest_index_base & (GlSharedMemory::kChunkSize - 1)) -
+                          impl_->shared_memory->chunk_window_lo(chunk));
         break;
       }
       case IBT::kHostConverted:

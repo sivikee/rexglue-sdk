@@ -48,6 +48,7 @@ void RewriteSharedMemoryAsTbo(std::string& src) {
     decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase + i) +
              ") uniform usamplerBuffer xe_sm_tbo_" + std::to_string(i) + ";\n";
   }
+  decls += "uniform int xe_sm_base[4];\n";
   src.replace(ds, dm + decl_marker.size() - ds, decls);
   const std::string use = "xe_shared_memory[";
   size_t pos = 0;
@@ -68,7 +69,7 @@ void RewriteSharedMemoryAsTbo(std::string& src) {
       ++e;
     }
     std::string expr = src.substr(e_begin, e - 1 - e_begin);
-    std::string rep = "texelFetch(xe_sm_tbo_" + k + ", int(" + expr + ")).x";
+    std::string rep = "texelFetch(xe_sm_tbo_" + k + ", int(" + expr + ") - xe_sm_base[" + k + "]).x";
     src.replace(pos, e - pos, rep);
     pos += rep.size();
   }

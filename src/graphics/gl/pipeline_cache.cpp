@@ -493,6 +493,7 @@ void GlPipelineCache::FinishLink(GlProgram& program, bool block) {
         dump("ps_ok", pixel->glsl()->source, pixel->shader().ucode_data_hash());
       }
     }
+    program.sm_base_location = glGetUniformLocation(program.program, "xe_sm_base");
     program.state = GlProgram::kReady;
   }
   glDeleteShader(program.vs_id);

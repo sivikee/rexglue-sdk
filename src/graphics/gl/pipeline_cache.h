@@ -29,6 +29,7 @@ struct GlProgram {
   enum State : int { kQueued = 0, kGlslReady, kLinking, kReady, kFailed };
   std::atomic<int> state{kQueued};
   GLuint vs_id = 0, fs_id = 0;
+  GLint sm_base_location = -1;  // xe_sm_base[4] uniform (shared memory window bases), -1 if unused
   std::chrono::steady_clock::time_point link_start;
   GlShader::GlTranslation* vertex = nullptr;
   GlShader::GlTranslation* pixel = nullptr;
