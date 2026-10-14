@@ -21,10 +21,23 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+#ifdef __APPLE__
+#define REX_PIXEL_SHADER_NO_CONTRACTION_DEFAULT false
+#else
+#define REX_PIXEL_SHADER_NO_CONTRACTION_DEFAULT true
+#endif
+REXCVAR_DEFINE_BOOL(spirv_pixel_shader_no_contraction, REX_PIXEL_SHADER_NO_CONTRACTION_DEFAULT,
+                    "GPU",
+                    "Forbid fusing multiplies and adds in translated pixel shaders. Through "
+                    "SPIRV-Cross (MoltenVK) every such operation becomes a non-inlinable function "
+                    "call, which costs most of the pixel shader throughput on Apple GPUs. Vertex "
+                    "shaders always keep it for position invariance between passes.");
 
 namespace rex::graphics {
 
@@ -175,6 +188,8 @@ void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
+  builder_->setNoContractionEnabled(!is_pixel_shader() ||
+                                    REXCVAR_GET(spirv_pixel_shader_no_contraction));
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
