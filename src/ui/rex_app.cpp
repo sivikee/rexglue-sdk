@@ -104,6 +104,14 @@ bool ReXApp::OnInitialize() {
 
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
+  // Where the config file and logs go. The iOS app bundle is read-only, so there it is the
+  // app's Documents folder, which the user can also reach through the Files app and Finder.
+  auto writable_dir = exe_dir;
+#if REX_PLATFORM_IOS
+  if (const char* home = std::getenv("HOME")) {
+    writable_dir = std::filesystem::path(home) / "Documents";
+  }
+#endif
 
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
@@ -117,7 +125,11 @@ bool ReXApp::SetupEnvironment() {
   if (!user_data_cvar.empty()) {
     user_dir = user_data_cvar;
   } else {
+#if REX_PLATFORM_IOS
+    user_dir = writable_dir / GetName();
+#else
     user_dir = rex::filesystem::GetUserFolder() / GetName();
+#endif
   }
 
   // Update data: cvar override, or empty (opt-in)
@@ -143,7 +155,7 @@ bool ReXApp::SetupEnvironment() {
   }
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+                         cache_dir, metadata_dir, writable_dir / (std::string(GetName()) + ".toml")};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -168,7 +180,7 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    log_config.log_dir = (writable_dir / "logs").string();
   }
 
   rex::InitLogging(log_config);

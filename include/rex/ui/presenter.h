@@ -50,6 +50,13 @@
 namespace rex {
 namespace ui {
 
+// iOS forbids GPU work while an app is in the background, and a submission then loses the
+// device. The windowing layer marks the app as backgrounded before that happens; threads that
+// may block (guest GPU work) wait it out, the UI thread skips painting.
+void SetAppInBackground(bool in_background);
+bool IsAppInBackground();
+void WaitWhileAppInBackground();
+
 class Presenter;
 class Window;
 

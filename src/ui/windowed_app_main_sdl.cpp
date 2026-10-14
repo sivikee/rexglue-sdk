@@ -126,6 +126,11 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
 
 #else
 
+#if REX_PLATFORM_IOS
+// Turns main into SDL_main, which SDL calls from inside UIApplicationMain.
+#include <SDL3/SDL_main.h>
+#endif
+
 int main(int argc, char* argv[]) {
   return RunWindowedApp(argc, argv);
 }

@@ -29,6 +29,7 @@
 
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Public/ShaderLang.h>
+#include <rex/ui/presenter.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -5590,6 +5591,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      rex::ui::WaitWhileAppInBackground();
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
       if (submit_result == VK_SUCCESS && std::getenv("OBLIVION_SYNC_GPU")) {
         auto t0 = std::chrono::steady_clock::now();

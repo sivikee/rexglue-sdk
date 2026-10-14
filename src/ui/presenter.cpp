@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <atomic>
 #include <cctype>
 #include <utility>
 
@@ -550,6 +553,7 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  WaitWhileAppInBackground();
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -1494,7 +1498,36 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 #endif  // XE_PLATFORM
 }
 
+namespace {
+std::mutex app_background_mutex_;
+std::condition_variable app_background_cv_;
+std::atomic<bool> app_in_background_{false};
+}  // namespace
+
+void SetAppInBackground(bool in_background) {
+  {
+    std::lock_guard<std::mutex> lock(app_background_mutex_);
+    app_in_background_.store(in_background, std::memory_order_release);
+  }
+  if (!in_background) {
+    app_background_cv_.notify_all();
+  }
+}
+
+bool IsAppInBackground() { return app_in_background_.load(std::memory_order_acquire); }
+
+void WaitWhileAppInBackground() {
+  if (!IsAppInBackground()) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(app_background_mutex_);
+  app_background_cv_.wait(lock, [] { return !app_in_background_.load(std::memory_order_acquire); });
+}
+
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+  if (IsAppInBackground()) {
+    return PaintResult::kNotPresented;
+  }
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);

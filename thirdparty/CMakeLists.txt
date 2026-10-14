@@ -210,8 +210,15 @@ if(REXGLUE_USE_VULKAN)
         set(LOADER_CODEGEN OFF CACHE BOOL "" FORCE)
         string(REGEX REPLACE "\\.[0-9]+$" "" VulkanHeaders_VERSION
             "${REXGLUE_VULKAN_SDK_VERSION}")
-        add_subdirectory(vulkan-loader EXCLUDE_FROM_ALL)
-        set_target_properties(vulkan PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        if(NOT IOS)
+            # On iOS MoltenVK is loaded directly; the loader does not build there.
+            add_subdirectory(vulkan-loader EXCLUDE_FROM_ALL)
+            set_target_properties(vulkan PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        else()
+            # MoltenVK's CMake requires AppKit; a pre-set cache entry makes find_library
+            # take UIKit instead.
+            set(APPKIT_LIBRARY "-framework UIKit;-framework CoreGraphics" CACHE STRING "" FORCE)
+        endif()
 
         set(MVK_BUILD_SHADER_CONVERTER_TOOL OFF CACHE BOOL "" FORCE)
         set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)

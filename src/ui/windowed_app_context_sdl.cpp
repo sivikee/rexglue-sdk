@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/ui/presenter.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
 #include <cstdlib>
@@ -41,7 +42,7 @@ bool SDLWindowedAppContext::Initialize() {
   // Picked before SDL_InitSubSystem, long before a graphics instance can say
   // which surface extensions it has, so the cvar is the escape hatch.
   std::string requested_driver = REXCVAR_GET(video_driver);
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC && !REX_PLATFORM_IOS
   // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
   if (requested_driver.empty()) {
     requested_driver = "cocoa";
@@ -182,6 +183,14 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
 
 bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+  // Delivered synchronously from the UIKit application delegate, before iOS revokes GPU access.
+  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+    REXLOG_INFO("App entering background, pausing GPU work");
+    SetAppInBackground(true);
+  } else if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+    REXLOG_INFO("App back in foreground, resuming GPU work");
+    SetAppInBackground(false);
+  }
   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
     // Cocoa stops making Metal drawables available as part of its termination
     // request. Handle the request synchronously while SDL is queueing it,

@@ -9,6 +9,21 @@
 include_guard(GLOBAL)
 
 function(_rexglue_stage_macos_vulkan_runtime target_name)
+    if(IOS)
+        # iOS has no Vulkan loader: MoltenVK goes next to the executable in the app bundle.
+        foreach(_rexglue_moltenvk MoltenVK::MoltenVK rex::moltenvk)
+            if(TARGET ${_rexglue_moltenvk})
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "$<TARGET_FILE:${_rexglue_moltenvk}>"
+                        "$<TARGET_FILE_DIR:${target_name}>/libMoltenVK.dylib"
+                    VERBATIM
+                )
+                return()
+            endif()
+        endforeach()
+        message(FATAL_ERROR "rexglue: MoltenVK target is unavailable")
+    endif()
     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
         set(_rexglue_vulkan_loader Vulkan::Loader)
         set(_rexglue_moltenvk MoltenVK::MoltenVK)

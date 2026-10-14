@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
@@ -50,6 +51,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
 
   std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
+#if REX_PLATFORM_IOS
+  // No loader on iOS: MoltenVK is bundled next to the executable and used directly.
+  loader_candidates.insert(loader_candidates.begin(),
+                           rex::filesystem::GetExecutableFolder() / "libMoltenVK.dylib");
+#endif
   loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
   loader_candidates.emplace_back("libvulkan.dylib");
   loader_candidates.emplace_back("libMoltenVK.dylib");

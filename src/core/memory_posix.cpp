@@ -21,7 +21,15 @@
 
 #if REX_PLATFORM_MAC
 #include <mach/mach.h>
+#if REX_PLATFORM_IOS
+// mach_vm.h is unavailable on iOS; vm_map.h has the same calls with 64-bit types on arm64.
+#include <mach/vm_map.h>
+#define mach_vm_address_t vm_address_t
+#define mach_vm_size_t vm_size_t
+#define mach_vm_region vm_region_64
+#else
 #include <mach/mach_vm.h>
+#endif
 #include <mach/vm_region.h>
 #endif  // REX_PLATFORM_MAC
 
@@ -431,7 +439,19 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_IOS
+  // The iOS sandbox forbids shm_open. A named Mach memory entry is the shareable backing
+  // instead; the handle is its port, and views are mapped with vm_map.
+  memory_object_size_t size = length;
+  mach_port_t entry = MACH_PORT_NULL;
+  kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &size, 0,
+                                               MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
+                                               &entry, MACH_PORT_NULL);
+  if (kr != KERN_SUCCESS || size < length) {
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(entry);
+#elif REX_PLATFORM_ANDROID
   // TODO(Triang3l): Check if memfd can be used instead on API 30+.
   if (android_ASharedMemory_create_) {
     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
@@ -488,6 +508,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+#if REX_PLATFORM_IOS
+  mach_port_deallocate(mach_task_self(), static_cast<mach_port_t>(handle));
+  return;
+#endif
   close(static_cast<int>(handle));
 #if !REX_PLATFORM_ANDROID
   auto full_path = MakeShmName(path);
@@ -502,6 +526,22 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
   if (file_offset % page != 0) {
     return nullptr;
   }
+
+#if REX_PLATFORM_IOS
+  vm_address_t address = reinterpret_cast<vm_address_t>(base_address);
+  vm_prot_t vm_prot = VM_PROT_NONE;
+  uint32_t posix_prot = ToPosixProtectFlags(access);
+  if (posix_prot & PROT_READ) vm_prot |= VM_PROT_READ;
+  if (posix_prot & PROT_WRITE) vm_prot |= VM_PROT_WRITE;
+  kern_return_t kr = vm_map(mach_task_self(), &address, length, 0,
+                            base_address ? (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) : VM_FLAGS_ANYWHERE,
+                            static_cast<mach_port_t>(handle), file_offset, FALSE, vm_prot,
+                            VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+  if (kr != KERN_SUCCESS) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(address);
+#endif
 
   int flags = MAP_SHARED;
 

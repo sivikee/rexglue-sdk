@@ -52,11 +52,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
 )
 
 # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
-install(TARGETS rexglue
-    EXPORT rexglueTargets
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    CONFIGURATIONS Release
-)
+if(TARGET rexglue)
+    install(TARGETS rexglue
+        EXPORT rexglueTargets
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        CONFIGURATIONS Release
+    )
+endif()
 
 if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
     install(TARGETS ${REXGLUE_INSTALL_FIDELITYFX_TARGETS}
@@ -138,11 +140,13 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 if(APPLE AND REXGLUE_USE_VULKAN)
-    install(FILES "$<TARGET_FILE:Vulkan::Loader>"
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        CONFIGURATIONS Release
-        RENAME libvulkan.1.dylib
-    )
+    if(TARGET Vulkan::Loader)
+        install(FILES "$<TARGET_FILE:Vulkan::Loader>"
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            CONFIGURATIONS Release
+            RENAME libvulkan.1.dylib
+        )
+    endif()
     install(FILES "$<TARGET_FILE:MoltenVK::MoltenVK>"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}
         CONFIGURATIONS Release
@@ -191,6 +195,7 @@ install(EXPORT rexglueTargets
 #
 # Windows: HKCU\Software\Kitware\CMake\Packages\rexglue  (REG_SZ, value name = MD5 hash)
 # Unix:    ~/.cmake/packages/rexglue/<hash>               (file containing prefix path)
+if(NOT IOS)  # a cross-compiled SDK must not shadow the host one
 install(CODE [[
     # Normalize path casing on Windows before hashing to avoid duplicate entries
     if(CMAKE_HOST_WIN32)
@@ -215,3 +220,4 @@ install(CODE [[
     message(STATUS "Registered rexglue in CMake user package registry")
     message(STATUS "  -> ${CMAKE_INSTALL_PREFIX}")
 ]])
+endif()

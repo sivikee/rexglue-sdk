@@ -337,9 +337,9 @@ int Memory::MapViewsMac() {
                                            map_info[n].virtual_address_start + 1);
     size_t file_offset = static_cast<size_t>(map_info[n].target_address & granularity_mask);
     void* target_address = mapping_base + map_info[n].virtual_address_start;
-    void* result = mmap(target_address, view_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
-                        mapping_, file_offset);
-    if (result == MAP_FAILED || result != target_address) {
+    void* result = rex::memory::MapFileView(mapping_, target_address, view_size,
+                                            rex::memory::PageAccess::kReadWrite, file_offset);
+    if (!result || result != target_address) {
       int err = errno;
       REXSYS_ERROR(
           "MapViewsMac: map failed view {} addr 0x{:016X} size 0x{:X} offset 0x{:X} err {} ({})", n,
