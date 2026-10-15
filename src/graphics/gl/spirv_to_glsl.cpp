@@ -44,11 +44,14 @@ void RewriteSharedMemoryAsTbo(std::string& src) {
     return;
   }
   std::string decls;
-  for (uint32_t i = 0; i < 4; ++i) {
-    decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase + i) +
-             ") uniform usamplerBuffer xe_sm_tbo_" + std::to_string(i) + ";\n";
-  }
-  decls += "uniform int xe_sm_base[4];\n";
+  decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase) + ") uniform usamplerBuffer xe_sm_store;\n";
+  decls += "layout(binding = " + std::to_string(kSharedMemoryTboUnitBase + 1) + ") uniform usamplerBuffer xe_sm_pt;\n";
+  // a = dword index in the 512 MiB guest physical space; 1 MiB granules = 2^18 dwords.
+  decls += "uint xe_sm_fetch(uint a) {\n"
+           "  uint h = texelFetch(xe_sm_pt, int(a >> 18)).x;\n"
+           "  if (h == 0xFFFFFFFFu) return 0u;\n"
+           "  return texelFetch(xe_sm_store, int(h + (a & 0x3FFFFu))).x;\n"
+           "}\n";
   src.replace(ds, dm + decl_marker.size() - ds, decls);
   const std::string use = "xe_shared_memory[";
   size_t pos = 0;
@@ -69,7 +72,7 @@ void RewriteSharedMemoryAsTbo(std::string& src) {
       ++e;
     }
     std::string expr = src.substr(e_begin, e - 1 - e_begin);
-    std::string rep = "texelFetch(xe_sm_tbo_" + k + ", int(" + expr + ") - xe_sm_base[" + k + "]).x";
+    std::string rep = "xe_sm_fetch(uint(" + k + ") * 33554432u + uint(" + expr + "))";
     src.replace(pos, e - pos, rep);
     pos += rep.size();
   }
@@ -133,6 +136,15 @@ bool ConvertSpirvToGlsl(const std::vector<uint8_t>& spirv, uint32_t texture_unit
     remap(res.storage_images);
     out.source = comp.compile();
     RewriteSharedMemoryAsTbo(out.source);
+    // The vertex and pixel stage float-constant blocks have different array sizes; GL requires
+    // identically defined blocks of the same name across the linked stages.
+    if (comp.get_execution_model() == spv::ExecutionModelFragment) {
+      const std::string blk = "uniform XeFloatConstants";
+      size_t bp = out.source.find(blk);
+      if (bp != std::string::npos) {
+        out.source.replace(bp, blk.size(), "uniform XeFloatConstantsPS");
+      }
+    }
     if (out.source.find("gl_CullDistance") != std::string::npos) {
       size_t nl = out.source.find('\n');
       out.source.insert(nl + 1, "#extension GL_ARB_cull_distance : require\n");

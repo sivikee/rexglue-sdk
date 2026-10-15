@@ -20,8 +20,8 @@ constexpr uint32_t kSsboBindingSharedMemory = 0;     // 4 consecutive bindings
 constexpr uint32_t kUboBindingPushConstants = 15;
 // Texture units: vertex shader 0.., pixel shader from kPixelTextureUnitBase.
 constexpr uint32_t kPixelTextureUnitBase = 32;
-// Shared memory is read through 4 R32UI texture buffers on these (vertex-stage-visible) units.
-constexpr uint32_t kSharedMemoryTboUnitBase = 28;
+// Shared memory is read through 2 R32UI texture buffers (store + page table) on these (vertex-stage-visible) units.
+constexpr uint32_t kSharedMemoryTboUnitBase = 30;  // store on 30, page table on 31
 
 struct CombinedSampler {
   uint32_t unit;             // GL texture unit (already offset for the stage)

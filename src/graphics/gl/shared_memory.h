@@ -1,15 +1,18 @@
 /**
  * @file        graphics/gl/shared_memory.h
- * @brief       Guest physical memory mirror for shaders: 4 x 128 MiB chunks, each backed by a GL buffer
- *              that only covers a window [lo, lo + size) of the chunk (grown on demand, as GL has no sparse
- *              buffers and the Switch application memory budget cannot afford 512 MiB). Shaders read the
- *              buffers through R32UI texture buffers (see spirv_to_glsl.cpp), with the per-chunk window base
- *              passed in the xe_sm_base uniform.
+ * @brief       Guest physical memory mirror for shaders. GL has no sparse buffers and the nouveau/Eden
+ *              driver cannot allocate large buffers once memory is fragmented (a 52 MiB buffer fails), so
+ *              the mirror is a COMPACT store: guest memory is made resident in 1 MiB granules that are
+ *              packed into one R32UI texture buffer ("store") on demand; a second small R32UI texture
+ *              buffer (the "page table", one dword per guest MiB) gives the store offset of every
+ *              granule. Shaders read shared memory as store[pt[a >> 18] + (a & 0x3FFFF)] (see
+ *              spirv_to_glsl.cpp).
  */
 #pragma once
 
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 #include <glad/glad.h>
 
@@ -19,10 +22,10 @@ namespace rex::graphics::gl {
 
 class GlSharedMemory final : public SharedMemory {
  public:
-  static constexpr uint32_t kChunkSizeLog2 = 27;  // GL_MAX_SHADER_STORAGE_BLOCK_SIZE on Mesa/nouveau
-  static constexpr uint32_t kChunkSize = 1u << kChunkSizeLog2;
-  static constexpr uint32_t kChunkCount = kBufferSize / kChunkSize;
-  static constexpr uint32_t kGranuleLog2 = 22;  // 4 MiB growth step
+  static constexpr uint32_t kGranuleLog2 = 20;  // residency granule: 1 MiB
+  static constexpr uint32_t kGranuleSize = 1u << kGranuleLog2;
+  static constexpr uint32_t kGranuleCount = kBufferSize >> kGranuleLog2;
+  static constexpr uint32_t kGrowStep = 8u << 20;  // store capacity growth step
 
   explicit GlSharedMemory(memory::Memory& memory) : SharedMemory(memory) {}
   ~GlSharedMemory() override { Shutdown(true); }
@@ -30,14 +33,14 @@ class GlSharedMemory final : public SharedMemory {
   bool Initialize();
   void Shutdown(bool from_destructor = false);
 
-  // Binds the chunk texture buffers (shader-visible units) for the next draw.
+  // Binds the store and page table texture buffers (shader-visible units) for the next draw.
   void BindStorageBuffers(uint32_t first_binding);
-  // Sets the xe_sm_base[4] uniform (window base of every chunk in dwords) of the current program.
-  void SetBaseUniform(GLint location) const;
-  GLuint chunk(uint32_t index) const { return chunks_[index]; }
-  // Byte offset (inside the chunk) of the first byte covered by the chunk buffer.
-  uint32_t chunk_window_lo(uint32_t index) const { return chunk_lo_[index]; }
-  uint32_t total_bytes() const;
+  // No per-draw uniform any more (kept for the call sites).
+  void SetBaseUniform(GLint location) const { (void)location; }
+  // Host buffer + byte offset holding guest physical range [address, address + length) contiguously.
+  // False if the range is not resident or not contiguous in the store.
+  bool GetHostRange(uint32_t address, uint32_t length, GLuint& buffer, GLintptr& offset) const;
+  uint32_t total_bytes() const { return next_slot_ << kGranuleLog2; }
 
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -45,13 +48,15 @@ class GlSharedMemory final : public SharedMemory {
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
-  bool EnsureWindow(uint32_t chunk_index, uint32_t begin, uint32_t end);
+  bool EnsureCapacity(uint32_t slots_needed_total);
 
-  GLuint chunks_[kChunkCount] = {};
-  GLuint tbos_[kChunkCount] = {};  // R32UI texture buffer views (shaders read shared memory through these)
-  uint32_t chunk_lo_[kChunkCount] = {};
-  uint32_t chunk_sizes_[kChunkCount] = {};
-  GLuint dummy_ = 0;
+  GLuint store_ = 0;
+  GLuint store_tbo_ = 0;
+  GLuint pt_ = 0;
+  GLuint pt_tbo_ = 0;
+  uint32_t capacity_ = 0;   // store size in bytes
+  uint32_t next_slot_ = 0;  // granule slots handed out so far
+  uint32_t page_table_[kGranuleCount] = {};  // dword offset into the store, or 0xFFFFFFFF
 };
 
 }  // namespace rex::graphics::gl

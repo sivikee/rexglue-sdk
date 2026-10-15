@@ -346,7 +346,7 @@ void GlPipelineCache::StartLink(GlProgram& program) {
       if (strip & 1) erase_block("xe_shared_memory[4]");
       if (strip & 2) { erase_block("xe_uniform_system_constants;"); erase_block("xe_uniform_bool_loop_constants;"); erase_block("xe_uniform_fetch_constants;"); erase_block("xe_uniform_float_constants;"); }
       const char* extra = "";
-      if (REXCVAR_GET(gl_debug_vs) == 4) extra = " if (texelFetch(xe_sm_tbo_0, gl_VertexID & 15).x == 0xDEADBEEFu) gl_Position.z = 0.5;";
+      if (REXCVAR_GET(gl_debug_vs) == 4) extra = " if (xe_sm_fetch(uint(gl_VertexID) & 15u) == 0xDEADBEEFu) gl_Position.z = 0.5;";
       if (REXCVAR_GET(gl_debug_vs) == 5) extra = " if (xe_uniform_system_constants.flags == 0xFFFFFFFFu) gl_Position.z = 0.5;";
       if (REXCVAR_GET(gl_debug_vs) == 6) extra = " if (xe_uniform_fetch_constants.fetch_constants[uint(gl_VertexID) & 7u].x == 0xDEADBEEFu) gl_Position.z = 0.5;";
       vs_source += "void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);"; vs_source += extra; vs_source += " }\n";

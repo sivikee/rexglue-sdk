@@ -317,12 +317,12 @@ bool GlCommandProcessor::PrepareVertexBuffers(const Shader& vertex_shader) {
       }
       if (dbg_log_vertex_) {
         const uint32_t* g = reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(address));
-        uint32_t chunk = address >> GlSharedMemory::kChunkSizeLog2;
         uint32_t host[8] = {};
-        GLuint buf = impl_->shared_memory->chunk(chunk);
-        if (buf) {
+        GLuint buf = 0;
+        GLintptr boff = 0;
+        if (impl_->shared_memory->GetHostRange(address, sizeof(host), buf, boff)) {
           glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
-          glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, (address & (GlSharedMemory::kChunkSize - 1)) - impl_->shared_memory->chunk_window_lo(chunk), sizeof(host), host);
+          glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, boff, sizeof(host), host);
         }
         REXGPU_INFO("GL vfetch#{} addr={:08X} size={} guest={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} | host buf={} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
                     index, address, size, g[0], g[1], g[2], g[3], g[4], g[5], buf, host[0], host[1], host[2], host[3], host[4], host[5]);
@@ -857,10 +857,11 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     GLintptr offset = 0;
     switch (ppr.index_buffer_type) {
       case IBT::kGuestDMA: {
-        uint32_t chunk = ppr.guest_index_base >> GlSharedMemory::kChunkSizeLog2;
-        buffer = impl_->shared_memory->chunk(chunk);
-        offset = GLintptr((ppr.guest_index_base & (GlSharedMemory::kChunkSize - 1)) -
-                          impl_->shared_memory->chunk_window_lo(chunk));
+        uint32_t bytes = ppr.host_draw_vertex_count *
+                         (ppr.host_index_format == xenos::IndexFormat::kInt16 ? 2u : 4u);
+        if (!impl_->shared_memory->GetHostRange(ppr.guest_index_base, bytes, buffer, offset)) {
+          return fail("index_buffer_not_contiguous");
+        }
         break;
       }
       case IBT::kHostConverted:
