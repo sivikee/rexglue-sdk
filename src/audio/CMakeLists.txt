@@ -16,6 +16,9 @@ add_library(rexaudio OBJECT
     sdl/sdl_audio_driver.cpp
 )
 add_library(rex::audio ALIAS rexaudio)
+if(REX_SWITCH)
+    target_sources(rexaudio PRIVATE switch/switch_audio_system.cpp)
+endif()
 
 rex_target_pch(rexaudio
     <mutex>
