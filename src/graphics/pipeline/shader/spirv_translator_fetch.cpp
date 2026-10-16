@@ -1859,6 +1859,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // possible to apply the signedness to host components before swizzling,
         // so doing it during (for unsigned vs. signed) and after (for biased
         // and gamma) swizzling.
+        const bool compact_result =
+            features_.compact_texture_result && !features_.image_view_format_swizzle;
         if (!features_.image_view_format_swizzle) {
           id_vector_temp_.clear();
           id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTextureSwizzles));
@@ -1873,6 +1875,37 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           spv::Id const_float_1 = builder_->makeFloatConstant(1.0f);
           uint32_t result_remaining_components = used_result_nonzero_components;
           uint32_t result_component_index;
+          if (compact_result) {
+            // Branch-free: 3 swizzle bits per component (bit 2 = constant 0/1 selected by bit 0, else the
+            // component index bits 1:0) of the signed or unsigned sample.
+            spv::Id const_uint_1 = builder_->makeUintConstant(1);
+            spv::Id const_uint_3 = builder_->makeUintConstant(3);
+            spv::Id const_uint_4 = builder_->makeUintConstant(4);
+            while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
+              result_remaining_components &= ~(UINT32_C(1) << result_component_index);
+              spv::Id swizzle_bits = builder_->createTriOp(
+                  spv::OpBitFieldUExtract, type_uint_, swizzle_word,
+                  builder_->makeUintConstant(swizzle_word_offset + 3 * result_component_index),
+                  const_uint_3);
+              spv::Id swizzle_sample_result = builder_->createTriOp(
+                  spv::OpSelect, type_float4_,
+                  builder_->smearScalar(spv::NoPrecision, result_is_signed[result_component_index],
+                                        type_bool4_),
+                  sample_result_signed, sample_result_unsigned);
+              spv::Id fetched = builder_->createBinOp(
+                  spv::OpVectorExtractDynamic, type_float_, swizzle_sample_result,
+                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, swizzle_bits, const_uint_3));
+              spv::Id constant = builder_->createUnaryOp(
+                  spv::OpConvertUToF, type_float_,
+                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, swizzle_bits, const_uint_1));
+              spv::Id is_constant = builder_->createBinOp(
+                  spv::OpINotEqual, type_bool_,
+                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, swizzle_bits, const_uint_4),
+                  const_uint_0_);
+              result[result_component_index] =
+                  builder_->createTriOp(spv::OpSelect, type_float_, is_constant, constant, fetched);
+            }
+          }
           while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
             result_remaining_components &= ~(UINT32_C(1) << result_component_index);
             uint32_t swizzle_bit_0_value = UINT32_C(1)
@@ -1939,7 +1972,85 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // to gamma-correct.
         spv::Id const_float_2 = builder_->makeFloatConstant(2.0f);
         spv::Id const_float_minus_1 = builder_->makeFloatConstant(-1.0f);
-        {
+        if (compact_result) {
+          // Signedness as one vector pass: signed was already selected while swizzling; unsigned biased and
+          // gamma only behind one (rarely taken) branch per fetch.
+          // Only the used components, packed: n = 1..4 (a scalar for 1).
+          uint32_t used_indices[4];
+          uint32_t n = 0;
+          {
+            uint32_t remaining = used_result_nonzero_components;
+            uint32_t index;
+            while (rex::bit_scan_forward(remaining, &index)) {
+              remaining &= ~(UINT32_C(1) << index);
+              used_indices[n++] = index;
+            }
+          }
+          if (n) {
+            spv::Id float_type = type_float_vectors_[n - 1];
+            spv::Id uint_type = type_uint_vectors_[n - 1];
+            spv::Id bool_type = type_bool_vectors_[n - 1];
+            spv::Id value, sign_vector;
+            if (n == 1) {
+              value = result[used_indices[0]];
+              sign_vector = swizzled_signs[used_indices[0]];
+            } else {
+              id_vector_temp_.clear();
+              for (uint32_t i = 0; i < n; ++i) id_vector_temp_.push_back(result[used_indices[i]]);
+              value = builder_->createCompositeConstruct(float_type, id_vector_temp_);
+              id_vector_temp_.clear();
+              for (uint32_t i = 0; i < n; ++i) id_vector_temp_.push_back(swizzled_signs[used_indices[i]]);
+              sign_vector = builder_->createCompositeConstruct(uint_type, id_vector_temp_);
+            }
+            spv::Id const_biased = SpirvSmearScalarResultOrConstant(
+                builder_->makeUintConstant(uint32_t(xenos::TextureSign::kUnsignedBiased)), uint_type);
+            spv::Id const_gamma = SpirvSmearScalarResultOrConstant(
+                builder_->makeUintConstant(uint32_t(xenos::TextureSign::kGamma)), uint_type);
+            spv::Id is_special =
+                builder_->createBinOp(spv::OpUGreaterThanEqual, bool_type, sign_vector, const_biased);
+            if (n > 1) is_special = builder_->createUnaryOp(spv::OpAny, type_bool_, is_special);
+            SpirvBuilder::IfBuilder if_special(is_special, spv::SelectionControlDontFlattenMask,
+                                               *builder_);
+            spv::Id special_value;
+            {
+              spv::Id biased = builder_->createNoContractionBinOp(
+                  spv::OpFAdd, float_type,
+                  builder_->createNoContractionBinOp(n > 1 ? spv::OpVectorTimesScalar : spv::OpFMul,
+                                                     float_type, value, const_float_2),
+                  SpirvSmearScalarResultOrConstant(const_float_minus_1, float_type));
+              spv::Id gamma;
+              if (n < 4) {
+                gamma = PWLGammaToLinear(value, false);
+              } else {
+                // PWLGammaToLinear takes up to 3 components: xyz and w separately.
+                std::vector<unsigned> xyz_channels = {0, 1, 2};
+                spv::Id gamma_xyz = PWLGammaToLinear(
+                    builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, value, xyz_channels),
+                    false);
+                spv::Id gamma_w =
+                    PWLGammaToLinear(builder_->createCompositeExtract(value, type_float_, 3), false);
+                std::unique_ptr<spv::Instruction> gamma_construct = std::make_unique<spv::Instruction>(
+                    builder_->getUniqueId(), type_float4_, spv::OpCompositeConstruct);
+                gamma_construct->addIdOperand(gamma_xyz);
+                gamma_construct->addIdOperand(gamma_w);
+                gamma = gamma_construct->getResultId();
+                builder_->getBuildPoint()->addInstruction(std::move(gamma_construct));
+              }
+              spv::Id is_biased =
+                  builder_->createBinOp(spv::OpIEqual, bool_type, sign_vector, const_biased);
+              spv::Id is_gamma = builder_->createBinOp(spv::OpIEqual, bool_type, sign_vector, const_gamma);
+              special_value = builder_->createTriOp(spv::OpSelect, float_type, is_biased, biased, value);
+              special_value =
+                  builder_->createTriOp(spv::OpSelect, float_type, is_gamma, gamma, special_value);
+            }
+            if_special.makeEndIf();
+            spv::Id final_value = if_special.createMergePhi(special_value, value);
+            for (uint32_t i = 0; i < n; ++i) {
+              result[used_indices[i]] =
+                  n == 1 ? final_value : builder_->createCompositeExtract(final_value, type_float_, i);
+            }
+          }
+        } else {
           uint32_t result_remaining_components = used_result_nonzero_components;
           uint32_t result_component_index;
           while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {

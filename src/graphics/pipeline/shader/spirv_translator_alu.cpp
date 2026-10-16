@@ -28,6 +28,13 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id ope
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
+  if (features_.cheap_mul_zero_rule) {
+    // 0 * inf / inf * 0 are the only finite-operand products that give NaN.
+    return builder_->createTriOp(
+        spv::OpSelect, type_float_vectors_[num_components - 1],
+        builder_->createUnaryOp(spv::OpIsNan, type_bool_vectors_[num_components - 1], value),
+        const_float_vectors_0_[num_components - 1], value);
+  }
   return builder_->createTriOp(
       spv::OpSelect, type_float_,
       builder_->createBinOp(spv::OpFOrdEqual, type_bool_vectors_[num_components - 1],

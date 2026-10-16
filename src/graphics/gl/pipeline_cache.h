@@ -52,6 +52,7 @@ struct GlProgram {
   bool urgent = false;   // requested by a draw
   bool busy = false;     // being processed by the compile thread
   bool from_disk = false;
+  size_t glsl_bytes = 0;  // VS + PS GLSL size once translated (link cost estimate for small-first scheduling)
   // GPU thread only.
   mutable bool used = false;  // a draw has used it (first-use draw accounting)
 };
@@ -94,7 +95,6 @@ class GlPipelineCache {
   const RegisterFile& register_file_;
   std::unique_ptr<SpirvShaderTranslator> translator_;
   string::StringBuffer ucode_disasm_buffer_;         // GPU thread
-  string::StringBuffer worker_ucode_disasm_buffer_;  // compile thread
   std::unordered_map<uint64_t, std::unique_ptr<GlShader>> shaders_;
 
   struct ProgramKey {
@@ -114,8 +114,16 @@ class GlPipelineCache {
   // Returns true if linked (sets program.program / sm_base_location); false = failed (logged, state kFailed).
   bool FinishLink(GlProgram& program, bool block, bool* done = nullptr);
   void WorkerLink(GlProgram& program);
-  void WorkerMain();
-  static void WorkerThunk(void* self);
+  struct Worker {
+    GlPipelineCache* self = nullptr;
+    int index = 0;
+    void* thread = nullptr;   // libnx Thread*
+    void* context = nullptr;  // shared EGL context (null: translate only)
+    bool share_ok = false;    // its share probe passed: may link
+    string::StringBuffer ucode_buffer;
+  };
+  void WorkerMain(Worker& worker);
+  static void WorkerThunk(void* worker);
   void EnqueueLocked(GlProgram& program, bool urgent);
   bool WarmLinkAllowed();
   // GPU thread: stop linking on the compile thread (it only translates from now on); logs why.
@@ -131,8 +139,9 @@ class GlPipelineCache {
   void FlushCacheWrites();
 
   class GlContext* gl_context_ = nullptr;
-  void* worker_thread_ = nullptr;
-  void* worker_context_ = nullptr;
+  // gl_compile_threads compile threads, each with its own shared context (Mesa compiles one program per context at
+  // a time; 0.5-10 s each on the Switch, and the first in-game frame needs dozens of them).
+  std::vector<std::unique_ptr<Worker>> workers_;
   std::atomic<bool> link_on_worker_{false};
   int validate_left_ = 8;  // GPU thread: first worker-linked programs are checked on the GPU thread's context
   // Share-group probe: objects created on the GPU thread's context that the compile thread looks up on its shared
@@ -143,7 +152,7 @@ class GlPipelineCache {
   std::atomic<bool> worker_programs_usable_{false};  // share probe passed and no validation failure
   std::atomic<bool> worker_started_{false};     // the compile thread finished its start-up (context + probe)
   std::atomic<uint32_t> worker_links_done_{0};  // successful links on the compile thread
-  std::atomic<bool> worker_in_link_{false};     // the compile thread is inside glCompileShader / glLinkProgram
+  std::atomic<int> worker_in_link_{0};          // compile threads inside glCompileShader / glLinkProgram
   std::atomic<uint32_t> worker_urgent_links_{0};  // ... of programs a draw had asked for
   std::mutex translate_mutex_;                  // translator_ + GlTranslation translation/GLSL (both threads)
   // GPU thread only.
@@ -165,6 +174,7 @@ class GlPipelineCache {
   std::atomic<uint32_t> translated_count_{0};
   std::atomic<uint32_t> linked_count_{0};
   uint32_t dumped_ = 0;
+  uint32_t dumped_big_ = 0;
   uint32_t warm_linked_ = 0, warm_skipped_ = 0;
   bool warm_logged_done_ = false;
 

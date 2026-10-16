@@ -47,6 +47,10 @@ class GlSharedMemory final : public SharedMemory {
   // GPU-side access (compute resolves, front buffer blit, lazy downloads).
   GLuint store_buffer() const { return store_; }
   GLuint page_table_buffer() const { return pt_; }
+  // R32UI texture buffers over the store / page table (draws read them with texelFetch; the GPU resolve compute
+  // shader writes the store through an image buffer).
+  GLuint store_texture_buffer() const { return store_tbo_; }
+  GLuint page_table_texture_buffer() const { return pt_tbo_; }
   uint32_t store_capacity() const { return capacity_; }
   // Store byte offset of a guest physical address and the number of bytes from it to the end of its granule.
   bool StoreOffset(uint32_t address, GLintptr& offset, uint32_t& bytes_to_granule_end) const;

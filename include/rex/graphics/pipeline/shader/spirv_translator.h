@@ -406,6 +406,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // Texture fetch results: swizzle (when !image_view_format_swizzle) and signedness (biased / gamma) applied
+    // branch-free, per fetch as one vector pass, instead of an if/else per component plus a switch per component.
+    // Same results. Used by the OpenGL backend: Mesa's GLSL compiler on the Switch needs minutes for the
+    // per-component form of shaders with ~20 texture fetches (200-300 KB of GLSL). Off for Vulkan.
+    bool compact_texture_result = false;
+
+    // Xenos "0 * anything = 0" multiplication rule as "NaN result -> 0" (one isnan() per product) instead of
+    // "min(|a|, |b|) == 0 -> 0". Identical unless an operand is already NaN (NaN * non-zero gives 0 instead of NaN).
+    // Used by the OpenGL backend to keep the GLSL small for Mesa. Off for Vulkan.
+    bool cheap_mul_zero_rule = false;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,

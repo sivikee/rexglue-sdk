@@ -15,6 +15,15 @@
 #include "spirv_to_glsl.h"
 #include "tiling.h"
 
+#include <string>
+
+REXCVAR_DEFINE_BOOL(gl_gpu_resolve_compute, false, "GPU",
+                    "GL backend: let GPU resolves write the shared memory store with a compute shader. false = resolves "
+                    "stay GPU snapshots (lazy) and are read back + converted on the CPU only when memory needs them. "
+                    "The compute dispatch crashed Eden's GPU emulation and was never exercised on hardware");
+REXCVAR_DEFINE_INT32(gl_gpu_resolve_debug, 0, "GPU",
+                     "GL debug: GPU resolve compute shader variants (1 = empty main, 2 = no store, 3 = no source fetch)");
+
 namespace rex::graphics::gl {
 
 namespace {
@@ -804,8 +813,11 @@ layout(binding = 0) uniform sampler2DArray src;
 layout(binding = 0) uniform sampler2D src;
 #define SRC_FETCH(q) texelFetch(src, q, 0)
 #endif
-layout(std430, binding = 0) buffer StoreBuf { uint data[]; } sm;
-layout(std430, binding = 1) readonly buffer PtBuf { uint pt[]; };
+// The store and its page table are accessed as an R32UI image buffer / texture buffer, not as SSBOs: Eden (NVIDIA
+// Vulkan driver) crashed on the first dispatch of the SSBO version (0xC0000409 / divide by zero in nvoglv64.dll),
+// and draws read the same buffers through texture buffers anyway.
+layout(r32ui, binding = 0) uniform writeonly uimageBuffer sm_store;
+layout(binding = 1) uniform usamplerBuffer sm_pt;
 uniform ivec4 u_src;   // source rect x0, y0, width, height
 uniform ivec4 u_dst;   // dest origin x, y (texels), pitch aligned to 32, log2 bytes per texel
 uniform uint u_base;   // guest physical base address of the destination image
@@ -827,12 +839,19 @@ uint swapw(uint v, int e) {
 }
 
 void main() {
+#if defined(DBG_MODE) && DBG_MODE == 1
+  return;
+#endif
   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
   if (p.x >= u_src.z || p.y >= u_src.w) return;
+#if defined(DBG_MODE) && DBG_MODE == 3
+  vec4 c = vec4(p.x, p.y, 0.0, 1.0);
+#else
   vec4 c = SRC_FETCH(u_src.xy + p);
+#endif
   if (u_fmt.z != 0) c = c.bgra;
   uint addr = u_base + tiled(uint(u_dst.x + p.x), uint(u_dst.y + p.y), uint(u_dst.z), uint(u_dst.w));
-  uint slot = pt[addr >> 20];
+  uint slot = texelFetch(sm_pt, int(addr >> 20)).x;
   if (slot == 0xFFFFFFFFu) return;
   uint idx = slot + ((addr & 0xFFFFFu) >> 2);
   int kind = u_fmt.x;
@@ -857,8 +876,10 @@ void main() {
     v0 = floatBitsToUint(c.r);
     v1 = floatBitsToUint(c.g);
   }
-  sm.data[idx] = swapw(v0, e);
-  if (kind == 3 || kind == 5) sm.data[idx + 1u] = swapw(v1, e);
+#if !defined(DBG_MODE) || DBG_MODE != 2
+  imageStore(sm_store, int(idx), uvec4(swapw(v0, e)));
+  if (kind == 3 || kind == 5) imageStore(sm_store, int(idx + 1u), uvec4(swapw(v1, e)));
+#endif
 }
 )";
 
@@ -898,7 +919,10 @@ int GpuKindFor(xenos::TextureFormat dest_format, uint32_t bpp) {
 namespace {
 GLuint CompileResolveProgram(bool src_array) {
   GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
-  const char* parts[2] = {src_array ? "#version 430 core\n#define SRC_ARRAY 1\n" : "#version 430 core\n", kResolveCs};
+  const int dbg = REXCVAR_GET(gl_gpu_resolve_debug);
+  std::string head = src_array ? "#version 430 core\n#define SRC_ARRAY 1\n" : "#version 430 core\n";
+  if (dbg) head += "#define DBG_MODE " + std::to_string(dbg) + "\n";
+  const char* parts[2] = {head.c_str(), kResolveCs};
   glShaderSource(cs, 2, parts, nullptr);
   glCompileShader(cs);
   GLint ok = 0;
@@ -954,16 +978,22 @@ bool GlRenderTargets::GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x
   if (uint64_t(pr.extent_start) + pr.extent_length > SharedMemory::kBufferSize) {
     return false;
   }
-  perf::Scope perf_gpu_scope(perf::kGpuResolveTicks);
-  // Make the destination pages resident (and current: partially covered edge pages keep their guest contents).
-  if (!sm_->RequestRange(pr.extent_start, pr.extent_length)) {
-    return false;
+  const bool compute = REXCVAR_GET(gl_gpu_resolve_compute);
+  const bool lazy = pr.snap_kind && (gpu_prog_array_ || !compute) && REXCVAR_GET(gl_lazy_resolve);
+  if (!compute && !lazy) {
+    return false;  // CPU resolve
   }
-  if (!sm_->store_buffer()) {
-    return false;
+  perf::Scope perf_gpu_scope(perf::kGpuResolveTicks);
+  if (compute) {
+    // Make the destination pages resident (and current: partially covered edge pages keep their guest contents).
+    if (!sm_->RequestRange(pr.extent_start, pr.extent_length)) {
+      return false;
+    }
+    if (!sm_->store_buffer()) {
+      return false;
+    }
   }
   pr.gpu_kind = kind;
-  const bool lazy = pr.snap_kind && gpu_prog_array_ && REXCVAR_GET(gl_lazy_resolve);
   const uint32_t new_pitch = (pr.dest_pitch + 31) & ~31u;
   // Older resolves whose image is completely overwritten by this one never need to be written back (or, when
   // lazy, never written into the store at all). Older lazy ones that overlap only partially must reach the store
@@ -1013,8 +1043,11 @@ void GlRenderTargets::GpuResolveDispatch(PendingResolve& pr, GLuint texture, boo
   const GLenum target = from_snapshot ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
   glBindTexture(target, texture);
   glBindSampler(0, 0);
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sm_->store_buffer());
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sm_->page_table_buffer());
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_BUFFER, sm_->page_table_texture_buffer());
+  glBindSampler(1, 0);
+  glActiveTexture(GL_TEXTURE0);
+  glBindImageTexture(0, sm_->store_texture_buffer(), 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
   glUniform4i(from_snapshot ? ua_src_ : u_src_, GLint(x0), GLint(y0), GLint(pr.rw), GLint(pr.rh));
   glUniform4i(from_snapshot ? ua_dst_ : u_dst_, GLint(pr.ox), GLint(pr.oy), GLint(pitch_aligned),
               GLint(pr.bpp_log2));
@@ -1024,8 +1057,12 @@ void GlRenderTargets::GpuResolveDispatch(PendingResolve& pr, GLuint texture, boo
   glDispatchCompute((pr.rw + 7) / 8, (pr.rh + 7) / 8, 1);
   perf::GpuSegEnd(perf::kGpuSegResolve, gpu_cs_begin);
   glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
-                  GL_ELEMENT_ARRAY_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT |
-                  GL_UNIFORM_BARRIER_BIT);
+                  GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT |
+                  GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT | GL_UNIFORM_BARRIER_BIT);
+  glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_BUFFER, 0);
+  glActiveTexture(GL_TEXTURE0);
   glBindTexture(target, 0);
   glUseProgram(0);
   if (gpu_checks_left_ > 0) {
@@ -1044,6 +1081,10 @@ void GlRenderTargets::GpuResolveDispatch(PendingResolve& pr, GLuint texture, boo
 
 void GlRenderTargets::Materialize(PendingResolve& pr) {
   if (!pr.lazy) return;
+  if (!REXCVAR_GET(gl_gpu_resolve_compute)) {
+    ConvertLazyToCpu(pr);
+    return;
+  }
   pr.lazy = false;
   --lazy_count_;
   perf::Add(perf::kLazyMaterialized);
@@ -1065,7 +1106,58 @@ void GlRenderTargets::MaterializeLazySlow(uint32_t start, uint32_t length) {
   }
 }
 
+void GlRenderTargets::ConvertLazyToCpu(PendingResolve& pr) {
+  if (!pr.lazy) return;
+  pr.lazy = false;
+  --lazy_count_;
+  perf::Add(perf::kLazyMaterialized);
+  ResidentRemove(pr.extent_start, pr.extent_length);
+  if (!pr.snapshot) {
+    REXGPU_WARN("GL RT: lazy resolve 0x{:08X} lost its snapshot, guest memory left stale", pr.dest_base);
+    pr.done = true;
+    return;
+  }
+  pr.gpu = false;
+  pr.done = false;
+  pr.dl_started = false;
+  pr.frame = frame_;  // flushed without waiting once its readback has finished (PollPending), at the latest after
+                      // gl_resolve_max_age frames
+  pr.src_is_8888 = pr.snapshot_format == GL_RGBA8;
+  pr.pbo_size = pr.rw * pr.rh * (pr.src_is_8888 ? 4 : 16);
+  perf::Scope perf_readback_scope(perf::kReadbackTicks);
+  for (size_t k = 0; k < free_pbos_.size(); ++k) {
+    if (free_pbos_[k].second >= pr.pbo_size && free_pbos_[k].second <= pr.pbo_size * 2) {
+      pr.pbo = free_pbos_[k].first;
+      pr.pbo_size = free_pbos_[k].second;
+      free_pbos_.erase(free_pbos_.begin() + k);
+      break;
+    }
+  }
+  if (!pr.pbo) {
+    glGenBuffers(1, &pr.pbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, pr.pbo_size, nullptr, GL_STREAM_READ);
+  } else {
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+  }
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo_);
+  glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, pr.snapshot, 0, 0);
+  glReadBuffer(GL_COLOR_ATTACHMENT0);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, GLsizei(pr.rw), GLsizei(pr.rh), GL_RGBA, pr.src_is_8888 ? GL_UNSIGNED_BYTE : GL_FLOAT,
+               nullptr);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  pr.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  // The store never received this image: its pages must come from guest memory (after the conversion; the
+  // shared memory pre-read hook flushes this record first).
+  if (sm_) sm_->MemoryInvalidationCallback(pr.extent_start, pr.extent_length, true);
+}
+
 void GlRenderTargets::StartGpuDownload(PendingResolve& pr) {
+  if (pr.lazy && !REXCVAR_GET(gl_gpu_resolve_compute)) {
+    ConvertLazyToCpu(pr);  // the caller sees pr.gpu == false and handles it as a CPU-path record
+    return;
+  }
   if (pr.lazy) {
     // Store writes keep resolve order: older lazy ones overlapping this range first (pr itself included).
     MaterializeLazySlow(pr.extent_start, pr.extent_length);
@@ -1220,10 +1312,18 @@ void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
     if (!wait) return;
     CountFlush(reason);
     if (!pr.dl_started) StartGpuDownload(pr);
-    if (!pr.done) FinishGpuDownload(pr);
-    ReleasePending(pr);
-    pending_.pop_front();
-    return;
+    if (pr.gpu) {
+      if (!pr.done) FinishGpuDownload(pr);
+      ReleasePending(pr);
+      pending_.pop_front();
+      return;
+    }
+    if (pr.done) {
+      ReleasePending(pr);
+      pending_.pop_front();
+      return;
+    }
+    // Converted to a CPU readback (gl_gpu_resolve_compute = false): finish it below.
   }
   if (!wait) {
     GLenum r = glClientWaitSync(pr.fence, 0, 0);
@@ -1254,6 +1354,11 @@ void GlRenderTargets::FlushPending(uint32_t start, uint32_t length, FlushReason 
   auto overlaps = [&](const PendingResolve& pr) {
     return uint64_t(pr.extent_start) < end && uint64_t(pr.extent_start) + pr.extent_length > start;
   };
+  if (!REXCVAR_GET(gl_gpu_resolve_compute)) {
+    for (PendingResolve& pr : pending_) {
+      if (pr.gpu && pr.lazy && !pr.done && overlaps(pr)) ConvertLazyToCpu(pr);
+    }
+  }
   // CPU-path resolves are written back strictly in order (up to the last overlapping one).
   int last_cpu = -1;
   for (size_t i = 0; i < pending_.size(); ++i) {
@@ -1292,7 +1397,7 @@ void GlRenderTargets::PollPending() {
       if (!pr.dl_started) {
         if (age < max_age) break;
         StartGpuDownload(pr);
-        if (pr.done) continue;
+        if (pr.done || !pr.gpu) continue;  // (!gpu: converted to a CPU readback, handled as such next)
       }
       if (age >= max_age + 3) {
         FlushFront(true, FlushReason::kAge);

@@ -167,6 +167,10 @@ class GlRenderTargets {
   // Runs the resolve compute shader for pr, reading texture (2D render target at x0,y0 or the 2D array snapshot).
   void GpuResolveDispatch(PendingResolve& pr, GLuint texture, bool from_snapshot, uint32_t x0, uint32_t y0);
   void Materialize(PendingResolve& pr);
+  // gl_gpu_resolve_compute = false: a lazy GPU-snapshot resolve that must reach memory becomes a CPU-path record
+  // (asynchronous glReadPixels of its snapshot into a PBO, CPU conversion when flushed); its store pages are
+  // invalidated so they are re-read from guest memory.
+  void ConvertLazyToCpu(PendingResolve& pr);
   void MaterializeLazySlow(uint32_t start, uint32_t length);
   void ResidentAdd(uint32_t start, uint32_t length);
   void ResidentRemove(uint32_t start, uint32_t length);

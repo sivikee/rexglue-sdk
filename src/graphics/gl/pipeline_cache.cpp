@@ -1,6 +1,7 @@
 #include "pipeline_cache.h"
 #include "perf.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -24,18 +25,36 @@ REXCVAR_DEFINE_BOOL(gl_async_compile, true, "GPU", "GL backend: translate and co
 REXCVAR_DEFINE_BOOL(gl_link_thread, true, "GPU",
                     "GL backend: the compile thread also compiles + links GL programs on a shared surfaceless EGL context "
                     "(Mesa takes 0.5-10 s per program on the Switch; false = link on the GPU thread, which stalls the frame)");
-REXCVAR_DEFINE_BOOL(gl_link_fence, true, "GPU",
+REXCVAR_DEFINE_BOOL(gl_link_fence, false, "GPU",
                     "GL backend: hand compile-thread programs over with a GL fence (dropped automatically when the start-up "
-                    "probe or a failed wait shows fences are not shared between the contexts)");
+                    "probe or a failed wait shows fences are not shared between the contexts). Off by default: Mesa links on "
+                    "the CPU inside glLinkProgram, and a fence + flush on the compile thread's nouveau context races with the "
+                    "GPU thread's flushes (nouveau keeps fence state per screen, not per context)");
 REXCVAR_DEFINE_INT32(gl_link_fence_timeout_ms, 500, "GPU",
                      "GL backend: a compile-thread program whose handover fence has not signalled after this long is used "
                      "anyway (the link itself is finished on the CPU)");
 REXCVAR_DEFINE_INT32(gl_program_max_wait_ms, 2000, "GPU",
                      "GL backend: a program a draw has been waiting for longer than this is linked on the GPU thread "
                      "(at most one per frame; stalls that frame). 0 = always wait for the compile thread");
+REXCVAR_DEFINE_BOOL(gl_compact_texture_fetch, true, "GPU",
+                    "GL backend: translate texture fetch swizzles / signedness branch-free per fetch (much smaller GLSL; "
+                    "Mesa compiled the per-component form of the in-game shaders for minutes)");
+REXCVAR_DEFINE_BOOL(gl_cheap_mul_zero_rule, true, "GPU",
+                    "GL backend: Xenos 0 * x = 0 rule as 'NaN product -> 0' (smaller GLSL; differs only for NaN inputs)");
+REXCVAR_DEFINE_BOOL(gl_link_small_first, true, "GPU",
+                    "GL backend: compile threads link the smallest translated program a draw waits for first (else FIFO)");
+REXCVAR_DEFINE_BOOL(gl_deadline_link_with_workers, false, "GPU",
+                    "GL backend: also apply gl_program_max_wait_ms (GPU-thread links) while the compile threads can link "
+                    "(stalls the frames for as long as Mesa needs; giant programs take minutes)");
+REXCVAR_DEFINE_INT32(gl_dump_big_glsl_kb, 48, "GPU",
+                     "GL backend: with gl_dump_shaders set, also dump programs whose VS or PS GLSL is larger than this (KiB, "
+                     "up to 8 programs; 0 = off)");
 REXCVAR_DEFINE_INT32(gl_link_thread_watchdog_ms, 3000, "GPU",
                      "GL backend: if no compile-thread program has become usable this long after the first draw had to "
                      "wait (and the compile thread is not busy linking), link on the GPU thread from then on. 0 = off");
+REXCVAR_DEFINE_INT32(gl_compile_threads, 2, "GPU",
+                     "GL backend: number of shader compile threads (1-3), each with its own shared GL context. Mesa "
+                     "compiles + links one program in 0.5-10 s on the Switch and the first in-game frame needs dozens");
 REXCVAR_DEFINE_INT32(gl_compile_thread_priority, 0x2C, "GPU",
                      "GL backend: Horizon priority of the compile thread for programs a draw is waiting for (0x2C = like the GPU thread)");
 REXCVAR_DEFINE_INT32(gl_warm_thread_priority, 0x2E, "GPU",
@@ -114,6 +133,8 @@ bool GlPipelineCache::Initialize(GlContext* gl_context) {
   features.clip_distance = true;
   features.cull_distance = true;
   features.image_view_format_swizzle = false;  // host swizzle done in the shader via system constants
+  features.compact_texture_result = REXCVAR_GET(gl_compact_texture_fetch);
+  features.cheap_mul_zero_rule = REXCVAR_GET(gl_cheap_mul_zero_rule);
   features.signed_zero_inf_nan_preserve_float32 = false;
   features.denorm_flush_to_zero_float32 = false;
   features.rounding_mode_rte_float32 = false;
@@ -140,8 +161,10 @@ bool GlPipelineCache::Initialize(GlContext* gl_context) {
   if (async_) {
     if (REXCVAR_GET(gl_link_thread)) {
       // Created here (GPU thread, main context current), made current on the compile thread.
-      worker_context_ = gl_context_->CreateSharedContext();
-      if (!worker_context_) {
+      void* first_context = gl_context_->CreateSharedContext();
+      workers_.push_back(std::make_unique<Worker>());
+      workers_[0]->context = first_context;
+      if (!first_context) {
         REXGPU_WARN("GL compile thread: shared context NOT created (EGL error {:x}): programs are linked on the GPU thread",
                     eglGetError());
       } else {
@@ -156,39 +179,64 @@ bool GlPipelineCache::Initialize(GlContext* gl_context) {
         glFlush();
         const GLenum e = DrainGlErrors();
         REXGPU_INFO("GL compile thread: shared context created ({}); probe buffer {} program {} sync {} (GL error {:x})",
-                    worker_context_, probe_buffer_, probe_program_, static_cast<void*>(probe_sync_), e);
+                    first_context, probe_buffer_, probe_program_, static_cast<void*>(probe_sync_), e);
+        const int n = std::clamp(REXCVAR_GET(gl_compile_threads), 1, 3);
+        for (int i = 1; i < n; ++i) {
+          void* c = gl_context_->CreateSharedContext();
+          if (!c) {
+            REXGPU_WARN("GL compile thread {}: shared context NOT created (EGL error {:x}); {} compile thread(s)", i,
+                        eglGetError(), i);
+            break;
+          }
+          workers_.push_back(std::make_unique<Worker>());
+          workers_.back()->context = c;
+        }
       }
     } else {
       REXGPU_INFO("GL compile thread: gl_link_thread = false: the compile thread only translates, programs are linked "
                   "on the GPU thread (synchronous, stalls the frame while Mesa compiles)");
     }
+    if (workers_.empty()) workers_.push_back(std::make_unique<Worker>());  // translate-only compile thread
     running_ = true;
-    Thread* t = new Thread();
-    // 8 MiB stack: Mesa's GLSL front end recurses deeply on the translator's big shaders.
-    if (R_FAILED(threadCreate(t, &GlPipelineCache::WorkerThunk, this, nullptr, 0x800000, 0x2C, -2)) ||
-        R_FAILED(threadStart(t))) {
-      REXGPU_ERROR("GL: failed to start the shader compile thread");
-      running_ = false;
-      async_ = false;
-      delete t;
-    } else {
-      worker_thread_ = t;
+    for (size_t i = 0; i < workers_.size(); ++i) {
+      Worker& w = *workers_[i];
+      w.self = this;
+      w.index = int(i);
+      Thread* t = new Thread();
+      // 8 MiB stack: Mesa's GLSL front end recurses deeply on the translator's big shaders.
+      if (R_FAILED(threadCreate(t, &GlPipelineCache::WorkerThunk, &w, nullptr, 0x800000, 0x2C, -2)) ||
+          R_FAILED(threadStart(t))) {
+        REXGPU_ERROR("GL: failed to start shader compile thread {}", i);
+        delete t;
+        if (i == 0) {
+          running_ = false;
+          async_ = false;
+        }
+        workers_.resize(i);
+        break;
+      }
+      w.thread = t;
     }
+    REXGPU_INFO("GL: {} shader compile thread(s) started", workers_.size());
   }
   return true;
 }
 
 void GlPipelineCache::Shutdown() {
-  if (worker_thread_) {
+  if (!workers_.empty()) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       running_ = false;
     }
     cv_.notify_all();
-    threadWaitForExit(static_cast<Thread*>(worker_thread_));
-    threadClose(static_cast<Thread*>(worker_thread_));
-    delete static_cast<Thread*>(worker_thread_);
-    worker_thread_ = nullptr;
+    for (auto& w : workers_) {
+      if (!w->thread) continue;
+      threadWaitForExit(static_cast<Thread*>(w->thread));
+      threadClose(static_cast<Thread*>(w->thread));
+      delete static_cast<Thread*>(w->thread);
+      w->thread = nullptr;
+    }
+    workers_.clear();
   }
   if (probe_sync_) glDeleteSync(probe_sync_);
   if (probe_buffer_) glDeleteBuffers(1, &probe_buffer_);
@@ -393,7 +441,11 @@ const GlProgram* GlPipelineCache::GetProgram(GlShader::GlTranslation* vertex,
     return nullptr;  // the compile thread owns it right now (translating / linking)
   }
   // Never skip a program's draws indefinitely: past gl_program_max_wait_ms link it here (one per frame).
-  const int max_wait = REXCVAR_GET(gl_program_max_wait_ms);
+  // Not while compile threads link: a deadline link of one of the giant programs froze the GPU thread (no frames at
+  // all) for minutes in Eden, while the compile threads could have linked it without stopping the frames.
+  const int max_wait = link_on_worker_.load() && !REXCVAR_GET(gl_deadline_link_with_workers)
+                           ? 0
+                           : REXCVAR_GET(gl_program_max_wait_ms);
   if (async_ && max_wait > 0 && p.urgent &&
       (state == GlProgram::kQueued || (state == GlProgram::kGlslReady && link_on_worker_.load()))) {
     const double waited = MsSince(p.request_time);
@@ -603,7 +655,7 @@ void GlPipelineCache::CheckWorkerWatchdog() {
   if (elapsed < double(watchdog)) {
     return;
   }
-  const bool in_link = worker_in_link_.load();
+  const bool in_link = worker_in_link_.load() > 0;
   const double cap = std::max(30000.0, double(watchdog) * 10.0);
   const double handover_grace = double(std::max(0, REXCVAR_GET(gl_link_fence_timeout_ms))) + 1000.0;
   char why[224];
@@ -624,8 +676,9 @@ void GlPipelineCache::CheckWorkerWatchdog() {
   FallBackToGpuThreadLinking(why);
 }
 
-void GlPipelineCache::WorkerThunk(void* self) {
-  static_cast<GlPipelineCache*>(self)->WorkerMain();
+void GlPipelineCache::WorkerThunk(void* worker) {
+  Worker* w = static_cast<Worker*>(worker);
+  w->self->WorkerMain(*w);
 }
 
 bool GlPipelineCache::WarmLinkAllowed() {
@@ -636,13 +689,14 @@ bool GlPipelineCache::WarmLinkAllowed() {
 
 // Compile thread: Xenos ucode -> SPIR-V -> GLSL, and with gl_link_thread also glCompileShader / glLinkProgram on
 // a shared context. Programs a draw waits for (urgent_) go first; cached ones (warm_) run at a lower priority.
-void GlPipelineCache::WorkerMain() {
+void GlPipelineCache::WorkerMain(Worker& self_worker) {
   tl_compile_thread = true;
+  const int wi = self_worker.index;
   const Result mask_rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7);
-  REXGPU_INFO("GL compile thread: started (core mask 0-2 rc {:x}, shared context {})", mask_rc,
-              worker_context_ ? "yes" : "no");
-  if (worker_context_) {
-    if (gl_context_->MakeCurrentWorker(worker_context_)) {
+  REXGPU_INFO("GL compile thread {}: started (core mask 0-2 rc {:x}, shared context {})", wi, mask_rc,
+              self_worker.context ? "yes" : "no");
+  if (self_worker.context) {
+    if (gl_context_->MakeCurrentWorker(self_worker.context)) {
       const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
       // Share-group probe: the GPU thread's objects must be visible here, or programs linked here are useless there.
       DrainGlErrors();
@@ -656,10 +710,11 @@ void GlPipelineCache::WorkerMain() {
       const bool prog = probe_program_ && glIsProgram(probe_program_) == GL_TRUE;
       const bool sync = probe_sync_ && glIsSync(probe_sync_) == GL_TRUE;
       const GLenum e = DrainGlErrors();
-      REXGPU_INFO("GL compile thread: shared context made current (renderer '{}'); share probe: buffer {} (size {}) "
+      REXGPU_INFO("GL compile thread {}: shared context made current (renderer '{}'); share probe: buffer {} (size {}) "
                   "program {} sync {} (GL error {:x})",
-                  renderer ? renderer : "?", buf, size, prog, sync, e);
+                  wi, renderer ? renderer : "?", buf, size, prog, sync, e);
       if (buf && size == GLint(kProbeBufferSize) && prog) {
+        self_worker.share_ok = true;
         if (!sync && fence_handover_.load()) {
           fence_handover_ = false;
           REXGPU_WARN("GL compile thread: sync objects are not shared: programs are handed over without fences");
@@ -686,15 +741,38 @@ void GlPipelineCache::WorkerMain() {
   while (true) {
     GlProgram* program = nullptr;
     bool urgent = false;
+    bool job_translate_only = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait(lock, [&] { return !running_ || !urgent_.empty() || !warm_.empty(); });
       if (!running_) {
         break;
       }
+      bool translate_only = false;
       if (!urgent_.empty()) {
-        program = urgent_.front();
-        urgent_.pop_front();
+        // Urgent jobs: translate everything first (7-90 ms each), then link the SMALLEST translated program. Mesa's
+        // compile time grows much faster than linearly with the GLSL size (a 300 KB program took 163 s in Eden, a
+        // 25 KB one 1-4 s), so FIFO let a few giant programs hold back every other draw of the first frames.
+        auto pick = urgent_.end();
+        for (auto it = urgent_.begin(); it != urgent_.end(); ++it) {
+          if ((*it)->state.load() == GlProgram::kQueued) {
+            pick = it;
+            translate_only = urgent_.size() > 1 && link_on_worker_.load() && self_worker.share_ok;
+            break;
+          }
+        }
+        if (pick == urgent_.end() && REXCVAR_GET(gl_link_small_first)) {
+          size_t best = SIZE_MAX;
+          for (auto it = urgent_.begin(); it != urgent_.end(); ++it) {
+            if ((*it)->glsl_bytes < best) {
+              best = (*it)->glsl_bytes;
+              pick = it;
+            }
+          }
+        }
+        if (pick == urgent_.end()) pick = urgent_.begin();
+        program = *pick;
+        urgent_.erase(pick);
       } else {
         program = warm_.front();
         warm_.pop_front();
@@ -702,6 +780,7 @@ void GlPipelineCache::WorkerMain() {
       program->queued = false;
       program->busy = true;
       urgent = program->urgent;
+      job_translate_only = translate_only;
       perf::SetWorkerQueue(uint32_t(urgent_.size()), uint32_t(warm_.size()));
     }
     const int prio = urgent ? REXCVAR_GET(gl_compile_thread_priority) : REXCVAR_GET(gl_warm_thread_priority);
@@ -718,10 +797,11 @@ void GlPipelineCache::WorkerMain() {
     }
     if (program->state.load() == GlProgram::kQueued) {
       perf::SetWorkerActivity(perf::kWTranslate, vh, ph);
-      TranslateProgram(*program, worker_ucode_disasm_buffer_);
+      TranslateProgram(*program, self_worker.ucode_buffer);
     }
     bool skipped_warm = false;
-    if (link_on_worker_.load() && program->state.load() == GlProgram::kGlslReady) {
+    if (link_on_worker_.load() && self_worker.share_ok && !job_translate_only &&
+        program->state.load() == GlProgram::kGlslReady) {
       if (!urgent && !WarmLinkAllowed()) {
         skipped_warm = true;  // left translated; linked when a draw asks for it
       } else {
@@ -761,17 +841,17 @@ void GlPipelineCache::WorkerMain() {
     }
     FlushCacheWrites();
   }
-  if (worker_context_) {
+  if (self_worker.context) {
     gl_context_->ReleaseCurrentWorker();
   }
 }
 
 void GlPipelineCache::WorkerLink(GlProgram& program) {
   perf::Scope link_scope(perf::kWLinkTicks);
-  worker_in_link_ = true;
+  ++worker_in_link_;
   StartLink(program);
   const bool ok = FinishLink(program, true);
-  worker_in_link_ = false;
+  --worker_in_link_;
   if (!ok) {
     return;  // kFailed, logged
   }
@@ -784,7 +864,7 @@ void GlPipelineCache::WorkerLink(GlProgram& program) {
                   DrainGlErrors());
     }
   }
-  glFlush();
+  if (program.fence) glFlush();  // no flush otherwise: nothing for the GPU, and nouveau flushes are not thread safe
   program.worker_linked = std::chrono::steady_clock::now();
   ++worker_links_done_;
   perf::Add(perf::kWLinkCount);
@@ -809,6 +889,7 @@ void GlPipelineCache::TranslateProgram(GlProgram& program, string::StringBuffer&
     program.state = GlProgram::kFailed;
     return;
   }
+  program.glsl_bytes = vs_glsl->source.size() + (ps_glsl ? ps_glsl->source.size() : 0);
   program.state = GlProgram::kGlslReady;
 }
 
@@ -994,6 +1075,20 @@ bool GlPipelineCache::FinishLink(GlProgram& program, bool block, bool* done_out)
                   tl_compile_thread ? "compile" : "GPU", vertex->glsl()->source.size(),
                   pixel ? pixel->glsl()->source.size() : size_t(0));
     }
+    const size_t big = size_t(std::max(0, REXCVAR_GET(gl_dump_big_glsl_kb))) << 10;
+    const size_t vs_bytes = vertex->glsl()->source.size(), ps_bytes = pixel ? pixel->glsl()->source.size() : 0;
+    if (big && (vs_bytes > big || ps_bytes > big) && dumped_big_ < 8) {
+      ++dumped_big_;
+      REXGPU_INFO("GL: big program (vs {:016X} {} bytes, ps {:016X} {} bytes) linked in {:.0f} ms; dumping it",
+                  vertex->shader().ucode_data_hash(), vs_bytes, pixel ? pixel->shader().ucode_data_hash() : uint64_t(0),
+                  ps_bytes, ms);
+      dump("vs_big", vertex->glsl()->source, vertex->shader().ucode_data_hash());
+      dump("vs_big_ucode", vertex->shader().ucode_disassembly(), vertex->shader().ucode_data_hash());
+      if (pixel) {
+        dump("ps_big", pixel->glsl()->source, pixel->shader().ucode_data_hash());
+        dump("ps_big_ucode", pixel->shader().ucode_disassembly(), pixel->shader().ucode_data_hash());
+      }
+    }
     if (dumped_ < 4) {
       ++dumped_;
       dump("vs_ok", vertex->glsl()->source, vertex->shader().ucode_data_hash());
@@ -1177,7 +1272,7 @@ void GlPipelineCache::WarmUpFromDisk() {
   REXGPU_INFO("GL program cache: {} ({} bytes): {} shaders, {} programs ({} queued for background compilation{}), {} bad records, "
               "loaded in {:.0f} ms; malloc headroom {} MiB",
               path, file.size(), shaders_loaded, programs_known, programs_queued,
-              link_on_worker_.load() || worker_context_ ? "" : ", translation only: no compile thread context", bad, ms,
+              link_on_worker_.load() || (!workers_.empty() && workers_[0]->context) ? "" : ", translation only: no compile thread context", bad, ms,
               MallocHeadroom() >> 20);
   perf::SetWorkerActivity(perf::kWIdle);
 }

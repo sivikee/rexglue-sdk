@@ -6,7 +6,12 @@
 
 #include <spirv_glsl.hpp>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(gl_native_min_max, true, "GPU",
+                    "GL backend: translate NaN-ignoring min/max/clamp (SPIR-V NMin/NMax/NClamp) to plain GLSL "
+                    "min/max/clamp (same results on Maxwell; avoids isnan() chains that made Mesa compiles very slow)");
 
 namespace rex::graphics::gl {
 
@@ -80,12 +85,37 @@ void RewriteSharedMemoryAsTbo(std::string& src) {
 
 }  // namespace
 
+// GLSL has no NaN-ignoring min/max/clamp, so SPIRV-Cross expands GLSL.std.450 NMin / NMax / NClamp into isnan()
+// select chains (several lines per use; the translator uses them for every Xenos min/max, for the 0 * x = 0 rule of
+// every multiplication, saturation, gamma, ...). On the Switch GPU (Maxwell FMNMX, like PTX min/max) plain min/max
+// already return the non-NaN operand, so FMin / FMax / FClamp give the same results with much less GLSL for Mesa
+// to compile. Rewrites the extended instruction numbers in place.
+void UseNativeMinMax(std::vector<uint32_t>& words) {
+  if (words.size() < 5) return;
+  uint32_t glsl_set = 0;
+  for (size_t i = 5; i < words.size();) {
+    const uint32_t count = words[i] >> 16, op = words[i] & 0xFFFF;
+    if (!count || i + count > words.size()) break;
+    if (op == 11 /* OpExtInstImport */ && count >= 3 &&
+        !std::strncmp(reinterpret_cast<const char*>(&words[i + 2]), "GLSL.std.450", (count - 2) * 4)) {
+      glsl_set = words[i + 1];
+    } else if (op == 12 /* OpExtInst */ && count >= 5 && glsl_set && words[i + 3] == glsl_set) {
+      uint32_t& inst = words[i + 4];
+      if (inst == 79) inst = 37;       // NMin -> FMin
+      else if (inst == 80) inst = 40;  // NMax -> FMax
+      else if (inst == 81) inst = 43;  // NClamp -> FClamp
+    }
+    i += count;
+  }
+}
+
 bool ConvertSpirvToGlsl(const std::vector<uint8_t>& spirv, uint32_t texture_unit_base,
                         uint32_t texture_count, GlslShader& out, std::string& error) {
   std::unique_ptr<spirv_cross::CompilerGLSL> comp_ptr;
   try {
     std::vector<uint32_t> words(spirv.size() / 4);
     std::memcpy(words.data(), spirv.data(), words.size() * 4);
+    if (REXCVAR_GET(gl_native_min_max)) UseNativeMinMax(words);
     comp_ptr = std::make_unique<spirv_cross::CompilerGLSL>(std::move(words));
     spirv_cross::CompilerGLSL& comp = *comp_ptr;
     spirv_cross::CompilerGLSL::Options o;

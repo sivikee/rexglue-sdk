@@ -1,7 +1,9 @@
 #include "gl_context.h"
 #include "gl_ext.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -14,6 +16,10 @@
 REXCVAR_DEFINE_BOOL(gl_egl_depth_stencil, false, "GPU",
                     "GL backend: request depth 24 / stencil 8 for the EGL window surface (the default framebuffer is only "
                     "cleared and blitted to; render targets are FBOs)");
+
+REXCVAR_DEFINE_STRING(gl_mesa_env, "", "GPU",
+                      "GL backend: environment variables for Mesa, set before EGL starts, as NAME=VALUE pairs separated "
+                      "by ';' (e.g. \"MESA_GLSL=nopt;NV50_PROG_OPTIMIZE=1\")");
 
 namespace rex::graphics::gl {
 
@@ -33,6 +39,23 @@ extern "C" void oblivion_bootlog(const char* fmt, ...) __attribute__((weak, form
 #define GLBL(...) do { if (oblivion_bootlog) oblivion_bootlog(__VA_ARGS__); } while (0)
 
 bool GlContext::Initialize() {
+  {
+    // Mesa reads these when the display / context / compiler start (MESA_GLSL at context creation,
+    // NV50_PROG_OPTIMIZE per shader).
+    const std::string env = REXCVAR_GET(gl_mesa_env);
+    size_t pos = 0;
+    while (pos < env.size()) {
+      size_t end = env.find(';', pos);
+      if (end == std::string::npos) end = env.size();
+      const std::string item = env.substr(pos, end - pos);
+      const size_t eq = item.find('=');
+      if (eq != std::string::npos && eq > 0) {
+        setenv(item.substr(0, eq).c_str(), item.substr(eq + 1).c_str(), 1);
+        REXGPU_INFO("GL: Mesa environment {}", item);
+      }
+      pos = end + 1;
+    }
+  }
   GLBL("gl: eglGetDisplay");
   EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (!display) {
@@ -197,14 +220,78 @@ void LoadGlExtensions(void* (*get_proc_address)(const char*)) {
 }
 }  // namespace rex::graphics::gl
 
+// devkitPro's Mesa 20.1 Switch EGL driver (egl_switch.c, statically linked from libEGL.a) IGNORES the share_context
+// argument of eglCreateContext: its switch_create_context calls st_api::create_context(..., shared_stctx = NULL)
+// (disassembly: `mov x4, #0` before `blr` of st_api+40; the share_list argument is never even saved). A second
+// context therefore never shares programs / buffers / syncs with the first one, which is why the v0.1.12/v0.1.13
+// compile thread could not hand its programs over ("share probe: buffer false program false sync false").
+// Workaround (gl_egl_share_fix): while the shared context is created, the display's st_api pointer is temporarily
+// replaced by a copy whose create_context injects the main context's st_context_iface as shared_stctx. All offsets
+// are taken from that disassembly and verified at run time before anything is patched (st_api pointer ==
+// st_gl_api_create(), st_api::get_current() == the main context's stctx); on any mismatch the plain call is used.
+REXCVAR_DEFINE_BOOL(gl_egl_share_fix, true, "GPU",
+                    "GL backend: make eglCreateContext's share_context work on the Switch EGL driver (it is ignored by "
+                    "devkitPro Mesa 20.1) so the compile thread's shared context really shares programs");
+
+extern "C" void* st_gl_api_create(void);
+
+namespace {
+constexpr size_t kEglDisplayDriverDataOffset = 88;  // _EGLDisplay::DriverData (switch_create_context: ldr x0,[x1,#88])
+constexpr size_t kSwitchCtxStctxOffset = 104;       // switch context: st_context_iface* (str x0,[x19,#104])
+constexpr size_t kStApiCreateContext = 40;          // st_api::create_context (ldr x5,[x0,#40])
+constexpr size_t kStApiGetCurrent = 56;             // st_api::get_current
+constexpr size_t kStApiSize = 72;                   // sizeof(struct st_api), Mesa 20.1
+using StCreateContextFn = void* (*)(void* api, void* smapi, const void* attribs, int* error, void* shared);
+using StGetCurrentFn = void* (*)(void* api);
+StCreateContextFn g_orig_create_context = nullptr;
+void* g_orig_st_api = nullptr;
+void* g_share_stctx = nullptr;
+alignas(16) unsigned char g_st_api_copy[128];
+void* SharingCreateContext(void* /*api*/, void* smapi, const void* attribs, int* error, void* shared) {
+  if (!shared && g_share_stctx) shared = g_share_stctx;
+  return g_orig_create_context(g_orig_st_api, smapi, attribs, error, shared);
+}
+}  // namespace
+
 namespace rex::graphics::gl {
 void* GlContext::CreateSharedContext() {
   EGLint attr[] = {EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
                    EGL_CONTEXT_MAJOR_VERSION_KHR,       4,
                    EGL_CONTEXT_MINOR_VERSION_KHR,       3,
                    EGL_NONE};
+  void** driver_data = nullptr;
+  void* st_api = nullptr;
+  if (REXCVAR_GET(gl_egl_share_fix) && display_ && context_) {
+    driver_data = *reinterpret_cast<void***>(static_cast<char*>(display_) + kEglDisplayDriverDataOffset);
+    st_api = driver_data ? driver_data[1] : nullptr;
+    void* main_stctx = *reinterpret_cast<void**>(static_cast<char*>(context_) + kSwitchCtxStctxOffset);
+    void* expected_api = st_gl_api_create();
+    void* current = nullptr;
+    if (st_api == expected_api && main_stctx) {
+      auto get_current = *reinterpret_cast<StGetCurrentFn*>(static_cast<char*>(st_api) + kStApiGetCurrent);
+      current = get_current ? get_current(st_api) : nullptr;  // the GPU thread's context is current here
+    }
+    if (st_api && st_api == expected_api && main_stctx && current == main_stctx) {
+      std::memcpy(g_st_api_copy, st_api, kStApiSize);
+      g_orig_st_api = st_api;
+      g_orig_create_context = *reinterpret_cast<StCreateContextFn*>(static_cast<char*>(st_api) + kStApiCreateContext);
+      *reinterpret_cast<StCreateContextFn*>(g_st_api_copy + kStApiCreateContext) = &SharingCreateContext;
+      g_share_stctx = main_stctx;
+      driver_data[1] = g_st_api_copy;
+      REXGPU_INFO("GL: EGL share fix armed (st_api {}, main st context {})", st_api, main_stctx);
+    } else {
+      REXGPU_WARN("GL: EGL share fix NOT applied (layout check failed: driver data {}, st_api {} vs st_gl_api_create {}, "
+                  "main st context {}, current {}); the shared context will not share objects",
+                  static_cast<void*>(driver_data), st_api, expected_api, main_stctx, current);
+      driver_data = nullptr;
+    }
+  }
   EGLContext ctx = eglCreateContext(static_cast<EGLDisplay>(display_), static_cast<EGLConfig>(config_),
                                     static_cast<EGLContext>(context_), attr);
+  if (driver_data) {
+    driver_data[1] = st_api;  // restore: nothing else ever sees the copy
+    g_share_stctx = nullptr;
+  }
   if (!ctx) {
     REXGPU_ERROR("GL: shared context creation failed ({:x})", eglGetError());
   }
