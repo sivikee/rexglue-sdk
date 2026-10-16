@@ -24,17 +24,23 @@ const char* GlErrorString(unsigned int err) {
   }
 }
 
+extern "C" void oblivion_bootlog(const char* fmt, ...) __attribute__((weak, format(printf, 1, 2)));
+#define GLBL(...) do { if (oblivion_bootlog) oblivion_bootlog(__VA_ARGS__); } while (0)
+
 bool GlContext::Initialize() {
+  GLBL("gl: eglGetDisplay");
   EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   if (!display) {
     REXGPU_ERROR("GL: eglGetDisplay failed ({:x})", eglGetError());
     return false;
   }
+  GLBL("gl: eglInitialize");
   EGLint major = 0, minor = 0;
   if (!eglInitialize(display, &major, &minor)) {
     REXGPU_ERROR("GL: eglInitialize failed ({:x})", eglGetError());
     return false;
   }
+  GLBL("gl: eglBindAPI");
   if (eglBindAPI(EGL_OPENGL_API) == EGL_FALSE) {
     REXGPU_ERROR("GL: eglBindAPI(OPENGL) failed ({:x})", eglGetError());
     return false;
@@ -43,6 +49,7 @@ bool GlContext::Initialize() {
                               EGL_GREEN_SIZE,      8,               EGL_BLUE_SIZE,    8,
                               EGL_ALPHA_SIZE,      8,               EGL_DEPTH_SIZE,   24,
                               EGL_STENCIL_SIZE,    8,               EGL_NONE};
+  GLBL("gl: eglChooseConfig");
   EGLConfig config;
   EGLint num = 0;
   eglChooseConfig(display, fb, &config, 1, &num);
@@ -50,6 +57,7 @@ bool GlContext::Initialize() {
     REXGPU_ERROR("GL: no EGL config ({:x})", eglGetError());
     return false;
   }
+  GLBL("gl: eglCreateWindowSurface");
   EGLSurface surface = eglCreateWindowSurface(display, config, nwindowGetDefault(), nullptr);
   if (!surface) {
     REXGPU_ERROR("GL: eglCreateWindowSurface failed ({:x})", eglGetError());
@@ -59,15 +67,18 @@ bool GlContext::Initialize() {
                    EGL_CONTEXT_MAJOR_VERSION_KHR,       4,
                    EGL_CONTEXT_MINOR_VERSION_KHR,       3,
                    EGL_NONE};
+  GLBL("gl: eglCreateContext");
   EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, attr);
   if (!context) {
     REXGPU_ERROR("GL: eglCreateContext(core 4.3) failed ({:x})", eglGetError());
     return false;
   }
+  GLBL("gl: eglMakeCurrent");
   if (!eglMakeCurrent(display, surface, surface, context)) {
     REXGPU_ERROR("GL: eglMakeCurrent failed ({:x})", eglGetError());
     return false;
   }
+  GLBL("gl: EGL context ready");
   config_ = config;
   display_ = display;
   surface_ = surface;

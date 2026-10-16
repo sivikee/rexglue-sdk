@@ -67,6 +67,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "Th
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
 
+#if REX_PLATFORM_SWITCH
+extern "C" void oblivion_bootlog(const char* fmt, ...) __attribute__((weak, format(printf, 1, 2)));
+#endif
 namespace rex::thread {
 
 #if REX_PLATFORM_ANDROID
@@ -1439,7 +1442,16 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   // libnx pthreads are created with core -2 = pinned to the process' single default core; at one equal
   // priority Horizon never preempts, so guest threads that poll/yield starve each other (loading hangs).
   // Allow all three application cores (0..2) and let the kernel balance.
-  svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7);
+  {
+    static std::atomic<int> logged{0};
+    Result cmrc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7);
+    if ((R_FAILED(cmrc) || logged.load() < 3) && logged.fetch_add(1) < 6) {
+      s32 pref = 0;
+      u64 sm = 0;
+      svcGetThreadCoreMask(&pref, &sm, CUR_THREAD_HANDLE);
+      if (oblivion_bootlog) oblivion_bootlog("thread: svcSetThreadCoreMask(-1,7) rc=0x%x; now pref=%d affinity=0x%llx", (unsigned)cmrc, (int)pref, (unsigned long long)sm);
+    }
+  }
 #endif
 #if !REX_PLATFORM_ANDROID
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {

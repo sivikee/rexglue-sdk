@@ -36,6 +36,9 @@
 #include <rex/memory/utils.h>
 #include <rex/platform.h>
 
+extern "C" void oblivion_bootlog(const char* fmt, ...) __attribute__((weak, format(printf, 1, 2)));
+#define BOOTLOG(...) do { if (oblivion_bootlog) oblivion_bootlog(__VA_ARGS__); } while (0)
+
 namespace rex::memory {
 
 namespace {
@@ -278,8 +281,10 @@ void* SwitchInitGuestArena() {
     return nullptr;
   }
   u64 stack_addr = 0, stack_size = 0;
+  BOOTLOG("arena: begin, pool=%p size=0x%llx", (void*)g_pool_base, (unsigned long long)g_pool_size);
   svcGetInfo(&stack_addr, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
   svcGetInfo(&stack_size, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0);
+  BOOTLOG("arena: stack region 0x%llx size 0x%llx", (unsigned long long)stack_addr, (unsigned long long)stack_size);
   if (stack_size < 0x80000000ull) {
     REXLOG_ERROR("Stack region too small for the guest windows (0x{:X})", stack_size);
     return nullptr;
@@ -293,14 +298,32 @@ void* SwitchInitGuestArena() {
   for (int i = 0; i < kWindowCount; ++i) {
     g_windows[i].first_unit = units;
     units += g_windows[i].size / kUnit;
+    {
+      u64 qa = reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo, qend = qa + g_windows[i].size;
+      u32 qpi = 0;
+      int nblocks = 0;
+      while (qa < qend && nblocks < 16) {
+        MemoryInfo qm{};
+        if (R_FAILED(svcQueryMemory(&qm, &qpi, qa))) break;
+        BOOTLOG("arena: win%d block addr=0x%llx size=0x%llx type=%u perm=%u", i, (unsigned long long)qm.addr,
+                (unsigned long long)qm.size, qm.type, qm.perm);
+        ++nblocks;
+        if (!qm.size) break;
+        qa = qm.addr + qm.size;
+      }
+    }
+    BOOTLOG("arena: reserving win%d %p + 0x%x", i, (void*)(s.base + g_windows[i].guest_lo), g_windows[i].size);
     // Keep libnx from handing these ranges out as thread-stack mirrors.
-    virtmemAddReservation(s.base + g_windows[i].guest_lo, g_windows[i].size);
+    void* resv = virtmemAddReservation(s.base + g_windows[i].guest_lo, g_windows[i].size);
+    BOOTLOG("arena: reservation win%d -> %p", i, resv);
   }
   virtmemUnlock();
   s.total_units = units;
   s.pool_of.assign(units, -1);
+  BOOTLOG("arena: reservations done");
   LogWindowBlocks(s, "guest arena init");
   s.arena_ready = true;
+  BOOTLOG("arena: ready, base=%p", (void*)s.base);
   REXLOG_INFO("Switch guest arena: base {} (stack region {:X}+{:X}), pool {} MiB at {}",
               static_cast<void*>(s.base), stack_addr, stack_size, g_pool_size >> 20,
               static_cast<void*>(s.pool));

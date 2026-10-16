@@ -29,12 +29,16 @@ void ExceptionHandler::Uninstall(Handler /*fn*/, void* /*data*/) {}
 
 }  // namespace rex::arch
 
+// Optional app hook (weak): detailed report to sdmc:/oblivion/crash.txt + on screen.
+extern "C" void oblivion_crash_report(ThreadExceptionDump* ctx) __attribute__((weak));
+
 extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
   if ((ctx->error_desc == ThreadExceptionDesc_InstructionAbort || ctx->error_desc == 0x100 ||
        ctx->error_desc == ThreadExceptionDesc_Other) &&
       rex::memory::HandleGuestMemoryFault(static_cast<uintptr_t>(ctx->far.x))) {
     svcReturnFromException(0);
   }
+  if (oblivion_crash_report) oblivion_crash_report(ctx);
   char buf[512];
   int n = std::snprintf(buf, sizeof buf,
                         "FATAL host exception: desc=0x%x pc=0x%llx far=0x%llx esr=0x%x lr=0x%llx "

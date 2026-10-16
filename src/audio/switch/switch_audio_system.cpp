@@ -36,6 +36,7 @@
 REXCVAR_DEFINE_STRING(switch_audio_dump, "", "Audio",
                       "Switch: write the stereo PCM sent to audout to this WAV file");
 
+extern "C" void oblivion_bootlog(const char* fmt, ...) __attribute__((weak, format(printf, 1, 2)));
 namespace rex::audio::switch_hw {
 
 namespace {
@@ -106,12 +107,15 @@ class AudoutDriver : public AudioDriver {
       : AudioDriver(memory), semaphore_(semaphore) {}
 
   bool Initialize() {
+    if (oblivion_bootlog) oblivion_bootlog("audio: audoutInitialize...");
     Result rc = audoutInitialize();
+    if (oblivion_bootlog) oblivion_bootlog("audio: audoutInitialize rc=0x%x", (unsigned)rc);
     if (R_FAILED(rc)) {
       REXAPU_ERROR("audoutInitialize failed: {:#x}", rc);
       return false;
     }
     rc = audoutStartAudioOut();
+    if (oblivion_bootlog) oblivion_bootlog("audio: audoutStartAudioOut rc=0x%x", (unsigned)rc);
     if (R_FAILED(rc)) {
       REXAPU_ERROR("audoutStartAudioOut failed: {:#x}", rc);
       audoutExit();
@@ -208,7 +212,7 @@ class AudoutDriver : public AudioDriver {
   }
 
   void Run() {
-    svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7);
+    { Result cm = svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, 0x7); if (oblivion_bootlog) oblivion_bootlog("audio: thread core mask rc=0x%x", (unsigned)cm); }
     for (uint32_t i = 0; i < kBufferCount; ++i) Fill(i);
     auto last_log = std::chrono::steady_clock::now();
     uint64_t frames = 0;
