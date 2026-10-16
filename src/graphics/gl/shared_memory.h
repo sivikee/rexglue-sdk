@@ -44,6 +44,14 @@ class GlSharedMemory final : public SharedMemory {
   // False if the range is not resident or not contiguous in the store.
   bool GetHostRange(uint32_t address, uint32_t length, GLuint& buffer, GLintptr& offset) const;
   uint32_t total_bytes() const { return next_slot_ << kGranuleLog2; }
+  // GPU-side access (compute resolves, front buffer blit, lazy downloads).
+  GLuint store_buffer() const { return store_; }
+  GLuint page_table_buffer() const { return pt_; }
+  uint32_t store_capacity() const { return capacity_; }
+  // Store byte offset of a guest physical address and the number of bytes from it to the end of its granule.
+  bool StoreOffset(uint32_t address, GLintptr& offset, uint32_t& bytes_to_granule_end) const;
+  // Called before the store contents are discarded (allocation failure fallback): GPU-only data must be written back.
+  void SetPreStoreResetHook(std::function<void()> hook) { pre_store_reset_hook_ = std::move(hook); }
   // Called with a guest physical range before it is read from guest memory (flushes pending async resolves).
   void SetPreReadHook(std::function<void(uint32_t, uint32_t)> hook) { pre_read_hook_ = std::move(hook); }
 
@@ -57,6 +65,7 @@ class GlSharedMemory final : public SharedMemory {
 
   StreamRing staging_;
   std::function<void(uint32_t, uint32_t)> pre_read_hook_;
+  std::function<void()> pre_store_reset_hook_;
   GLuint store_ = 0;
   GLuint store_tbo_ = 0;
   GLuint pt_ = 0;

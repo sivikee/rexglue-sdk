@@ -227,11 +227,19 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
   }
   if (render_targets_ && info.is_tiled && info.mip_max_level == 0 && REXCVAR_GET(gl_resolve_gpu_copy)) {
     xenos::TextureFormat bf = GetBaseFormat(info.format);
+    uint32_t snap_kind = 0;
     if (bf == xenos::TextureFormat::k_8_8_8_8 || bf == xenos::TextureFormat::k_8_8_8_8_A) {
+      snap_kind = 1;
+    } else if (bf == xenos::TextureFormat::k_16_16_16_16_FLOAT) {
+      snap_kind = 2;
+    } else if (bf == xenos::TextureFormat::k_2_10_10_10) {
+      snap_kind = 3;
+    }
+    if (snap_kind) {
       GLuint snap = 0;
       bool swap_rb = false;
       if (render_targets_->FindSnapshot(info.memory.base_address, info.width + 1, info.height + 1, info.pitch,
-                                        uint32_t(info.endianness), snap, swap_rb)) {
+                                        uint32_t(info.endianness), snap_kind, snap, swap_rb)) {
         snapshot_tex_.id = snap;
         snapshot_tex_.target = GL_TEXTURE_2D_ARRAY;
         snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
@@ -239,6 +247,8 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
         perf::Add(perf::kResolveGpuHits);
         return &snapshot_tex_;
       }
+      render_targets_->LogLookupMiss("tex", info.memory.base_address, info.width + 1, info.height + 1, info.pitch,
+                                     uint32_t(info.endianness), uint32_t(info.format), snap_kind);
     }
   }
   uint64_t key = info.hash();
@@ -264,7 +274,7 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     }
     size = std::min<uint32_t>(size, 0x20000000 - address);
     size = std::min<uint32_t>(size, 64u << 20);
-    if (render_targets_) render_targets_->FlushPending(address, size);
+    if (render_targets_) render_targets_->FlushPending(address, size, GlRenderTargets::FlushReason::kTex);
     h ^= XXH3_64bits(memory_.TranslatePhysical(address), size) + 0x9E3779B97F4A7C15ull + (h << 6);
   };
   {

@@ -42,7 +42,11 @@ REXCVAR_DEFINE_BOOL(gl_stream_uploads, true, "GPU", "GL backend: upload constant
 REXCVAR_DEFINE_BOOL(gl_sync_resolve, false, "GPU", "GL backend: resolve (EDRAM copy) readback is synchronous like the original implementation (debugging)");
 REXCVAR_DEFINE_BOOL(gl_resolve_gpu_copy, true, "GPU", "GL backend: textures / front buffer matching a pending resolve use a GPU-side copy of the render target instead of guest memory");
 REXCVAR_DEFINE_INT32(gl_resolve_max_age, 3, "GPU", "GL backend: a pending async resolve is written to guest memory after at most this many swaps");
-REXCVAR_DEFINE_BOOL(gl_state_cache, true, "GPU", "GL backend: skip redundant raster state GL calls")
+REXCVAR_DEFINE_BOOL(gl_state_cache, true, "GPU", "GL backend: skip redundant raster state GL calls");
+REXCVAR_DEFINE_BOOL(gl_gpu_resolve, true, "GPU", "GL backend: resolves (EDRAM copies) are done by a compute shader into the shared memory store; guest memory is written back lazily (false = CPU readback + conversion)");
+REXCVAR_DEFINE_BOOL(gl_gpu_front, true, "GPU", "GL backend: the front buffer is detiled / endian swapped by a fragment shader reading the shared memory store (false = other paths)");
+REXCVAR_DEFINE_BOOL(gl_cpu_frontbuffer, false, "GPU", "GL backend: force the old CPU detile + upload of the front buffer (debugging)");
+REXCVAR_DEFINE_INT32(gl_resolve_log, 12, "GPU", "GL backend: log budget for resolve configurations and failed GPU-copy lookups (0 = off)")
 ;
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
@@ -320,7 +324,9 @@ struct GlCommandProcessor::Impl {
   bool stream = false;
   uint32_t ubo_align = 256;
   GLuint blit_array_program = 0;
-  GLint blit_array_swap_loc = -1;
+  GLint blit_array_sel_loc = -1;
+  GLuint blit_store_program = 0;
+  GLint blit_store_a_loc = -1, blit_store_b_loc = -1, blit_store_sel_loc = -1;
   GlTextureCache::FetchInfo fetch_info[32];
   std::unordered_map<uint64_t, uint64_t> vertex_buffer_hashes;
   uint32_t texture_bound_mask = 0;
@@ -351,9 +357,10 @@ bool GlCommandProcessor::SetupContext() {
     const char* fs_arr = R"(#version 430 core
 in vec2 uv;
 layout(binding = 0) uniform sampler2DArray tex;
-uniform int swap_rb;
+uniform ivec3 sel;
 out vec4 o;
-void main() { vec3 c = texture(tex, vec3(uv, 0.0)).rgb; o = vec4(swap_rb != 0 ? c.bgr : c, 1.0); }
+float pick(vec4 c, int s) { return s < 4 ? c[s] : float(s == 5); }
+void main() { vec4 c = texture(tex, vec3(uv, 0.0)); o = vec4(pick(c, sel.x), pick(c, sel.y), pick(c, sel.z), 1.0); }
 )";
     GLuint avs = Compile(GL_VERTEX_SHADER, kBlitVs);
     GLuint afs = Compile(GL_FRAGMENT_SHADER, fs_arr);
@@ -363,7 +370,77 @@ void main() { vec3 c = texture(tex, vec3(uv, 0.0)).rgb; o = vec4(swap_rb != 0 ? 
     glLinkProgram(impl_->blit_array_program);
     glDeleteShader(avs);
     glDeleteShader(afs);
-    impl_->blit_array_swap_loc = glGetUniformLocation(impl_->blit_array_program, "swap_rb");
+    impl_->blit_array_sel_loc = glGetUniformLocation(impl_->blit_array_program, "sel");
+  }
+  {
+    // Front buffer straight from the shared memory store: tiled 32bpp address, endian swap, format, swizzle and a
+    // bilinear filter, all in the fragment shader (no CPU detile / upload).
+    const char* fs_store = R"(#version 430 core
+in vec2 uv;
+layout(binding = 30) uniform usamplerBuffer xe_sm_store;
+layout(binding = 31) uniform usamplerBuffer xe_sm_pt;
+uniform uvec4 u_a;   // base address, pitch aligned to 32, width, height
+uniform ivec4 u_b;   // endian (0..3), format (0 = 8888, 1 = 2_10_10_10)
+uniform ivec3 u_sel; // fetch constant swizzle (0..3 = component, 4 = 0, 5 = 1)
+out vec4 o;
+
+uint tiled(uint x, uint y, uint pitch) {
+  int macro = int((x >> 5) + (y >> 5) * (pitch >> 5)) << 9;
+  int micro = int((x & 7u) + ((y & 0xEu) << 2)) << 2;
+  int offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + int((y & 1u) << 4);
+  return uint(((offset & ~0x1FF) << 3) + int((y & 16u) << 7) + ((offset & 0x1C0) << 2) +
+              int(((((y & 8u) >> 2) + (x >> 3)) & 3u) << 6) + (offset & 0x3F));
+}
+
+vec4 fetch_texel(ivec2 p) {
+  uint addr = u_a.x + tiled(uint(p.x), uint(p.y), u_a.y);
+  uint slot = texelFetch(xe_sm_pt, int(addr >> 20)).x;
+  uint v = texelFetch(xe_sm_store, int(slot + ((addr & 0xFFFFFu) >> 2))).x;
+  int e = u_b.x;
+  if (e == 1) v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+  else if (e == 2) v = (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+  else if (e == 3) v = (v << 16) | (v >> 16);
+  if (u_b.y == 1) {
+    return vec4(float(v & 1023u), float((v >> 10) & 1023u), float((v >> 20) & 1023u), float(v >> 30)) *
+           vec4(1.0 / 1023.0, 1.0 / 1023.0, 1.0 / 1023.0, 1.0 / 3.0);
+  }
+  return vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), float(v >> 24)) * (1.0 / 255.0);
+}
+
+float pick(vec4 c, int s) { return s < 4 ? c[s] : float(s == 5); }
+
+void main() {
+  vec2 p = uv * vec2(u_a.zw) - 0.5;
+  ivec2 i0 = ivec2(floor(p));
+  vec2 f = p - vec2(i0);
+  ivec2 hi = ivec2(u_a.zw) - 1;
+  vec4 c00 = fetch_texel(clamp(i0, ivec2(0), hi));
+  vec4 c10 = fetch_texel(clamp(i0 + ivec2(1, 0), ivec2(0), hi));
+  vec4 c01 = fetch_texel(clamp(i0 + ivec2(0, 1), ivec2(0), hi));
+  vec4 c11 = fetch_texel(clamp(i0 + ivec2(1, 1), ivec2(0), hi));
+  vec4 c = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+  o = vec4(pick(c, u_sel.x), pick(c, u_sel.y), pick(c, u_sel.z), 1.0);
+}
+)";
+    GLuint svs = Compile(GL_VERTEX_SHADER, kBlitVs);
+    GLuint sfs = Compile(GL_FRAGMENT_SHADER, fs_store);
+    impl_->blit_store_program = glCreateProgram();
+    glAttachShader(impl_->blit_store_program, svs);
+    glAttachShader(impl_->blit_store_program, sfs);
+    glLinkProgram(impl_->blit_store_program);
+    glDeleteShader(svs);
+    glDeleteShader(sfs);
+    GLint linked = 0;
+    glGetProgramiv(impl_->blit_store_program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+      REXGPU_ERROR("GL: front buffer store blit program failed to link, gl_gpu_front disabled");
+      glDeleteProgram(impl_->blit_store_program);
+      impl_->blit_store_program = 0;
+    } else {
+      impl_->blit_store_a_loc = glGetUniformLocation(impl_->blit_store_program, "u_a");
+      impl_->blit_store_b_loc = glGetUniformLocation(impl_->blit_store_program, "u_b");
+      impl_->blit_store_sel_loc = glGetUniformLocation(impl_->blit_store_program, "u_sel");
+    }
   }
   glGenTextures(1, &impl_->front_tex);
   {
@@ -396,8 +473,18 @@ void main() { vec3 c = texture(tex, vec3(uv, 0.0)).rgb; o = vec4(swap_rb != 0 ? 
   impl_->texture_cache = std::make_unique<GlTextureCache>(*register_file_, *memory_);
   impl_->texture_cache->SetRenderTargets(impl_->render_targets.get());
   impl_->texture_cache->SetStreamRing(impl_->stream ? &impl_->tex_ring : nullptr);
+  impl_->render_targets->SetSharedMemory(impl_->shared_memory.get());
   impl_->shared_memory->SetPreReadHook([this](uint32_t start, uint32_t length) {
-    if (impl_->render_targets) impl_->render_targets->FlushPending(start, length);
+    if (impl_->render_targets) {
+      impl_->render_targets->FlushPending(start, length, GlRenderTargets::FlushReason::kSm);
+    }
+  });
+  impl_->shared_memory->SetPreStoreResetHook([this]() {
+    // The store is about to be discarded: GPU-only data must reach guest memory first.
+    if (impl_->render_targets) {
+      impl_->render_targets->FlushAll(GlRenderTargets::FlushReason::kOther);
+      impl_->render_targets->ClearGpuResident();
+    }
   });
   if (!impl_->shared_memory->Initialize() || !impl_->primitive_processor->Initialize() ||
       !impl_->pipeline_cache->Initialize(&context_) || !impl_->render_targets->Initialize() ||
@@ -1115,10 +1202,16 @@ bool GlCommandProcessor::IssueCopy() {
   perf::Scope perf_copy_scope(perf::kCopyTicks);
   uint32_t start = 0, length = 0;
   glDisable(GL_SCISSOR_TEST);
-  bool ok = impl_->render_targets->Resolve(start, length);
+  bool gpu_written = false;
+  bool ok = impl_->render_targets->Resolve(start, length, gpu_written);
   impl_->raster_cache.Invalidate();
   if (length) {
-    impl_->shared_memory->MemoryInvalidationCallback(start, length, true);
+    if (gpu_written) {
+      // The store holds the data; guest memory is stale until the lazy write-back.
+      impl_->shared_memory->RangeWrittenByGpu(start, length);
+    } else {
+      impl_->shared_memory->MemoryInvalidationCallback(start, length, true);
+    }
   }
   return ok;
 }
@@ -1251,20 +1344,40 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   GLuint snap_tex = 0;
   bool snap_swap_rb = false;
   bool use_snap = false;
+  bool use_store = false;
   uint32_t front_ring_offset = 0;
   bool front_from_ring = false;
   if (have) {
     uint32_t pitch = std::max<uint32_t>(uint32_t(fetch.pitch) << 5, w);
-    // GPU path: the front buffer is exactly a recent, not yet written back resolve of the render target.
-    if (REXCVAR_GET(gl_resolve_gpu_copy) && fetch.tiled && (uint32_t(fetch.swizzle) & 0x1FF) == 0x88 &&
-        (fetch.format == xenos::TextureFormat::k_8_8_8_8 || fetch.format == xenos::TextureFormat::k_8_8_8_8_A) &&
-        impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), snap_tex, snap_swap_rb)) {
+    const bool cpu_forced = REXCVAR_GET(gl_cpu_frontbuffer);
+    const bool fmt_8888 = fetch.format == xenos::TextureFormat::k_8_8_8_8 || fetch.format == xenos::TextureFormat::k_8_8_8_8_A;
+    const bool fmt_1010 = fetch.format == xenos::TextureFormat::k_2_10_10_10;
+    const uint32_t swz = uint32_t(fetch.swizzle);
+    // Best path: the front buffer is the result of GPU resolves, so it lives in the shared memory store. A
+    // fragment shader reads it there (tiled address, endian swap, format, swizzle): no write-back, no CPU detile.
+    if (!cpu_forced && REXCVAR_GET(gl_gpu_front) && impl_->blit_store_program && fetch.tiled &&
+        (fmt_8888 || fmt_1010) && uint32_t(fetch.endianness) <= 3) {
+      uint32_t upper = texture_util::GetTiledAddressUpperBound2D(w, h, pitch, 2);
+      if (impl_->render_targets->IsGpuResident(base, upper)) {
+        use_store = true;
+        perf::Add(perf::kGpuFrontBlits);
+      } else {
+        impl_->render_targets->LogLookupMiss("front", base, w, h, pitch, uint32_t(fetch.endianness),
+                                             uint32_t(fetch.format), 1);
+      }
+    }
+    // Next: the front buffer is exactly a recent resolve whose GPU snapshot can be shown directly.
+    if (!use_store && !cpu_forced && REXCVAR_GET(gl_resolve_gpu_copy) && fetch.tiled && fmt_8888 &&
+        impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), 1, snap_tex,
+                                            snap_swap_rb)) {
       use_snap = true;
       perf::Add(perf::kResolveFrontHits);
     }
-    if (!use_snap) {
+    if (!use_store && !use_snap) {
+      perf::Add(perf::kCpuFrontFrames);
       const uint32_t pitch_al = (pitch + 31) & ~31u;
-      impl_->render_targets->FlushPending(base, pitch_al * ((h + 31) & ~31u) * 4);
+      impl_->render_targets->FlushPending(base, pitch_al * ((h + 31) & ~31u) * 4,
+                                          GlRenderTargets::FlushReason::kFront);
       const uint8_t* mem = memory_->TranslatePhysical(base);
       perf::Scope perf_detile_scope(perf::kSwapDetileTicks);
       uint32_t* out_px = nullptr;
@@ -1277,7 +1390,6 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
         impl_->front_pixels.resize(size_t(w) * h);
         out_px = impl_->front_pixels.data();
       }
-      const uint32_t swz = uint32_t(fetch.swizzle);
       const bool need_swz = (swz & 0x1FF) != 0x88;
       const bool tiled = fetch.tiled;
       const xenos::Endian endian = fetch.endianness;
@@ -1313,11 +1425,26 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   }
   if (have) {
     glActiveTexture(GL_TEXTURE0);
-    if (use_snap) {
+    if (use_store) {
+      const uint32_t swz = uint32_t(fetch.swizzle);
+      impl_->shared_memory->BindStorageBuffers(0);
+      glUseProgram(impl_->blit_store_program);
+      glUniform4ui(impl_->blit_store_a_loc, base, (std::max<uint32_t>(uint32_t(fetch.pitch) << 5, w) + 31) & ~31u, w, h);
+      glUniform4i(impl_->blit_store_b_loc, GLint(uint32_t(fetch.endianness)), fetch.format == xenos::TextureFormat::k_2_10_10_10 ? 1 : 0, 0, 0);
+      glUniform3i(impl_->blit_store_sel_loc, GLint(swz & 7), GLint((swz >> 3) & 7), GLint((swz >> 6) & 7));
+    } else if (use_snap) {
       glBindTexture(GL_TEXTURE_2D_ARRAY, snap_tex);
       glBindSampler(0, 0);
       glUseProgram(impl_->blit_array_program);
-      glUniform1i(impl_->blit_array_swap_loc, snap_swap_rb ? 1 : 0);
+      // Channel selector: fetch swizzle applied to the guest bytes; the snapshot is the render target (RGBA) and
+      // the resolve may have swapped red/blue on the way into guest memory.
+      const uint32_t swz = uint32_t(fetch.swizzle);
+      auto sel = [&](uint32_t s) -> GLint {
+        s &= 7;
+        if (s < 4 && snap_swap_rb && (s == 0 || s == 2)) return GLint(2 - s);
+        return GLint(s);
+      };
+      glUniform3i(impl_->blit_array_sel_loc, sel(swz), sel(swz >> 3), sel(swz >> 6));
     } else {
       glBindTexture(GL_TEXTURE_2D, impl_->front_tex);
       if (impl_->front_w != w || impl_->front_h != h) {

@@ -11,6 +11,8 @@
 
 #include "gl_cvars.h"
 #include "gl_ext.h"
+#include "shared_memory.h"
+#include "spirv_to_glsl.h"
 #include "tiling.h"
 
 namespace rex::graphics::gl {
@@ -102,6 +104,11 @@ void ApplyEndian(uint8_t* b, uint32_t size, xenos::Endian128 endian) {
 
 bool GlRenderTargets::Initialize() {
   glGenFramebuffers(1, &read_fbo_);
+  if (REXCVAR_GET(gl_gpu_resolve)) {
+    if (!CreateGpuResolveProgram()) {
+      REXGPU_WARN("GL RT: GPU resolve compute shader unavailable, using CPU resolves");
+    }
+  }
   return true;
 }
 
@@ -313,7 +320,8 @@ bool GlRenderTargets::BindForDraw(uint32_t color_mask, bool depth_stencil_used, 
   return true;
 }
 
-bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_length_out) {
+bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_length_out, bool& gpu_written_out) {
+  gpu_written_out = false;
   extent_start_out = 0;
   extent_length_out = 0;
   draw_util::ResolveInfo ri;
@@ -342,6 +350,7 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
   uint32_t h = ri.height_div_8 * 8;
 
   // ---- Copy ----
+  gpu_written_out = false;
   if (!is_depth && ri.copy_dest_extent_length) {
     auto color_info = regs_.Get<reg::RB_COLOR_INFO>(
         reg::RB_COLOR_INFO::rt_register_indices[ri.rb_copy_control.copy_src_select]);
@@ -378,43 +387,70 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
         pr.swap_rb = swap_rb;
         pr.src_is_8888 = src_is_8888;
         const bool sync = REXCVAR_GET(gl_sync_resolve);
-        pr.pbo_size = rw * rh * (src_is_8888 ? 4 : 16);
+        // Snapshot kind: the dest layout equals the render target's host format, so consumers can sample a GPU
+        // copy of the render target instead of going through guest memory.
         {
-          perf::Scope perf_readback_scope(perf::kReadbackTicks);
-          glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo_);
-          glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->texture, 0);
-          glReadBuffer(GL_COLOR_ATTACHMENT0);
-          glPixelStorei(GL_PACK_ALIGNMENT, 1);
-          for (size_t k = 0; k < free_pbos_.size(); ++k) {
-            if (free_pbos_[k].second >= pr.pbo_size && free_pbos_[k].second <= pr.pbo_size * 2) {
-              pr.pbo = free_pbos_[k].first;
-              pr.pbo_size = free_pbos_[k].second;
-              free_pbos_.erase(free_pbos_.begin() + k);
-              break;
-            }
+          const bool rgba8_dest = rt->internal_format == GL_RGBA8 && bpp == 4 &&
+                                  (dest_format == xenos::TextureFormat::k_8_8_8_8 ||
+                                   dest_format == xenos::TextureFormat::k_8_8_8_8_A);
+          const bool f16_dest = rt->internal_format == GL_RGBA16F && !swap_rb &&
+                                dest_format == xenos::TextureFormat::k_16_16_16_16_FLOAT;
+          const bool r10_dest = rt->internal_format == GL_RGB10_A2 && bpp == 4 && !swap_rb &&
+                                dest_format == xenos::TextureFormat::k_2_10_10_10;
+          if (!sync && ox == 0 && oy == 0 && REXCVAR_GET(gl_resolve_gpu_copy) &&
+              uint64_t(rw) * rh <= (1u << 21) && (rgba8_dest || f16_dest || r10_dest)) {
+            pr.snap_kind = rgba8_dest ? 1 : f16_dest ? 2 : 3;
+            pr.snapshot_format = rt->internal_format;
           }
-          if (!pr.pbo) {
-            glGenBuffers(1, &pr.pbo);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
-            glBufferData(GL_PIXEL_PACK_BUFFER, pr.pbo_size, nullptr, GL_STREAM_READ);
-          } else {
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
-          }
-          if (src_is_8888) {
-            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-          } else {
-            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_FLOAT, nullptr);
-          }
-          glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-          pr.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
-        const bool rgba8_dest = src_is_8888 && bpp == 4 &&
-                                (dest_format == xenos::TextureFormat::k_8_8_8_8 ||
-                                 dest_format == xenos::TextureFormat::k_8_8_8_8_A);
-        if (rgba8_dest && ox == 0 && oy == 0 && !sync && REXCVAR_GET(gl_resolve_gpu_copy)) {
-          // GPU-side snapshot of the resolved rectangle for consumers (textures, front buffer).
+        bool gpu_done = false;
+        if (!sync && gpu_prog_ && sm_ && REXCVAR_GET(gl_gpu_resolve)) {
+          gpu_done = GpuResolve(*rt, pr, x0, y0);
+        }
+        if (!gpu_done) {
+          perf::Add(perf::kCpuResolves);
+          // CPU path: pending resolves into the same range must be written back first (ordering), and the range
+          // is no longer GPU resident.
+          if (!pending_.empty()) {
+            FlushPending(ri.copy_dest_extent_start, ri.copy_dest_extent_length, FlushReason::kOther);
+          }
+          ResidentRemove(ri.copy_dest_extent_start, ri.copy_dest_extent_length);
+          pr.pbo_size = rw * rh * (src_is_8888 ? 4 : 16);
+          {
+            perf::Scope perf_readback_scope(perf::kReadbackTicks);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo_);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->texture, 0);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            for (size_t k = 0; k < free_pbos_.size(); ++k) {
+              if (free_pbos_[k].second >= pr.pbo_size && free_pbos_[k].second <= pr.pbo_size * 2) {
+                pr.pbo = free_pbos_[k].first;
+                pr.pbo_size = free_pbos_[k].second;
+                free_pbos_.erase(free_pbos_.begin() + k);
+                break;
+              }
+            }
+            if (!pr.pbo) {
+              glGenBuffers(1, &pr.pbo);
+              glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+              glBufferData(GL_PIXEL_PACK_BUFFER, pr.pbo_size, nullptr, GL_STREAM_READ);
+            } else {
+              glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+            }
+            if (src_is_8888) {
+              glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            } else {
+              glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_FLOAT, nullptr);
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            pr.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+          }
+        }
+        if (pr.snap_kind) {
+          // GPU-side snapshot of the resolved rectangle for consumers (textures).
           for (size_t k = 0; k < free_snapshots_.size(); ++k) {
-            if (free_snapshots_[k].w == rw && free_snapshots_[k].h == rh) {
+            if (free_snapshots_[k].w == rw && free_snapshots_[k].h == rh &&
+                free_snapshots_[k].format == pr.snapshot_format) {
               pr.snapshot = free_snapshots_[k].texture;
               free_snapshots_.erase(free_snapshots_.begin() + k);
               break;
@@ -423,7 +459,7 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
           if (!pr.snapshot) {
             glGenTextures(1, &pr.snapshot);
             glBindTexture(GL_TEXTURE_2D_ARRAY, pr.snapshot);
-            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, rw, rh, 1);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, pr.snapshot_format, rw, rh, 1);
             glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0);
             glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
           }
@@ -432,22 +468,34 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
           glCopyImageSubData(rt->texture, GL_TEXTURE_2D, 0, GLint(x0), GLint(y0), 0, pr.snapshot,
                              GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, GLsizei(rw), GLsizei(rh), 1);
         }
-        if (resolve_count_ <= 4) {
-          REXGPU_INFO(
-              "GL resolve #{}: RT base={} {}x{} fmt={} -> dest 0x{:08X} fmt={} pitch={} rect=({},{}) {}x{} "
-              "endian={} swap={} snapshot={}",
-              resolve_count_, uint32_t(color_info.color_base), rt->width, rt->height, uint32_t(color_info.color_format),
-              ri.copy_dest_base, uint32_t(dest_format), dest_pitch, x0, y0, rw, rh, uint32_t(endian),
-              uint32_t(swap_rb), pr.snapshot != 0);
+        // Log distinct resolve configurations (up to gl_resolve_log * 4) for diagnostics.
+        {
+          const int32_t log_budget = REXCVAR_GET(gl_resolve_log);
+          uint64_t sig = (uint64_t(pr.dest_base) << 32) ^ (uint64_t(rw) << 16) ^ rh ^ (uint64_t(dest_pitch) << 48) ^
+                         (uint64_t(uint32_t(dest_format)) << 8) ^ (uint64_t(uint32_t(endian)) << 4) ^
+                         (swap_rb ? 1 : 0) ^ (uint64_t(ox + oy * 4096) << 20);
+          bool seen = false;
+          for (uint64_t sg : resolve_sigs_) seen |= sg == sig;
+          if (!seen && int32_t(resolve_sigs_.size()) < log_budget * 4) {
+            resolve_sigs_.push_back(sig);
+            REXGPU_INFO(
+                "GL resolve #{} (new config): RT base={} {}x{} fmt={} -> dest 0x{:08X} fmt={} pitch={} (aligned {}) "
+                "origin=({},{}) src rect=({},{}) {}x{} extent=0x{:08X}+0x{:X} endian={} swap={} gpu={} snap_kind={}",
+                resolve_count_, uint32_t(color_info.color_base), rt->width, rt->height,
+                uint32_t(color_info.color_format), ri.copy_dest_base, uint32_t(dest_format), dest_pitch,
+                (dest_pitch + 31) & ~31u, ox, oy, x0, y0, rw, rh, ri.copy_dest_extent_start,
+                ri.copy_dest_extent_length, uint32_t(endian), uint32_t(swap_rb), gpu_done, pr.snap_kind);
+          }
         }
         pending_.push_back(pr);
         if (sync) {
-          FlushAll();
+          FlushAll(FlushReason::kSync);
         } else {
-          while (pending_.size() > 8) FlushFront(true);
+          while (pending_.size() > 24) FlushFront(true, FlushReason::kCap);
         }
         extent_start_out = ri.copy_dest_extent_start;
         extent_length_out = ri.copy_dest_extent_length;
+        gpu_written_out = gpu_done;
       }
     }
   } else if (is_depth) {
@@ -691,7 +739,7 @@ void GlRenderTargets::ConvertPending(PendingResolve& pr, const void* pixels) {
         }
 }
 
-void GlRenderTargets::ReleasePending(PendingResolve& pr) {
+void GlRenderTargets::ReleaseDownload(PendingResolve& pr) {
   if (pr.fence) {
     glDeleteSync(pr.fence);
     pr.fence = nullptr;
@@ -704,8 +752,11 @@ void GlRenderTargets::ReleasePending(PendingResolve& pr) {
       free_pbos_.erase(free_pbos_.begin());
     }
   }
+}
+
+void GlRenderTargets::ReleaseSnapshot(PendingResolve& pr) {
   if (pr.snapshot) {
-    free_snapshots_.push_back({pr.snapshot, pr.snapshot_w, pr.snapshot_h});
+    free_snapshots_.push_back({pr.snapshot, pr.snapshot_w, pr.snapshot_h, pr.snapshot_format});
     pr.snapshot = 0;
     while (free_snapshots_.size() > 6) {
       glDeleteTextures(1, &free_snapshots_.front().texture);
@@ -714,12 +765,379 @@ void GlRenderTargets::ReleasePending(PendingResolve& pr) {
   }
 }
 
-void GlRenderTargets::FlushFront(bool wait) {
+void GlRenderTargets::ReleasePending(PendingResolve& pr) {
+  ReleaseDownload(pr);
+  ReleaseSnapshot(pr);
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU resolve (compute shader writing the guest-format image into the shared memory store)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// Dest layout kinds of the compute shader.
+constexpr int kGpuKind8888 = 0;      // 4x8 bit
+constexpr int kGpuKind2101010 = 1;   // 2_10_10_10
+constexpr int kGpuKind1616F = 2;     // 16_16_FLOAT (32 bpp)
+constexpr int kGpuKind16161616F = 3; // 16_16_16_16_FLOAT (64 bpp)
+constexpr int kGpuKind32F = 4;       // 32_FLOAT
+constexpr int kGpuKind3232F = 5;     // 32_32_FLOAT (64 bpp)
+
+const char* kResolveCs = R"(#version 430 core
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(std430, binding = 0) buffer StoreBuf { uint data[]; } sm;
+layout(std430, binding = 1) readonly buffer PtBuf { uint pt[]; };
+uniform ivec4 u_src;   // source rect x0, y0, width, height
+uniform ivec4 u_dst;   // dest origin x, y (texels), pitch aligned to 32, log2 bytes per texel
+uniform uint u_base;   // guest physical base address of the destination image
+uniform ivec4 u_fmt;   // dest kind, endian (0..3), swap red/blue, unused
+
+uint tiled(uint x, uint y, uint pitch, uint bl) {
+  int macro = int((x >> 5) + (y >> 5) * (pitch >> 5)) << int(bl + 7u);
+  int micro = int((x & 7u) + ((y & 0xEu) << 2)) << int(bl);
+  int offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + int((y & 1u) << 4);
+  return uint(((offset & ~0x1FF) << 3) + int((y & 16u) << 7) + ((offset & 0x1C0) << 2) +
+              int(((((y & 8u) >> 2) + (x >> 3)) & 3u) << 6) + (offset & 0x3F));
+}
+
+uint swapw(uint v, int e) {
+  if (e == 1) return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+  if (e == 2) return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+  if (e == 3) return (v << 16) | (v >> 16);
+  return v;
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u_src.z || p.y >= u_src.w) return;
+  vec4 c = texelFetch(src, u_src.xy + p, 0);
+  if (u_fmt.z != 0) c = c.bgra;
+  uint addr = u_base + tiled(uint(u_dst.x + p.x), uint(u_dst.y + p.y), uint(u_dst.z), uint(u_dst.w));
+  uint slot = pt[addr >> 20];
+  if (slot == 0xFFFFFFFFu) return;
+  uint idx = slot + ((addr & 0xFFFFFu) >> 2);
+  int kind = u_fmt.x;
+  int e = u_fmt.y;
+  uint v0 = 0u, v1 = 0u;
+  if (kind == 0) {
+    uvec4 b = uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+    v0 = b.x | (b.y << 8) | (b.z << 16) | (b.w << 24);
+  } else if (kind == 1) {
+    vec4 q = clamp(c, 0.0, 1.0);
+    uint r = uint(q.r * 1023.0 + 0.5), g = uint(q.g * 1023.0 + 0.5), bl = uint(q.b * 1023.0 + 0.5);
+    uint a = uint(q.a * 3.0 + 0.5);
+    v0 = r | (g << 10) | (bl << 20) | (a << 30);
+  } else if (kind == 2) {
+    v0 = packHalf2x16(c.rg);
+  } else if (kind == 3) {
+    v0 = packHalf2x16(c.rg);
+    v1 = packHalf2x16(c.ba);
+  } else if (kind == 4) {
+    v0 = floatBitsToUint(c.r);
+  } else {
+    v0 = floatBitsToUint(c.r);
+    v1 = floatBitsToUint(c.g);
+  }
+  sm.data[idx] = swapw(v0, e);
+  if (kind == 3 || kind == 5) sm.data[idx + 1u] = swapw(v1, e);
+}
+)";
+
+int GpuKindFor(xenos::TextureFormat dest_format, uint32_t bpp) {
+  int kind = -1;
+  switch (xenos::ColorFormat(dest_format)) {
+    case xenos::ColorFormat::k_8_8_8_8:
+    case xenos::ColorFormat::k_8_8_8_8_A:
+    case xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16:
+      kind = kGpuKind8888;
+      break;
+    case xenos::ColorFormat::k_2_10_10_10:
+    case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16:
+      kind = kGpuKind2101010;
+      break;
+    case xenos::ColorFormat::k_16_16_FLOAT:
+      kind = kGpuKind1616F;
+      break;
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+      kind = kGpuKind16161616F;
+      break;
+    case xenos::ColorFormat::k_32_FLOAT:
+      kind = kGpuKind32F;
+      break;
+    case xenos::ColorFormat::k_32_32_FLOAT:
+      kind = kGpuKind3232F;
+      break;
+    default:
+      return -1;
+  }
+  const uint32_t want_bpp = (kind == kGpuKind16161616F || kind == kGpuKind3232F) ? 8 : 4;
+  return bpp == want_bpp ? kind : -1;
+}
+
+}  // namespace
+
+bool GlRenderTargets::CreateGpuResolveProgram() {
+  GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+  glShaderSource(cs, 1, &kResolveCs, nullptr);
+  glCompileShader(cs);
+  GLint ok = 0;
+  glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[2048];
+    glGetShaderInfoLog(cs, sizeof(log), nullptr, log);
+    REXGPU_ERROR("GL RT: resolve compute shader compile failed: {}", log);
+    glDeleteShader(cs);
+    return false;
+  }
+  GLuint prog = glCreateProgram();
+  glAttachShader(prog, cs);
+  glLinkProgram(prog);
+  glDeleteShader(cs);
+  glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+  if (!ok) {
+    char log[2048];
+    glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+    REXGPU_ERROR("GL RT: resolve compute shader link failed: {}", log);
+    glDeleteProgram(prog);
+    return false;
+  }
+  gpu_prog_ = prog;
+  u_src_ = glGetUniformLocation(prog, "u_src");
+  u_dst_ = glGetUniformLocation(prog, "u_dst");
+  u_base_ = glGetUniformLocation(prog, "u_base");
+  u_fmt_ = glGetUniformLocation(prog, "u_fmt");
+  REXGPU_INFO("GL RT: GPU resolve compute shader ready");
+  return true;
+}
+
+bool GlRenderTargets::GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x0, uint32_t y0) {
+  const int kind = GpuKindFor(pr.dest_format, pr.bpp);
+  if (kind < 0 || uint32_t(pr.endian) > uint32_t(xenos::Endian128::k16in32)) {
+    return false;
+  }
+  if (uint64_t(pr.extent_start) + pr.extent_length > SharedMemory::kBufferSize) {
+    return false;
+  }
+  perf::Scope perf_gpu_scope(perf::kGpuResolveTicks);
+  // Make the destination pages resident (and current: partially covered edge pages keep their guest contents).
+  if (!sm_->RequestRange(pr.extent_start, pr.extent_length)) {
+    return false;
+  }
+  if (!sm_->store_buffer()) {
+    return false;
+  }
+  const uint32_t pitch_aligned = (pr.dest_pitch + 31) & ~31u;
+  if (gpu_checks_left_ > 0) {
+    while (glGetError() != GL_NO_ERROR) {}  // so only errors of the dispatch below are blamed on it
+  }
+  glUseProgram(gpu_prog_);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, rt.texture);
+  glBindSampler(0, 0);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sm_->store_buffer());
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sm_->page_table_buffer());
+  glUniform4i(u_src_, GLint(x0), GLint(y0), GLint(pr.rw), GLint(pr.rh));
+  glUniform4i(u_dst_, GLint(pr.ox), GLint(pr.oy), GLint(pitch_aligned), GLint(pr.bpp_log2));
+  glUniform1ui(u_base_, pr.dest_base);
+  glUniform4i(u_fmt_, kind, GLint(uint32_t(pr.endian)), pr.swap_rb ? 1 : 0, 0);
+  glDispatchCompute((pr.rw + 7) / 8, (pr.rh + 7) / 8, 1);
+  glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+                  GL_ELEMENT_ARRAY_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT |
+                  GL_UNIFORM_BARRIER_BIT);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glUseProgram(0);
+  if (gpu_checks_left_ > 0) {
+    --gpu_checks_left_;
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+      REXGPU_ERROR("GL RT: GPU resolve raised GL error 0x{:x}, falling back to CPU resolves", err);
+      glDeleteProgram(gpu_prog_);
+      gpu_prog_ = 0;
+      return false;
+    }
+  }
+  pr.gpu = true;
+  pr.gpu_kind = kind;
+  perf::Add(perf::kGpuResolves);
+  // Older resolves whose image is completely overwritten by this one never need to be written back.
+  const uint32_t new_pitch = pitch_aligned;
+  for (PendingResolve& o : pending_) {
+    if (!o.gpu || o.done || o.dl_started) continue;
+    if (o.dest_base != pr.dest_base || ((o.dest_pitch + 31) & ~31u) != new_pitch || o.bpp != pr.bpp) continue;
+    if (o.ox >= pr.ox && o.oy >= pr.oy && o.ox + o.rw <= pr.ox + pr.rw && o.oy + o.rh <= pr.oy + pr.rh) {
+      o.done = true;
+      ReleaseSnapshot(o);
+      perf::Add(perf::kResolveSuperseded);
+    }
+  }
+  ResidentAdd(pr.extent_start, pr.extent_length);
+  return true;
+}
+
+void GlRenderTargets::StartGpuDownload(PendingResolve& pr) {
+  pr.dl_started = true;
+  const uint32_t size = pr.extent_length;
+  pr.pbo_size = size;
+  for (size_t k = 0; k < free_pbos_.size(); ++k) {
+    if (free_pbos_[k].second >= size && free_pbos_[k].second <= size * 2) {
+      pr.pbo = free_pbos_[k].first;
+      pr.pbo_size = free_pbos_[k].second;
+      free_pbos_.erase(free_pbos_.begin() + k);
+      break;
+    }
+  }
+  if (!pr.pbo) {
+    glGenBuffers(1, &pr.pbo);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, pr.pbo);
+    glBufferData(GL_COPY_WRITE_BUFFER, pr.pbo_size, nullptr, GL_STREAM_READ);
+  } else {
+    glBindBuffer(GL_COPY_WRITE_BUFFER, pr.pbo);
+  }
+  glBindBuffer(GL_COPY_READ_BUFFER, sm_->store_buffer());
+  uint32_t copied = 0;
+  bool ok = true;
+  while (copied < size) {
+    GLintptr off = 0;
+    uint32_t n = 0;
+    if (!sm_->StoreOffset(pr.extent_start + copied, off, n)) {
+      ok = false;
+      break;
+    }
+    n = std::min(n, size - copied);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, off, GLintptr(copied), n);
+    copied += n;
+  }
+  glBindBuffer(GL_COPY_READ_BUFFER, 0);
+  glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+  if (!ok) {
+    REXGPU_WARN("GL RT: GPU resolve write-back skipped, range 0x{:08X}+0x{:X} not resident", pr.extent_start, size);
+    ReleaseDownload(pr);
+    pr.done = true;
+    return;
+  }
+  pr.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  perf::Add(perf::kLazyDownloads);
+  perf::Add(perf::kLazyDownloadBytes, size);
+}
+
+void GlRenderTargets::FinishGpuDownload(PendingResolve& pr) {
+  perf::Scope perf_dl_scope(perf::kLazyDownloadTicks);
+  if (!pr.fence || !pr.pbo) {
+    pr.done = true;
+    return;
+  }
+  const void* data = nullptr;
+  {
+    perf::Scope perf_readback_scope(perf::kReadbackTicks);
+    GLenum r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+    while (r == GL_TIMEOUT_EXPIRED) {
+      r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+    }
+    glBindBuffer(GL_COPY_WRITE_BUFFER, pr.pbo);
+    data = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, pr.extent_length, GL_MAP_READ_BIT);
+  }
+  if (data) {
+    // The data is already in guest format (tiled, endian swapped): a plain copy.
+    std::memcpy(memory_.TranslatePhysical(pr.extent_start), data, pr.extent_length);
+    glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+  }
+  glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+  ReleaseDownload(pr);
+  pr.done = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU-resident ranges (sorted, merged)
+// ---------------------------------------------------------------------------------------------
+
+void GlRenderTargets::ResidentAdd(uint32_t start, uint32_t length) {
+  uint64_t s = start, e = uint64_t(start) + length;
+  for (size_t i = 0; i < resident_.size();) {
+    uint64_t rs = resident_[i].start, re = rs + resident_[i].length;
+    if (rs <= e && s <= re) {
+      s = std::min(s, rs);
+      e = std::max(e, re);
+      resident_.erase(resident_.begin() + i);
+    } else {
+      ++i;
+    }
+  }
+  resident_.push_back({uint32_t(s), uint32_t(e - s)});
+  while (resident_.size() > 64) resident_.erase(resident_.begin());
+}
+
+void GlRenderTargets::ResidentRemove(uint32_t start, uint32_t length) {
+  uint64_t s = start, e = uint64_t(start) + length;
+  std::vector<Range> out;
+  for (const Range& r : resident_) {
+    uint64_t rs = r.start, re = rs + r.length;
+    if (re <= s || rs >= e) {
+      out.push_back(r);
+      continue;
+    }
+    if (rs < s) out.push_back({r.start, uint32_t(s - rs)});
+    if (re > e) out.push_back({uint32_t(e), uint32_t(re - e)});
+  }
+  resident_ = std::move(out);
+}
+
+bool GlRenderTargets::IsGpuResident(uint32_t start, uint32_t length) const {
+  uint64_t s = start, e = uint64_t(start) + length;
+  for (const Range& r : resident_) {
+    if (r.start <= s && uint64_t(r.start) + r.length >= e) {
+      // A CPU-path resolve still pending on the range would make the store stale.
+      for (const PendingResolve& pr : pending_) {
+        if (!pr.gpu && uint64_t(pr.extent_start) < e && uint64_t(pr.extent_start) + pr.extent_length > s) return false;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pending resolve management
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+void CountFlush(GlRenderTargets::FlushReason r) {
+  using R = GlRenderTargets::FlushReason;
+  switch (r) {
+    case R::kTex: perf::Add(perf::kFlushTex); break;
+    case R::kSm: perf::Add(perf::kFlushSm); break;
+    case R::kFront: perf::Add(perf::kFlushFront); break;
+    case R::kAge: perf::Add(perf::kFlushAge); break;
+    case R::kCap: perf::Add(perf::kFlushCap); break;
+    case R::kSync: perf::Add(perf::kFlushSync); break;
+    default: perf::Add(perf::kFlushOther); break;
+  }
+}
+}  // namespace
+
+void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
   if (pending_.empty()) return;
   PendingResolve& pr = pending_.front();
+  if (pr.gpu) {
+    if (pr.done) {
+      ReleasePending(pr);
+      pending_.pop_front();
+      return;
+    }
+    if (!wait) return;
+    CountFlush(reason);
+    if (!pr.dl_started) StartGpuDownload(pr);
+    if (!pr.done) FinishGpuDownload(pr);
+    ReleasePending(pr);
+    pending_.pop_front();
+    return;
+  }
   if (!wait) {
     GLenum r = glClientWaitSync(pr.fence, 0, 0);
     if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED) return;
+  } else {
+    CountFlush(reason);
   }
   const void* data = nullptr;
   {
@@ -740,27 +1158,63 @@ void GlRenderTargets::FlushFront(bool wait) {
   pending_.pop_front();
 }
 
-void GlRenderTargets::FlushPending(uint32_t start, uint32_t length) {
+void GlRenderTargets::FlushPending(uint32_t start, uint32_t length, FlushReason reason) {
   if (pending_.empty()) return;
-  int last = -1;
-  uint64_t end = uint64_t(start) + length;
+  const uint64_t end = uint64_t(start) + length;
+  auto overlaps = [&](const PendingResolve& pr) {
+    return uint64_t(pr.extent_start) < end && uint64_t(pr.extent_start) + pr.extent_length > start;
+  };
+  // CPU-path resolves are written back strictly in order (up to the last overlapping one).
+  int last_cpu = -1;
   for (size_t i = 0; i < pending_.size(); ++i) {
-    const PendingResolve& pr = pending_[i];
-    if (uint64_t(pr.extent_start) < end && uint64_t(pr.extent_start) + pr.extent_length > start) last = int(i);
+    if (!pending_[i].gpu && overlaps(pending_[i])) last_cpu = int(i);
   }
-  for (int i = 0; i <= last; ++i) FlushFront(true);
+  for (int i = 0; i <= last_cpu; ++i) FlushFront(true, reason);
+  // GPU-path resolves: the store always holds the newest data, so each overlapping one is simply downloaded.
+  for (PendingResolve& pr : pending_) {
+    if (!pr.gpu || pr.done || !overlaps(pr)) continue;
+    CountFlush(reason);
+    if (!pr.dl_started) StartGpuDownload(pr);
+    if (!pr.done) FinishGpuDownload(pr);
+  }
 }
 
-void GlRenderTargets::FlushAll() {
-  while (!pending_.empty()) FlushFront(true);
+void GlRenderTargets::FlushAll(FlushReason reason) {
+  if (pending_.empty()) return;
+  FlushPending(0, 0xFFFFFFFFu, reason);
+  while (!pending_.empty()) FlushFront(true, reason);
 }
 
 void GlRenderTargets::PollPending() {
   const int64_t max_age = std::max(0, REXCVAR_GET(gl_resolve_max_age));
   while (!pending_.empty()) {
-    int64_t age = int64_t(frame_) - int64_t(pending_.front().frame);
+    PendingResolve& pr = pending_.front();
+    int64_t age = int64_t(frame_) - int64_t(pr.frame);
+    if (pr.gpu) {
+      if (pr.done) {
+        // Superseded records (no snapshot) go away at once, downloaded ones keep their snapshot for a while.
+        if (age >= (pr.snapshot ? max_age : 1)) {
+          FlushFront(true, FlushReason::kOther);
+          continue;
+        }
+        break;
+      }
+      if (!pr.dl_started) {
+        if (age < max_age) break;
+        StartGpuDownload(pr);
+        if (pr.done) continue;
+      }
+      if (age >= max_age + 3) {
+        FlushFront(true, FlushReason::kAge);
+        continue;
+      }
+      GLenum r = glClientWaitSync(pr.fence, 0, 0);
+      if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED) break;
+      FinishGpuDownload(pr);  // keeps the record (and its snapshot) until it ages out
+      continue;
+    }
     if (age >= max_age) {
-      FlushFront(true);
+      FlushFront(true, FlushReason::kAge);
     } else if (age >= 1) {
       size_t before = pending_.size();
       FlushFront(false);
@@ -772,20 +1226,69 @@ void GlRenderTargets::PollPending() {
 }
 
 bool GlRenderTargets::FindSnapshot(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch,
-                                   uint32_t endian, GLuint& texture_out, bool& swap_rb_out) const {
+                                   uint32_t endian, uint32_t snap_kind, GLuint& texture_out,
+                                   bool& swap_rb_out) const {
   for (size_t i = pending_.size(); i-- > 0;) {
     const PendingResolve& pr = pending_[i];
-    // A newer resolve covering the base that is not an exact match makes older snapshots unreliable.
-    // Newest resolve overlapping the texture range decides; only an exact match is usable.
-    if (pr.snapshot && pr.dest_base == base && pr.rw == width && pr.rh == height &&
+    // The newest resolve overlapping the texture base decides; only an exact match is usable.
+    if (pr.snapshot && pr.snap_kind == snap_kind && pr.dest_base == base && pr.rw == width && pr.rh == height &&
         ((pr.dest_pitch + 31) & ~31u) == ((pitch + 31) & ~31u) && uint32_t(pr.endian) == endian) {
       texture_out = pr.snapshot;
       swap_rb_out = pr.swap_rb;
       return true;
     }
-if (pr.extent_start <= base && base < uint64_t(pr.extent_start) + pr.extent_length) return false;
+    if (pr.extent_start <= base && base < uint64_t(pr.extent_start) + pr.extent_length) return false;
   }
   return false;
+}
+
+void GlRenderTargets::LogLookupMiss(const char* who, uint32_t base, uint32_t width, uint32_t height,
+                                    uint32_t pitch, uint32_t endian, uint32_t format, uint32_t snap_kind) const {
+  const int32_t budget = REXCVAR_GET(gl_resolve_log);
+  if (budget <= 0) return;
+  static uint32_t counts[2] = {0, 0}, none_counts[2] = {0, 0};
+  const int wi = who[0] == 'f' ? 1 : 0;
+  // Newest resolve that has this base as its destination, else the newest one covering the base.
+  const PendingResolve* match = nullptr;
+  for (size_t i = pending_.size(); i-- > 0;) {
+    if (pending_[i].dest_base == base) {
+      match = &pending_[i];
+      break;
+    }
+  }
+  if (!match) {
+    for (size_t i = pending_.size(); i-- > 0;) {
+      const PendingResolve& pr = pending_[i];
+      if (pr.extent_start <= base && base < uint64_t(pr.extent_start) + pr.extent_length) {
+        match = &pr;
+        break;
+      }
+    }
+  }
+  if (!match) {
+    // Lookups that no resolve ever targeted are the common case (ordinary textures): only a few are logged.
+    uint32_t& nn = none_counts[wi];
+    if (++nn > 3 && (nn % 4000) != 0) return;
+    uint32_t n = nn;
+    REXGPU_INFO("GL lookup miss #{} [{}]: base=0x{:08X} {}x{} pitch={} endian={} fmt={} kind={}: no pending resolve targets this base ({} pending)",
+                n, who, base, width, height, pitch, endian, format, snap_kind, pending_.size());
+    return;
+  }
+  uint32_t& cnt = counts[wi];
+  ++cnt;
+  if (cnt > uint32_t(budget) && (cnt % 1500) != 0) return;
+  const uint32_t n = cnt;
+  const PendingResolve& pr = *match;
+  REXGPU_INFO(
+      "GL lookup miss #{} [{}]: want base=0x{:08X} {}x{} pitch={}(al {}) endian={} fmt={} kind={} | resolve dest=0x{:08X} "
+      "{}x{} origin=({},{}) pitch={}(al {}) endian={} fmt={} kind={} gpu={} snapshot={} done={} age={} | mismatch:{}{}{}{}{}{}{}",
+      n, who, base, width, height, pitch, (pitch + 31) & ~31u, endian, format, snap_kind, pr.dest_base, pr.rw, pr.rh,
+      pr.ox, pr.oy, pr.dest_pitch, (pr.dest_pitch + 31) & ~31u, uint32_t(pr.endian), uint32_t(pr.dest_format),
+      pr.snap_kind, pr.gpu, pr.snapshot != 0, pr.done, int64_t(frame_) - int64_t(pr.frame),
+      pr.dest_base != base ? " base" : "", (pr.rw != width || pr.rh != height) ? " size" : "",
+      ((pr.dest_pitch + 31) & ~31u) != ((pitch + 31) & ~31u) ? " pitch" : "",
+      uint32_t(pr.endian) != endian ? " endian" : "", pr.snap_kind != snap_kind ? " kind" : "",
+      pr.snapshot == 0 ? " nosnapshot" : "", (pr.ox || pr.oy) ? " origin" : "");
 }
 
 }  // namespace rex::graphics::gl

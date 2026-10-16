@@ -78,6 +78,7 @@ bool GlSharedMemory::EnsureCapacity(uint32_t slots_needed_total) {
     if (!capacity_) {
       return false;
     }
+    if (pre_store_reset_hook_) pre_store_reset_hook_();
     glBindTexture(GL_TEXTURE_BUFFER, store_tbo_);
     glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, pt_);  // detach
     glDeleteBuffers(1, &store_);
@@ -214,6 +215,17 @@ bool GlSharedMemory::GetHostRange(uint32_t address, uint32_t length, GLuint& buf
   }
   buffer = store_;
   offset = GLintptr(page_table_[g0]) * 4 + (address & (kGranuleSize - 1));
+  return true;
+}
+
+bool GlSharedMemory::StoreOffset(uint32_t address, GLintptr& offset, uint32_t& bytes_to_granule_end) const {
+  uint32_t g = address >> kGranuleLog2;
+  if (g >= kGranuleCount || page_table_[g] == 0xFFFFFFFFu) {
+    return false;
+  }
+  uint32_t in = address & (kGranuleSize - 1);
+  offset = GLintptr(page_table_[g]) * 4 + in;
+  bytes_to_granule_end = kGranuleSize - in;
   return true;
 }
 

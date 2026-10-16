@@ -25,6 +25,10 @@ enum Counter : int {
   kResolveConvTicks, kResolveGpuHits, kResolveFrontHits,  // deferred resolve CPU conversion, GPU-copy consumers
   kSmCopyTicks,
   kSwapTicks, kSwapDetileTicks, kSwapBufTicks,
+  // flush reasons (number of resolves forced to be written to guest memory), GPU resolve statistics
+  kFlushTex, kFlushSm, kFlushFront, kFlushAge, kFlushCap, kFlushSync, kFlushOther,
+  kGpuResolves, kCpuResolves, kGpuFrontBlits, kCpuFrontFrames, kLazyDownloads, kLazyDownloadBytes, kLazyDownloadTicks,
+  kResolveSuperseded, kGpuResolveTicks,
   kCounterCount
 };
 

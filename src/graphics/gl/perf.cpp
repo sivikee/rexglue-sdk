@@ -41,7 +41,7 @@ void OnSwap() {
   double fps = g_frames / secs;
   double avg = g_frames ? Ms(g_sum_ft) / g_frames : 0.0;
   double mx = Ms(g_max_ft);
-  char l1[320], l2[320], l3[160];
+  char l1[320], l2[320], l3[160], l4[400];
   std::snprintf(l1, sizeof l1,
                 "perf: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
                 "copies=%llu (%.0f ms, readback %.0f ms)",
@@ -56,15 +56,25 @@ void OnSwap() {
                 Ms(c[kTexUploadTicks]), c[kTexHashBytes] / 1048576.0, Ms(c[kTexHashTicks]),
                 c[kSmUploadBytes] / 1048576.0, Ms(c[kSmUploadTicks]), Ms(c[kFinishTicks]));
   std::snprintf(l3, sizeof l3, "perf: sm copy %.0f ms resolve convert %.0f ms gpu-copy hits tex=%llu front=%llu", Ms(c[kSmCopyTicks]), Ms(c[kResolveConvTicks]), (unsigned long long)c[kResolveGpuHits], (unsigned long long)c[kResolveFrontHits]);
+  std::snprintf(l4, sizeof l4,
+                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu | front gpu=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
+                "flushes: tex=%llu sm=%llu front=%llu age=%llu cap=%llu sync=%llu other=%llu",
+                (unsigned long long)c[kGpuResolves], Ms(c[kGpuResolveTicks]), (unsigned long long)c[kCpuResolves],
+                (unsigned long long)c[kResolveSuperseded], (unsigned long long)c[kGpuFrontBlits],
+                (unsigned long long)c[kCpuFrontFrames], (unsigned long long)c[kLazyDownloads],
+                c[kLazyDownloadBytes] / 1048576.0, Ms(c[kLazyDownloadTicks]), (unsigned long long)c[kFlushTex],
+                (unsigned long long)c[kFlushSm], (unsigned long long)c[kFlushFront], (unsigned long long)c[kFlushAge],
+                (unsigned long long)c[kFlushCap], (unsigned long long)c[kFlushSync], (unsigned long long)c[kFlushOther]);
   REXGPU_INFO("{}", l1);
   REXGPU_INFO("{}", l2);
   REXGPU_INFO("{}", l3);
+  REXGPU_INFO("{}", l4);
   if (!g_file_tried) {
     g_file_tried = true;
     g_file = std::fopen("sdmc:/oblivion/perf.txt", "a");
   }
   if (g_file) {
-    std::fprintf(g_file, "%s\n%s\n%s\n", l1, l2, l3);
+    std::fprintf(g_file, "%s\n%s\n%s\n%s\n", l1, l2, l3, l4);
     std::fflush(g_file);
   }
   char o1[64], o2[64];

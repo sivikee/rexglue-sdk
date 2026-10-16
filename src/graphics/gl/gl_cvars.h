@@ -7,3 +7,7 @@ REXCVAR_DECLARE(bool, gl_sync_resolve);
 REXCVAR_DECLARE(bool, gl_resolve_gpu_copy);
 REXCVAR_DECLARE(int32_t, gl_resolve_max_age);
 REXCVAR_DECLARE(bool, gl_state_cache);
+REXCVAR_DECLARE(bool, gl_gpu_resolve);
+REXCVAR_DECLARE(bool, gl_gpu_front);
+REXCVAR_DECLARE(bool, gl_cpu_frontbuffer);
+REXCVAR_DECLARE(int32_t, gl_resolve_log);
