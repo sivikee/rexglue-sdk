@@ -511,6 +511,9 @@ void main() {
     return false;
   }
 
+  // Fixed GL buffers (Mesa nouveau allocates GPU memory from the newlib heap on the Switch).
+  perf::MemAdd(perf::kMemBuffers, int64_t(Impl::kUboRingSize) + (impl_->stream ? int64_t((16u + 48u) << 20) : 0));
+  impl_->pipeline_cache->WarmUpFromDisk();
   {
     const int interval = std::clamp(REXCVAR_GET(gl_swap_interval), 0, 4);
     if (interval != 1) context_.SetSwapInterval(interval);
@@ -960,6 +963,20 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   const RegisterFile& regs = *register_file_;
   ++draw_count_;
   ++frame_draws_;
+  perf::Tick();
+  perf::SetCurrentDraw(draw_count_);
+  perf::Activity draw_activity(perf::kPhDraw, draw_count_);
+  // Per-draw wall time histogram (everything the draw triggers: lookups, uploads, resolves, links).
+  struct DrawTimer {
+    uint64_t t0 = armGetSystemTick();
+    ~DrawTimer() {
+      const uint64_t dt = armGetSystemTick() - t0;
+      const uint64_t us = armTicksToNs(dt) / 1000;
+      perf::Add(us < 1000 ? perf::kDrawHist0 : us < 5000 ? perf::kDrawHist1 : us < 20000 ? perf::kDrawHist2
+                : us < 100000 ? perf::kDrawHist3 : us < 1000000 ? perf::kDrawHist4 : perf::kDrawHist5);
+      perf::Max(perf::kDrawMaxTicks, dt);
+    }
+  } draw_timer;
   auto fail = [&](const char* stage) {
     if (++draw_fail_count_ <= 20) {
       REXGPU_ERROR("GL IssueDraw #{} failed at {} (prim={}, indices={})", draw_count_, stage,
@@ -1046,8 +1063,11 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   const GlProgram* program = impl_->pipeline_cache->GetProgram(vs_translation, ps_translation);
   if (!program) {
     ++draws_skipped_;
+    perf::Add(perf::kSkippedDraws);
     return true;  // still compiling (async) or failed (logged by the pipeline cache)
   }
+  const bool first_use = !program->used;
+  program->used = true;
 
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets()) : 0;
@@ -1068,8 +1088,11 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   }
 
   dbg_log_vertex_ = (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12);
-  if (!PrepareVertexBuffers(*vertex_shader)) {
-    return fail("vertex_buffers");
+  {
+    perf::Activity act(perf::kPhVertexPrep);
+    if (!PrepareVertexBuffers(*vertex_shader)) {
+      return fail("vertex_buffers");
+    }
   }
 
   // Textures (must be bound before the system constants are written: they carry signs/swizzles).
@@ -1079,6 +1102,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   }
   const GlslShader* vs_glsl = vs_translation->glsl();
   const GlslShader* ps_glsl = ps_translation ? ps_translation->glsl() : nullptr;
+  perf::Activity bind_activity(perf::kPhBindTextures);
   impl_->texture_cache->BindStage(vs_glsl->samplers, vertex_shader->GetTextureBindingsAfterTranslation(),
                                   vertex_shader->GetSamplerBindingsAfterTranslation(), impl_->fetch_info);
   uint32_t used_texture_mask = vertex_shader->GetUsedTextureMaskAfterTranslation();
@@ -1170,6 +1194,11 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     return true;
   }
   using IBT = PrimitiveProcessor::ProcessedIndexBufferType;
+  // First draw with a program: Mesa may still build a state-dependent variant here (timed separately).
+  perf::Activity first_use_activity(first_use ? perf::kPhFirstUse : perf::kPhDraw,
+                                    uint32_t(vertex_shader->ucode_data_hash()),
+                                    pixel_shader ? uint32_t(pixel_shader->ucode_data_hash()) : 0);
+  const uint64_t first_use_t0 = first_use ? armGetSystemTick() : 0;
   if (ppr.index_buffer_type == IBT::kNone) {
     glDrawArrays(mode, 0, GLsizei(ppr.host_draw_vertex_count));
   } else {
@@ -1204,6 +1233,10 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
                    ppr.host_index_format == xenos::IndexFormat::kInt16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
                    reinterpret_cast<const void*>(offset));
   }
+  if (first_use) {
+    perf::Add(perf::kFirstUseDraws);
+    perf::Add(perf::kFirstUseTicks, armGetSystemTick() - first_use_t0);
+  }
   if (log_this) {
     float px[4] = {-1, -1, -1, -1};
     glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -1225,6 +1258,8 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
 }
 
 bool GlCommandProcessor::IssueCopy() {
+  perf::Tick();
+  perf::Activity copy_activity(perf::kPhCopy);
   perf::Add(perf::kCopies);
   perf::Scope perf_copy_scope(perf::kCopyTicks);
   uint32_t start = 0, length = 0;
@@ -1322,6 +1357,7 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
 void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                    uint32_t frontbuffer_height) {
   ++swap_count_;
+  perf::Activity swap_activity(perf::kPhSwap, swap_count_);
   perf::OnSwap();
   perf::Scope perf_swap_scope(perf::kSwapTicks);
   // Sub-step timing: each step() adds the wall time since the previous step to a counter.

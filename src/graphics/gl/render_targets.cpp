@@ -185,6 +185,7 @@ GlRenderTargets::ColorTarget* GlRenderTargets::GetColorTarget(uint32_t base,
     glTexStorage2D(GL_TEXTURE_2D, 1, t.internal_format, width, height);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    perf::MemAdd(perf::kMemRenderTargets, int64_t(width) * height * (t.internal_format == GL_RGBA16F || t.internal_format == GL_RG32F ? 8 : 4));
     REXGPU_INFO("GL RT: created color target base={} fmt={} {}x{}", base, uint32_t(format), width, height);
     return &t;
   }
@@ -201,6 +202,8 @@ GlRenderTargets::ColorTarget* GlRenderTargets::GetColorTarget(uint32_t base,
                        t.height, 1);
     InvalidateFramebuffersUsing(t.texture);
     glDeleteTextures(1, &t.texture);
+    perf::MemAdd(perf::kMemRenderTargets, (int64_t(new_w) * new_h - int64_t(t.width) * t.height) *
+                                              (t.internal_format == GL_RGBA16F || t.internal_format == GL_RG32F ? 8 : 4));
     REXGPU_INFO("GL RT: grew color target base={} {}x{} -> {}x{}", base, t.width, t.height, new_w, new_h);
     t.texture = tex;
     t.width = new_w;
@@ -225,6 +228,7 @@ GlRenderTargets::DepthTarget* GlRenderTargets::GetDepthTarget(uint32_t base, uin
     glGenTextures(1, &t.texture);
     glBindTexture(GL_TEXTURE_2D, t.texture);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, width, height);
+    perf::MemAdd(perf::kMemRenderTargets, int64_t(width) * height * 4);
     REXGPU_INFO("GL RT: created depth target base={} {}x{}", base, width, height);
     return &t;
   }
@@ -460,6 +464,7 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
             glGenTextures(1, &pr.snapshot);
             glBindTexture(GL_TEXTURE_2D_ARRAY, pr.snapshot);
             glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, pr.snapshot_format, rw, rh, 1);
+            perf::MemAdd(perf::kMemSnapshots, int64_t(rw) * rh * (pr.snapshot_format == GL_RGBA16F ? 8 : 4));
             glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0);
             glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
           }
@@ -761,6 +766,8 @@ void GlRenderTargets::ReleaseSnapshot(PendingResolve& pr) {
     free_snapshots_.push_back({pr.snapshot, pr.snapshot_w, pr.snapshot_h, pr.snapshot_format});
     pr.snapshot = 0;
     while (free_snapshots_.size() > 6) {
+      perf::MemAdd(perf::kMemSnapshots, -int64_t(free_snapshots_.front().w) * free_snapshots_.front().h *
+                                            (free_snapshots_.front().format == GL_RGBA16F ? 8 : 4));
       glDeleteTextures(1, &free_snapshots_.front().texture);
       free_snapshots_.erase(free_snapshots_.begin());
     }
@@ -1116,6 +1123,7 @@ void GlRenderTargets::FinishGpuDownload(PendingResolve& pr) {
   }
   const void* data = nullptr;
   {
+    perf::Activity act(perf::kPhFlushWait, pr.extent_start, pr.extent_length);
     perf::Scope perf_readback_scope(perf::kReadbackTicks);
     perf::FenceWaitLogged(pr.fence, "resolve write-back");
     glBindBuffer(GL_COPY_WRITE_BUFFER, pr.pbo);
@@ -1225,6 +1233,7 @@ void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
   }
   const void* data = nullptr;
   {
+    perf::Activity act(perf::kPhFlushWait, pr.extent_start, pr.extent_length);
     perf::Scope perf_readback_scope(perf::kReadbackTicks);
     perf::FenceWaitLogged(pr.fence, "resolve readback");
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);

@@ -16,6 +16,7 @@ bool GlSharedMemory::Initialize() {
   InitializeCommon();
   if (REXCVAR_GET(gl_stream_uploads)) {
     if (!staging_.Initialize(32u << 20, 16, GL_COPY_READ_BUFFER, true)) staging_.Shutdown();
+    if (staging_.valid()) perf::MemAdd(perf::kMemBuffers, int64_t(32u << 20));
   }
   InitializeSparseHostGpuMemory(kGranuleLog2);
   std::fill(std::begin(page_table_), std::end(page_table_), 0xFFFFFFFFu);
@@ -56,6 +57,7 @@ bool GlSharedMemory::EnsureCapacity(uint32_t slots_needed_total) {
   if (need <= capacity_) {
     return true;
   }
+  perf::Activity act(perf::kPhStoreGrow, uint32_t(need >> 20), capacity_ >> 20);
   uint32_t new_cap = uint32_t((need + kGrowStep - 1) / kGrowStep * kGrowStep);
   auto alloc = [&](GLuint& out) -> bool {
     glGenBuffers(1, &out);
@@ -100,6 +102,7 @@ bool GlSharedMemory::EnsureCapacity(uint32_t slots_needed_total) {
     glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, capacity_);
     glDeleteBuffers(1, &store_);
   }
+  perf::MemAdd(perf::kMemBuffers, int64_t(new_cap) - int64_t(copied ? capacity_ : 0));
   store_ = nb;
   capacity_ = new_cap;
   glBindTexture(GL_TEXTURE_BUFFER, store_tbo_);
@@ -136,6 +139,8 @@ bool GlSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocation
 
 bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   perf::Scope perf_sm_scope(perf::kSmUploadTicks);
+  perf::Activity act(perf::kPhSmUpload, upload_page_ranges.empty() ? 0 : upload_page_ranges.front().first << page_size_log2(),
+                     uint32_t(upload_page_ranges.size()));
   const bool staged = staging_.valid();
   uint8_t* block = nullptr;  // current staging block
   uint32_t block_off = 0, block_used = 0, block_cap = 0;

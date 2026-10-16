@@ -259,6 +259,10 @@ void FenceWaitLogged(void* sync, const char* who) {
   }
 }
 
+namespace {
+void Report(uint64_t now, bool swapless);
+}  // namespace
+
 void OnSwap() {
   uint64_t now = armGetSystemTick();
   if (g_last_swap) {
@@ -278,9 +282,21 @@ void OnSwap() {
     g_last_vdswaps = g_switch_vdswap_count.load(std::memory_order_relaxed);
     return;
   }
-  uint64_t elapsed = now - g_last_report;
-  if (armTicksToNs(elapsed) < 1000000000ull) return;
+  if (armTicksToNs(now - g_last_report) < 1000000000ull) return;
+  Report(now, false);
+}
 
+void Tick() {
+  if (!g_last_report) return;  // the first swap starts the report clock
+  const uint64_t now = armGetSystemTick();
+  // Only when the swap-driven report is late (no swap for over a second): the frame is stalled.
+  if (armTicksToNs(now - g_last_report) < 1100000000ull) return;
+  Report(now, true);
+}
+
+namespace {
+void Report(uint64_t now, bool swapless) {
+  const uint64_t elapsed = now - g_last_report;
   uint64_t c[kCounterCount];
   for (int i = 0; i < kCounterCount; ++i) c[i] = g_counters[i].exchange(0, std::memory_order_relaxed);
   const uint64_t cp_idle = g_switch_cp_idle_ticks.exchange(0, std::memory_order_relaxed);
@@ -298,11 +314,11 @@ void OnSwap() {
   double fps = g_frames / secs;
   double avg = g_frames ? Ms(g_sum_ft) / g_frames : 0.0;
   double mx = Ms(g_max_ft);
-  char l1[320], l2[320], l3[160], l4[480], l5[480], l6[560];
+  char l1[360], l2[320], l3[160], l4[480], l5[480], l6[560], l7[640];
   std::snprintf(l1, sizeof l1,
-                "perf: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
+                "perf%s: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
                 "copies=%llu (%.0f ms, readback %.0f ms)",
-                fps, avg, mx, Ms(c[kSwapTicks]), Ms(c[kSwapBufTicks]), Ms(c[kSwapDetileTicks]),
+                swapless ? " (NO SWAP for >1 s, frame stalled)" : "", fps, avg, mx, Ms(c[kSwapTicks]), Ms(c[kSwapBufTicks]), Ms(c[kSwapDetileTicks]),
                 (unsigned long long)c[kDraws], Ms(c[kDrawTicks]), Ms(c[kConstUpTicks]), Ms(c[kDrawTicks]) - Ms(c[kConstUpTicks]) - Ms(c[kTexUploadTicks]) - Ms(c[kSmUploadTicks]), (unsigned long long)c[kCopies], Ms(c[kCopyTicks]),
                 Ms(c[kReadbackTicks]));
   std::snprintf(l2, sizeof l2,
@@ -356,18 +372,27 @@ void OnSwap() {
                   g_fl_n ? double(g_fl_sum) / g_fl_n / 1e6 : 0.0, double(g_fl_max) / 1e6,
                   g_inflight_n ? double(g_inflight_sum) / g_inflight_n : 0.0);
   }
+  std::snprintf(l7, sizeof l7,
+                "perf: draw cost hist <1ms=%llu <5=%llu <20=%llu <100=%llu <1s=%llu >=1s=%llu max %.0f ms | first-use draws %llu (%.0f ms) | "
+                "skipped (program not ready) %llu | compile thread: links %llu (%.0f ms) | %s",
+                (unsigned long long)c[kDrawHist0], (unsigned long long)c[kDrawHist1], (unsigned long long)c[kDrawHist2],
+                (unsigned long long)c[kDrawHist3], (unsigned long long)c[kDrawHist4], (unsigned long long)c[kDrawHist5],
+                Ms(c[kDrawMaxTicks]), (unsigned long long)c[kFirstUseDraws], Ms(c[kFirstUseTicks]),
+                (unsigned long long)c[kSkippedDraws], (unsigned long long)c[kWLinkCount], Ms(c[kWLinkTicks]),
+                ActivityString().c_str());
   REXGPU_INFO("{}", l1);
   REXGPU_INFO("{}", l2);
   REXGPU_INFO("{}", l3);
   REXGPU_INFO("{}", l4);
   REXGPU_INFO("{}", l5);
   REXGPU_INFO("{}", l6);
+  REXGPU_INFO("{}", l7);
   if (!g_file_tried) {
     g_file_tried = true;
     g_file = std::fopen("sdmc:/oblivion/perf.txt", "a");
   }
   if (g_file) {
-    std::fprintf(g_file, "%s\n%s\n%s\n%s\n%s\n%s\n", l1, l2, l3, l4, l5, l6);
+    std::fprintf(g_file, "%s\n%s\n%s\n%s\n%s\n%s\n%s\n", l1, l2, l3, l4, l5, l6, l7);
     std::fflush(g_file);
   }
   char o1[64], o2[64], o3[80];
@@ -405,6 +430,91 @@ void OnSwap() {
   g_inflight_sum = g_inflight_n = 0;
   g_stamp_fail = 0;
   g_report_ticks = armGetSystemTick() - report_t0;
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------------------------
+// Current activity (written by the GPU / compile threads, read by the heartbeat thread)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+std::atomic<uint32_t> g_ph{kPhIdle}, g_ph_d0{0}, g_ph_d1{0}, g_draw_index{0};
+std::atomic<uint64_t> g_ph_t0{0};
+std::atomic<uint32_t> g_wph{kWIdle}, g_wq_urgent{0}, g_wq_warm{0};
+std::atomic<uint64_t> g_wph_t0{0}, g_wph_a{0}, g_wph_b{0};
+std::atomic<uint32_t> g_slow_logged{0};
+const char* const kPhaseNames[kPhCount] = {"idle", "draw", "copy/resolve", "swap", "LINK (sync, GPU thread)",
+                                           "first draw with a new program", "texture hash", "texture upload",
+                                           "shared memory upload", "vertex buffers", "resolve", "flush wait",
+                                           "store grow", "program lookup", "bind textures"};
+const char* const kWorkerNames[kWCount] = {"idle", "translate", "compile+link", "warm-up load"};
+}  // namespace
+
+Activity::Activity(Phase phase, uint32_t d0, uint32_t d1) {
+  prev_phase_ = g_ph.load(std::memory_order_relaxed);
+  prev_d0_ = g_ph_d0.load(std::memory_order_relaxed);
+  prev_d1_ = g_ph_d1.load(std::memory_order_relaxed);
+  prev_t0_ = g_ph_t0.load(std::memory_order_relaxed);
+  t0_ = armGetSystemTick();
+  g_ph_d0.store(d0, std::memory_order_relaxed);
+  g_ph_d1.store(d1, std::memory_order_relaxed);
+  g_ph_t0.store(t0_, std::memory_order_relaxed);
+  g_ph.store(phase, std::memory_order_release);
+}
+
+Activity::~Activity() {
+  const uint32_t phase = g_ph.load(std::memory_order_relaxed);
+  const uint64_t dt = armGetSystemTick() - t0_;
+  if (armTicksToNs(dt) >= 2000000000ull && phase != kPhIdle && g_slow_logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+    REXGPU_WARN("GL slow: {} took {:.2f} s (detail {:08X} {:08X}, draw #{})", kPhaseNames[phase < kPhCount ? phase : 0],
+                Ms(dt) / 1000.0, g_ph_d0.load(), g_ph_d1.load(), g_draw_index.load());
+  }
+  g_ph_d0.store(prev_d0_, std::memory_order_relaxed);
+  g_ph_d1.store(prev_d1_, std::memory_order_relaxed);
+  g_ph_t0.store(prev_t0_, std::memory_order_relaxed);
+  g_ph.store(prev_phase_, std::memory_order_release);
+}
+
+void SetCurrentDraw(uint32_t draw_index) { g_draw_index.store(draw_index, std::memory_order_relaxed); }
+
+void SetWorkerActivity(WorkerPhase phase, uint64_t a, uint64_t b) {
+  g_wph_a.store(a, std::memory_order_relaxed);
+  g_wph_b.store(b, std::memory_order_relaxed);
+  g_wph_t0.store(armGetSystemTick(), std::memory_order_relaxed);
+  g_wph.store(phase, std::memory_order_release);
+}
+
+void SetWorkerQueue(uint32_t urgent, uint32_t warm) {
+  g_wq_urgent.store(urgent, std::memory_order_relaxed);
+  g_wq_warm.store(warm, std::memory_order_relaxed);
+}
+
+std::string ActivityString() {
+  const uint64_t now = armGetSystemTick();
+  const uint32_t ph = g_ph.load(std::memory_order_acquire);
+  const uint64_t t0 = g_ph_t0.load(std::memory_order_relaxed);
+  const uint32_t wph = g_wph.load(std::memory_order_acquire);
+  const uint64_t wt0 = g_wph_t0.load(std::memory_order_relaxed);
+  char buf[400];
+  std::snprintf(buf, sizeof buf,
+                "now: gpu thread %s for %.0f ms (detail %08X %08X) draw #%u | compile thread %s for %.0f ms "
+                "(%016llX %016llX) queue urgent=%u warm=%u",
+                kPhaseNames[ph < kPhCount ? ph : 0], t0 && ph != kPhIdle ? Ms(now - t0) : 0.0, g_ph_d0.load(),
+                g_ph_d1.load(), g_draw_index.load(), kWorkerNames[wph < kWCount ? wph : 0],
+                wt0 && wph != kWIdle ? Ms(now - wt0) : 0.0, (unsigned long long)g_wph_a.load(),
+                (unsigned long long)g_wph_b.load(), g_wq_urgent.load(), g_wq_warm.load());
+  return buf;
+}
+
+std::string MemoryString() {
+  char buf[240];
+  std::snprintf(buf, sizeof buf,
+                "GL memory (approx): textures %.1f MiB, render targets %.1f MiB, resolve snapshots %.1f MiB, buffers %.1f MiB, "
+                "linked programs %lld",
+                double(g_mem[kMemTextures].load()) / 1048576.0, double(g_mem[kMemRenderTargets].load()) / 1048576.0,
+                double(g_mem[kMemSnapshots].load()) / 1048576.0, double(g_mem[kMemBuffers].load()) / 1048576.0,
+                (long long)g_mem[kMemPrograms].load());
+  return buf;
 }
 
 }  // namespace rex::graphics::gl::perf

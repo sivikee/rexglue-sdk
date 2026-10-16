@@ -278,6 +278,7 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     h ^= XXH3_64bits(memory_.TranslatePhysical(address), size) + 0x9E3779B97F4A7C15ull + (h << 6);
   };
   {
+    perf::Activity act(perf::kPhTexHash, info.memory.base_address, info.memory.base_size);
     perf::Scope perf_hash_scope(perf::kTexHashTicks);
     hash_range(info.memory.base_address, info.memory.base_size);
     if (info.mip_max_level > 0) {
@@ -297,6 +298,9 @@ bool GlTextureCache::Upload(Texture& t) {
   perf::Add(perf::kTexUploads);
   perf::Scope perf_upload_scope(perf::kTexUploadTicks);
   const TextureInfo& info = t.info;
+  // detail: base address, (width << 16 | height) of level 0; format in the top byte of the height half.
+  perf::Activity act(perf::kPhTexUpload, info.memory.base_address,
+                     ((info.width + 1) << 16) | ((info.height + 1) & 0xFFF) | (uint32_t(info.format) << 12));
   HostFormat hf;
   xenos::TextureFormat base_format = GetBaseFormat(info.format);
   if (!GetHostFormat(base_format, hf)) {
@@ -318,6 +322,13 @@ bool GlTextureCache::Upload(Texture& t) {
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, levels - 1);
     t.host_swizzle = hf.swizzle;
+    {
+      // Approximate GPU memory (newlib heap on the Switch): level 0 * 4/3 for mip chains.
+      uint64_t bytes = uint64_t(w) * h * hf.out_bytes_per_block;
+      if (hf.compressed) bytes /= 16;
+      if (levels > 1) bytes = bytes * 4 / 3;
+      perf::MemAdd(perf::kMemTextures, int64_t(bytes));
+    }
   } else {
     glBindTexture(GL_TEXTURE_2D_ARRAY, t.id);
   }

@@ -73,6 +73,7 @@ struct State {
   int fault_commits = 0;
   size_t total_units = 0;
   int protect_logged = 0;
+  size_t used_units = 0, peak_units = 0;  // pool units committed now / at most (diagnostics)
 };
 
 State& S() {
@@ -185,6 +186,8 @@ bool CommitRun(State& s, int win, size_t first, size_t count) {
   for (size_t k = 0; k < count; ++k) {
     s.pool_of[first + k] = static_cast<int32_t>(static_cast<size_t>(p) + k);
   }
+  s.used_units += count;
+  if (s.used_units > s.peak_units) s.peak_units = s.used_units;
   return true;
 }
 
@@ -255,6 +258,7 @@ void DecommitLocked(State& s, void* addr, size_t length) {
       svcUnmapMemory(reinterpret_cast<void*>(ua), src, kUnit);
       s.pool_used[static_cast<size_t>(s.pool_of[u])] = false;
       s.pool_of[u] = -1;
+      if (s.used_units) --s.used_units;
     } else {
       std::memset(reinterpret_cast<void*>(zs), 0, ze - zs);
     }
@@ -272,6 +276,27 @@ size_t allocation_granularity() {
 
 bool IsWritableExecutableMemorySupported() {
   return false;
+}
+
+// Pool usage for the app heartbeat: bytes committed now / peak / pool size, and committed bytes per window
+// (0 = 0x40000000 virtual, 1 = 0xA0000000 physical).
+void SwitchGuestPoolStats(size_t* used, size_t* peak, size_t* total, size_t* win0, size_t* win1) {
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (used) *used = s.used_units * kUnit;
+  if (peak) *peak = s.peak_units * kUnit;
+  if (total) *total = s.pool_units * kUnit;
+  size_t w[2] = {0, 0};
+  if (s.arena_ready) {
+    for (int i = 0; i < kWindowCount && i < 2; ++i) {
+      const size_t first = g_windows[i].first_unit, n = g_windows[i].size / kUnit;
+      for (size_t u = first; u < first + n && u < s.pool_of.size(); ++u) {
+        if (s.pool_of[u] >= 0) ++w[i];
+      }
+    }
+  }
+  if (win0) *win0 = w[0] * kUnit;
+  if (win1) *win1 = w[1] * kUnit;
 }
 
 void SwitchSetGuestPool(void* pool, size_t size) {
