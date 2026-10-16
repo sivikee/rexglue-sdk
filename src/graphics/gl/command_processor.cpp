@@ -1359,6 +1359,7 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   ++swap_count_;
   perf::Activity swap_activity(perf::kPhSwap, swap_count_);
   perf::OnSwap();
+  if (impl_->pipeline_cache) impl_->pipeline_cache->OnFrame();
   perf::Scope perf_swap_scope(perf::kSwapTicks);
   // Sub-step timing: each step() adds the wall time since the previous step to a counter.
   const uint64_t swap_cpu0 = perf::ThreadCpuTicks();

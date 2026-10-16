@@ -41,8 +41,10 @@ struct GlProgram {
   std::atomic<int> state{kQueued};
   GLuint vs_id = 0, fs_id = 0;
   GLint sm_base_location = -1;  // xe_sm_base[4] uniform (shared memory window bases), -1 if unused
-  GLsync fence = nullptr;
+  GLsync fence = nullptr;  // null = handed over without a fence (see gl_link_fence)
   std::chrono::steady_clock::time_point link_start;
+  std::chrono::steady_clock::time_point request_time;   // first draw that wanted it (urgent); guarded by mutex_
+  std::chrono::steady_clock::time_point worker_linked;  // when the compile thread finished linking it
   GlShader::GlTranslation* vertex = nullptr;
   GlShader::GlTranslation* pixel = nullptr;
   // Guarded by GlPipelineCache::mutex_.
@@ -84,6 +86,8 @@ class GlPipelineCache {
 
   uint32_t translated_shader_count() const { return translated_count_.load(); }
   uint32_t pending_programs() const { return pending_.load(); }
+  // GPU thread, once per presented frame: refills the per-frame budget of deadline sync links.
+  void OnFrame() { deadline_budget_ = 1; }
   bool links_on_worker() const { return link_on_worker_.load(); }
 
  private:
@@ -114,6 +118,13 @@ class GlPipelineCache {
   static void WorkerThunk(void* self);
   void EnqueueLocked(GlProgram& program, bool urgent);
   bool WarmLinkAllowed();
+  // GPU thread: stop linking on the compile thread (it only translates from now on); logs why.
+  void FallBackToGpuThreadLinking(const char* why);
+  // GPU thread, mutex_ held by `lock`: links a translated (or not yet translated) program on the GPU thread because a
+  // draw has waited longer than gl_program_max_wait_ms for it. Returns the program if it is now ready.
+  const GlProgram* DeadlineLinkLocked(GlProgram& p, std::unique_lock<std::mutex>& lock, double waited_ms);
+  // GPU thread: checks the compile thread's progress (gl_link_thread_watchdog_ms) after a not-ready lookup.
+  void CheckWorkerWatchdog();
 
   // Persistent program list.
   void RecordProgram(const GlProgram& program);
@@ -124,6 +135,27 @@ class GlPipelineCache {
   void* worker_context_ = nullptr;
   std::atomic<bool> link_on_worker_{false};
   int validate_left_ = 8;  // GPU thread: first worker-linked programs are checked on the GPU thread's context
+  // Share-group probe: objects created on the GPU thread's context that the compile thread looks up on its shared
+  // context at start-up (eglCreateContext's share_context is not guaranteed to be honoured by every EGL platform).
+  GLuint probe_buffer_ = 0, probe_program_ = 0;
+  GLsync probe_sync_ = nullptr;
+  std::atomic<bool> fence_handover_{true};      // hand over with a GL fence (cleared if syncs are not shared)
+  std::atomic<bool> worker_programs_usable_{false};  // share probe passed and no validation failure
+  std::atomic<bool> worker_started_{false};     // the compile thread finished its start-up (context + probe)
+  std::atomic<uint32_t> worker_links_done_{0};  // successful links on the compile thread
+  std::atomic<bool> worker_in_link_{false};     // the compile thread is inside glCompileShader / glLinkProgram
+  std::atomic<uint32_t> worker_urgent_links_{0};  // ... of programs a draw had asked for
+  std::mutex translate_mutex_;                  // translator_ + GlTranslation translation/GLSL (both threads)
+  // GPU thread only.
+  uint32_t handovers_ = 0;
+  bool waiting_ = false;                        // a draw has been skipped since the last handover
+  std::chrono::steady_clock::time_point first_wait_;
+  int deadline_budget_ = 1;
+  std::chrono::steady_clock::time_point last_deadline_link_;
+  uint32_t deadline_links_ = 0;
+  bool fence_problem_logged_ = false;
+  bool first_link_seen_set_ = false;
+  std::chrono::steady_clock::time_point first_link_seen_;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<GlProgram*> urgent_, warm_;

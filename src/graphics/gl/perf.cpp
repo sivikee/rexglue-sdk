@@ -314,7 +314,7 @@ void Report(uint64_t now, bool swapless) {
   double fps = g_frames / secs;
   double avg = g_frames ? Ms(g_sum_ft) / g_frames : 0.0;
   double mx = Ms(g_max_ft);
-  char l1[360], l2[320], l3[160], l4[480], l5[480], l6[560], l7[640];
+  char l1[360], l2[320], l3[160], l4[480], l5[480], l6[560], l7[800];
   std::snprintf(l1, sizeof l1,
                 "perf%s: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
                 "copies=%llu (%.0f ms, readback %.0f ms)",
@@ -374,11 +374,12 @@ void Report(uint64_t now, bool swapless) {
   }
   std::snprintf(l7, sizeof l7,
                 "perf: draw cost hist <1ms=%llu <5=%llu <20=%llu <100=%llu <1s=%llu >=1s=%llu max %.0f ms | first-use draws %llu (%.0f ms) | "
-                "skipped (program not ready) %llu | compile thread: links %llu (%.0f ms) | %s",
+                "skipped (program not ready) %llu | compile thread: links %llu (%.0f ms) handed over %llu | deadline sync links %llu (%.0f ms) | %s",
                 (unsigned long long)c[kDrawHist0], (unsigned long long)c[kDrawHist1], (unsigned long long)c[kDrawHist2],
                 (unsigned long long)c[kDrawHist3], (unsigned long long)c[kDrawHist4], (unsigned long long)c[kDrawHist5],
                 Ms(c[kDrawMaxTicks]), (unsigned long long)c[kFirstUseDraws], Ms(c[kFirstUseTicks]),
                 (unsigned long long)c[kSkippedDraws], (unsigned long long)c[kWLinkCount], Ms(c[kWLinkTicks]),
+                (unsigned long long)c[kHandoverCount], (unsigned long long)c[kDeadlineLinkCount], Ms(c[kDeadlineLinkTicks]),
                 ActivityString().c_str());
   REXGPU_INFO("{}", l1);
   REXGPU_INFO("{}", l2);

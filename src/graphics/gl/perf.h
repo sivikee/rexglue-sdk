@@ -42,6 +42,8 @@ enum Counter : int {
   kFirstUseDraws, kFirstUseTicks,  // draws that used a program for the first time (Mesa may compile a variant)
   kWLinkCount, kWLinkTicks,        // compile + link done on the compile thread (shared context), not blocking draws
   kSkippedDraws,                   // draws skipped because their program was not ready yet
+  kHandoverCount,                  // compile-thread programs that became usable on the GPU thread
+  kDeadlineLinkCount, kDeadlineLinkTicks,  // programs linked on the GPU thread after waiting > gl_program_max_wait_ms
   kCounterCount
 };
 

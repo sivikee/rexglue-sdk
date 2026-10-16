@@ -60,6 +60,9 @@ bool GlSharedMemory::EnsureCapacity(uint32_t slots_needed_total) {
   perf::Activity act(perf::kPhStoreGrow, uint32_t(need >> 20), capacity_ >> 20);
   uint32_t new_cap = uint32_t((need + kGrowStep - 1) / kGrowStep * kGrowStep);
   auto alloc = [&](GLuint& out) -> bool {
+    // Clear errors left by earlier calls so they are not attributed to this allocation.
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {
+    }
     glGenBuffers(1, &out);
     glBindBuffer(GL_COPY_WRITE_BUFFER, out);
     glBufferData(GL_COPY_WRITE_BUFFER, new_cap, nullptr, GL_DYNAMIC_DRAW);
