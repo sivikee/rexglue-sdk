@@ -8,7 +8,12 @@
 #include <glad/glad.h>
 #include <switch.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(gl_egl_depth_stencil, false, "GPU",
+                    "GL backend: request depth 24 / stencil 8 for the EGL window surface (the default framebuffer is only "
+                    "cleared and blitted to; render targets are FBOs)");
 
 namespace rex::graphics::gl {
 
@@ -45,10 +50,13 @@ bool GlContext::Initialize() {
     REXGPU_ERROR("GL: eglBindAPI(OPENGL) failed ({:x})", eglGetError());
     return false;
   }
-  static const EGLint fb[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_RED_SIZE,     8,
-                              EGL_GREEN_SIZE,      8,               EGL_BLUE_SIZE,    8,
-                              EGL_ALPHA_SIZE,      8,               EGL_DEPTH_SIZE,   24,
-                              EGL_STENCIL_SIZE,    8,               EGL_NONE};
+  const bool want_ds = REXCVAR_GET(gl_egl_depth_stencil);
+  const EGLint fb[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                       EGL_RED_SIZE,        8,              EGL_GREEN_SIZE,   8,
+                       EGL_BLUE_SIZE,       8,              EGL_ALPHA_SIZE,   8,
+                       EGL_DEPTH_SIZE,      want_ds ? 24 : 0, EGL_STENCIL_SIZE, want_ds ? 8 : 0,
+                       EGL_SAMPLE_BUFFERS,  0,              EGL_SAMPLES,      0,
+                       EGL_NONE};
   GLBL("gl: eglChooseConfig");
   EGLConfig config;
   EGLint num = 0;
@@ -56,6 +64,19 @@ bool GlContext::Initialize() {
   if (!num) {
     REXGPU_ERROR("GL: no EGL config ({:x})", eglGetError());
     return false;
+  }
+  {
+    EGLint r = 0, g = 0, b = 0, a = 0, d = 0, st = 0, sm = 0, vid = 0;
+    eglGetConfigAttrib(display, config, EGL_RED_SIZE, &r);
+    eglGetConfigAttrib(display, config, EGL_GREEN_SIZE, &g);
+    eglGetConfigAttrib(display, config, EGL_BLUE_SIZE, &b);
+    eglGetConfigAttrib(display, config, EGL_ALPHA_SIZE, &a);
+    eglGetConfigAttrib(display, config, EGL_DEPTH_SIZE, &d);
+    eglGetConfigAttrib(display, config, EGL_STENCIL_SIZE, &st);
+    eglGetConfigAttrib(display, config, EGL_SAMPLES, &sm);
+    eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &vid);
+    GLBL("gl: EGL config rgba=%d%d%d%d depth=%d stencil=%d samples=%d visual=0x%x (depth/stencil requested: %d)", r, g, b,
+         a, d, st, sm, vid, int(want_ds));
   }
   GLBL("gl: eglCreateWindowSurface");
   EGLSurface surface = eglCreateWindowSurface(display, config, nwindowGetDefault(), nullptr);

@@ -786,9 +786,17 @@ constexpr int kGpuKind16161616F = 3; // 16_16_16_16_FLOAT (64 bpp)
 constexpr int kGpuKind32F = 4;       // 32_FLOAT
 constexpr int kGpuKind3232F = 5;     // 32_32_FLOAT (64 bpp)
 
-const char* kResolveCs = R"(#version 430 core
+// Body of the resolve compute shader; prefixed with "#version" and optionally "#define SRC_ARRAY" (source is a
+// GL_TEXTURE_2D_ARRAY resolve snapshot, layer 0, instead of the 2D render target).
+const char* kResolveCs = R"(
 layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef SRC_ARRAY
+layout(binding = 0) uniform sampler2DArray src;
+#define SRC_FETCH(q) texelFetch(src, ivec3(q, 0), 0)
+#else
 layout(binding = 0) uniform sampler2D src;
+#define SRC_FETCH(q) texelFetch(src, q, 0)
+#endif
 layout(std430, binding = 0) buffer StoreBuf { uint data[]; } sm;
 layout(std430, binding = 1) readonly buffer PtBuf { uint pt[]; };
 uniform ivec4 u_src;   // source rect x0, y0, width, height
@@ -814,7 +822,7 @@ uint swapw(uint v, int e) {
 void main() {
   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
   if (p.x >= u_src.z || p.y >= u_src.w) return;
-  vec4 c = texelFetch(src, u_src.xy + p, 0);
+  vec4 c = SRC_FETCH(u_src.xy + p);
   if (u_fmt.z != 0) c = c.bgra;
   uint addr = u_base + tiled(uint(u_dst.x + p.x), uint(u_dst.y + p.y), uint(u_dst.z), uint(u_dst.w));
   uint slot = pt[addr >> 20];
@@ -880,18 +888,20 @@ int GpuKindFor(xenos::TextureFormat dest_format, uint32_t bpp) {
 
 }  // namespace
 
-bool GlRenderTargets::CreateGpuResolveProgram() {
+namespace {
+GLuint CompileResolveProgram(bool src_array) {
   GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
-  glShaderSource(cs, 1, &kResolveCs, nullptr);
+  const char* parts[2] = {src_array ? "#version 430 core\n#define SRC_ARRAY 1\n" : "#version 430 core\n", kResolveCs};
+  glShaderSource(cs, 2, parts, nullptr);
   glCompileShader(cs);
   GLint ok = 0;
   glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
   if (!ok) {
     char log[2048];
     glGetShaderInfoLog(cs, sizeof(log), nullptr, log);
-    REXGPU_ERROR("GL RT: resolve compute shader compile failed: {}", log);
+    REXGPU_ERROR("GL RT: resolve compute shader (array={}) compile failed: {}", src_array, log);
     glDeleteShader(cs);
-    return false;
+    return 0;
   }
   GLuint prog = glCreateProgram();
   glAttachShader(prog, cs);
@@ -901,16 +911,31 @@ bool GlRenderTargets::CreateGpuResolveProgram() {
   if (!ok) {
     char log[2048];
     glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
-    REXGPU_ERROR("GL RT: resolve compute shader link failed: {}", log);
+    REXGPU_ERROR("GL RT: resolve compute shader (array={}) link failed: {}", src_array, log);
     glDeleteProgram(prog);
-    return false;
+    return 0;
   }
+  return prog;
+}
+}  // namespace
+
+bool GlRenderTargets::CreateGpuResolveProgram() {
+  GLuint prog = CompileResolveProgram(false);
+  if (!prog) return false;
   gpu_prog_ = prog;
   u_src_ = glGetUniformLocation(prog, "u_src");
   u_dst_ = glGetUniformLocation(prog, "u_dst");
   u_base_ = glGetUniformLocation(prog, "u_base");
   u_fmt_ = glGetUniformLocation(prog, "u_fmt");
-  REXGPU_INFO("GL RT: GPU resolve compute shader ready");
+  gpu_prog_array_ = CompileResolveProgram(true);
+  if (gpu_prog_array_) {
+    ua_src_ = glGetUniformLocation(gpu_prog_array_, "u_src");
+    ua_dst_ = glGetUniformLocation(gpu_prog_array_, "u_dst");
+    ua_base_ = glGetUniformLocation(gpu_prog_array_, "u_base");
+    ua_fmt_ = glGetUniformLocation(gpu_prog_array_, "u_fmt");
+  }
+  REXGPU_INFO("GL RT: GPU resolve compute shader ready (snapshot variant {}, lazy resolves {})",
+              gpu_prog_array_ ? "ready" : "FAILED", gpu_prog_array_ && REXCVAR_GET(gl_lazy_resolve) ? "on" : "off");
   return true;
 }
 
@@ -930,57 +955,114 @@ bool GlRenderTargets::GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x
   if (!sm_->store_buffer()) {
     return false;
   }
+  pr.gpu_kind = kind;
+  const bool lazy = pr.snap_kind && gpu_prog_array_ && REXCVAR_GET(gl_lazy_resolve);
+  const uint32_t new_pitch = (pr.dest_pitch + 31) & ~31u;
+  // Older resolves whose image is completely overwritten by this one never need to be written back (or, when
+  // lazy, never written into the store at all). Older lazy ones that overlap only partially must reach the store
+  // before this one does.
+  const uint64_t ns = pr.extent_start, ne = ns + pr.extent_length;
+  for (PendingResolve& o : pending_) {
+    if (!o.gpu || o.done || o.dl_started) continue;
+    const bool covered = o.dest_base == pr.dest_base && ((o.dest_pitch + 31) & ~31u) == new_pitch &&
+                         o.bpp == pr.bpp && o.ox >= pr.ox && o.oy >= pr.oy && o.ox + o.rw <= pr.ox + pr.rw &&
+                         o.oy + o.rh <= pr.oy + pr.rh;
+    if (covered) {
+      if (o.lazy) {
+        o.lazy = false;
+        --lazy_count_;
+      }
+      o.done = true;
+      ReleaseSnapshot(o);
+      perf::Add(perf::kResolveSuperseded);
+    } else if (o.lazy && uint64_t(o.extent_start) < ne && uint64_t(o.extent_start) + o.extent_length > ns) {
+      Materialize(o);
+    }
+  }
+  if (!lazy) {
+    GpuResolveDispatch(pr, rt.texture, false, x0, y0);
+    if (!gpu_prog_) return false;  // GL error on the first dispatches: CPU fallback
+  }
+  pr.gpu = true;
+  if (lazy) {
+    // The snapshot (made by the caller right after this) holds the image; the store is written on demand.
+    pr.lazy = true;
+    ++lazy_count_;
+    perf::Add(perf::kLazyDeferred);
+  }
+  perf::Add(perf::kGpuResolves);
+  ResidentAdd(pr.extent_start, pr.extent_length);
+  return true;
+}
+
+void GlRenderTargets::GpuResolveDispatch(PendingResolve& pr, GLuint texture, bool from_snapshot, uint32_t x0,
+                                         uint32_t y0) {
   const uint32_t pitch_aligned = (pr.dest_pitch + 31) & ~31u;
   if (gpu_checks_left_ > 0) {
     while (glGetError() != GL_NO_ERROR) {}  // so only errors of the dispatch below are blamed on it
   }
-  glUseProgram(gpu_prog_);
+  glUseProgram(from_snapshot ? gpu_prog_array_ : gpu_prog_);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, rt.texture);
+  const GLenum target = from_snapshot ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+  glBindTexture(target, texture);
   glBindSampler(0, 0);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sm_->store_buffer());
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, sm_->page_table_buffer());
-  glUniform4i(u_src_, GLint(x0), GLint(y0), GLint(pr.rw), GLint(pr.rh));
-  glUniform4i(u_dst_, GLint(pr.ox), GLint(pr.oy), GLint(pitch_aligned), GLint(pr.bpp_log2));
-  glUniform1ui(u_base_, pr.dest_base);
-  glUniform4i(u_fmt_, kind, GLint(uint32_t(pr.endian)), pr.swap_rb ? 1 : 0, 0);
+  glUniform4i(from_snapshot ? ua_src_ : u_src_, GLint(x0), GLint(y0), GLint(pr.rw), GLint(pr.rh));
+  glUniform4i(from_snapshot ? ua_dst_ : u_dst_, GLint(pr.ox), GLint(pr.oy), GLint(pitch_aligned),
+              GLint(pr.bpp_log2));
+  glUniform1ui(from_snapshot ? ua_base_ : u_base_, pr.dest_base);
+  glUniform4i(from_snapshot ? ua_fmt_ : u_fmt_, pr.gpu_kind, GLint(uint32_t(pr.endian)), pr.swap_rb ? 1 : 0, 0);
   const int gpu_cs_begin = perf::GpuStamp();
   glDispatchCompute((pr.rw + 7) / 8, (pr.rh + 7) / 8, 1);
   perf::GpuSegEnd(perf::kGpuSegResolve, gpu_cs_begin);
   glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
                   GL_ELEMENT_ARRAY_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT |
                   GL_UNIFORM_BARRIER_BIT);
-  glBindTexture(GL_TEXTURE_2D, 0);
+  glBindTexture(target, 0);
   glUseProgram(0);
   if (gpu_checks_left_ > 0) {
     --gpu_checks_left_;
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
-      REXGPU_ERROR("GL RT: GPU resolve raised GL error 0x{:x}, falling back to CPU resolves", err);
+      REXGPU_ERROR("GL RT: GPU resolve (snapshot={}) raised GL error 0x{:x}, falling back to CPU resolves",
+                   from_snapshot, err);
       glDeleteProgram(gpu_prog_);
       gpu_prog_ = 0;
-      return false;
+      if (gpu_prog_array_) glDeleteProgram(gpu_prog_array_);
+      gpu_prog_array_ = 0;
     }
   }
-  pr.gpu = true;
-  pr.gpu_kind = kind;
-  perf::Add(perf::kGpuResolves);
-  // Older resolves whose image is completely overwritten by this one never need to be written back.
-  const uint32_t new_pitch = pitch_aligned;
-  for (PendingResolve& o : pending_) {
-    if (!o.gpu || o.done || o.dl_started) continue;
-    if (o.dest_base != pr.dest_base || ((o.dest_pitch + 31) & ~31u) != new_pitch || o.bpp != pr.bpp) continue;
-    if (o.ox >= pr.ox && o.oy >= pr.oy && o.ox + o.rw <= pr.ox + pr.rw && o.oy + o.rh <= pr.oy + pr.rh) {
-      o.done = true;
-      ReleaseSnapshot(o);
-      perf::Add(perf::kResolveSuperseded);
+}
+
+void GlRenderTargets::Materialize(PendingResolve& pr) {
+  if (!pr.lazy) return;
+  pr.lazy = false;
+  --lazy_count_;
+  perf::Add(perf::kLazyMaterialized);
+  if (!pr.snapshot || !gpu_prog_array_) {
+    REXGPU_WARN("GL RT: lazy resolve 0x{:08X} lost its snapshot, store left stale", pr.dest_base);
+    return;
+  }
+  perf::Scope perf_gpu_scope(perf::kGpuResolveTicks);
+  GpuResolveDispatch(pr, pr.snapshot, true, 0, 0);
+}
+
+void GlRenderTargets::MaterializeLazySlow(uint32_t start, uint32_t length) {
+  const uint64_t s = start, e = s + length;
+  // Oldest first: the store must see the writes in resolve order.
+  for (PendingResolve& pr : pending_) {
+    if (pr.lazy && !pr.done && uint64_t(pr.extent_start) < e && uint64_t(pr.extent_start) + pr.extent_length > s) {
+      Materialize(pr);
     }
   }
-  ResidentAdd(pr.extent_start, pr.extent_length);
-  return true;
 }
 
 void GlRenderTargets::StartGpuDownload(PendingResolve& pr) {
+  if (pr.lazy) {
+    // Store writes keep resolve order: older lazy ones overlapping this range first (pr itself included).
+    MaterializeLazySlow(pr.extent_start, pr.extent_length);
+  }
   pr.dl_started = true;
   const uint32_t size = pr.extent_length;
   pr.pbo_size = size;
@@ -1088,9 +1170,10 @@ bool GlRenderTargets::IsGpuResident(uint32_t start, uint32_t length) const {
   uint64_t s = start, e = uint64_t(start) + length;
   for (const Range& r : resident_) {
     if (r.start <= s && uint64_t(r.start) + r.length >= e) {
-      // A CPU-path resolve still pending on the range would make the store stale.
+      // A CPU-path resolve still pending on the range would make the store stale (so would a lazy one:
+      // callers MaterializeLazy first).
       for (const PendingResolve& pr : pending_) {
-        if (!pr.gpu && uint64_t(pr.extent_start) < e && uint64_t(pr.extent_start) + pr.extent_length > s) return false;
+        if ((!pr.gpu || pr.lazy) && uint64_t(pr.extent_start) < e && uint64_t(pr.extent_start) + pr.extent_length > s) return false;
       }
       return true;
     }

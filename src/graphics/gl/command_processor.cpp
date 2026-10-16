@@ -50,6 +50,9 @@ REXCVAR_DEFINE_BOOL(gl_cpu_frontbuffer, false, "GPU", "GL backend: force the old
 REXCVAR_DEFINE_INT32(gl_resolve_log, 12, "GPU", "GL backend: log budget for resolve configurations and failed GPU-copy lookups (0 = off)")
 ;
 REXCVAR_DEFINE_BOOL(gl_gpu_timers, true, "GPU", "GL backend: GPU timestamp queries + frame fences for the perf report (GPU-side present / resolve time, GPU lag)");
+REXCVAR_DEFINE_BOOL(gl_lazy_resolve, true, "GPU", "GL backend: resolves with an exact GPU snapshot defer the compute write into the shared memory store until the range is read (store / guest memory) or ages out; superseded ones are never written");
+REXCVAR_DEFINE_BOOL(gl_present_snapshot, true, "GPU", "GL backend: present the front buffer straight from the resolve snapshot when one matches (plain textured blit) before trying the store detile blit / CPU path");
+REXCVAR_DEFINE_DOUBLE(gl_gpu_timestamp_scale, 0.0, "GPU", "GL backend: ns per raw GL_TIMESTAMP unit (0 = auto: 625/384 on Switch, whose GPU timer ticks at 614.4 MHz and Mesa returns raw ticks)");
 REXCVAR_DEFINE_INT32(gl_swap_interval, 1, "GPU", "GL backend: eglSwapInterval (1 = wait for vsync; 0 = present without waiting for vsync)");
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
@@ -184,6 +187,7 @@ const uint8_t* OverlayGlyph(char ch) {
       {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}}, {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
       {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}}, {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
       {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}}, {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+      {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
   };
   for (const auto& g : kGlyphs) {
     if (g.c == ch) return g.r;
@@ -604,6 +608,7 @@ bool GlCommandProcessor::PrepareVertexBuffers(const Shader& vertex_shader) {
           impl_->shared_memory->MemoryInvalidationCallback(address, size, true);
         }
       }
+      impl_->render_targets->MaterializeLazy(address, size);  // shaders read it from the store
       if (!impl_->shared_memory->RequestRange(address, size)) {
         REXGPU_ERROR("GL: failed to request vertex buffer {:08X} size {} in shared memory", address, size);
         return false;
@@ -1174,6 +1179,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
       case IBT::kGuestDMA: {
         uint32_t bytes = ppr.host_draw_vertex_count *
                          (ppr.host_index_format == xenos::IndexFormat::kInt16 ? 2u : 4u);
+        impl_->render_targets->MaterializeLazy(ppr.guest_index_base, bytes);
         if (!impl_->shared_memory->GetHostRange(ppr.guest_index_base, bytes, buffer, offset)) {
           return fail("index_buffer_not_contiguous");
         }
@@ -1401,11 +1407,19 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
     const bool fmt_8888 = fetch.format == xenos::TextureFormat::k_8_8_8_8 || fetch.format == xenos::TextureFormat::k_8_8_8_8_A;
     const bool fmt_1010 = fetch.format == xenos::TextureFormat::k_2_10_10_10;
     const uint32_t swz = uint32_t(fetch.swizzle);
-    // Best path: the front buffer is the result of GPU resolves, so it lives in the shared memory store. A
-    // fragment shader reads it there (tiled address, endian swap, format, swizzle): no write-back, no CPU detile.
-    if (!cpu_forced && REXCVAR_GET(gl_gpu_front) && impl_->blit_store_program && fetch.tiled &&
+    // Present order: (1) the front buffer is exactly a recent resolve whose GPU snapshot is shown directly (plain
+    // textured blit; with lazy resolves the store is never written for it); (2) the front buffer lives in the
+    // shared memory store (GPU resolves): a fragment shader detiles it there; (3) CPU detile of guest memory.
+    if (!cpu_forced && REXCVAR_GET(gl_present_snapshot) && REXCVAR_GET(gl_resolve_gpu_copy) && fetch.tiled &&
+        fmt_8888 && impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), 1, snap_tex,
+                                                        snap_swap_rb)) {
+      use_snap = true;
+      perf::Add(perf::kResolveFrontHits);
+    }
+    if (!use_snap && !cpu_forced && REXCVAR_GET(gl_gpu_front) && impl_->blit_store_program && fetch.tiled &&
         (fmt_8888 || fmt_1010) && uint32_t(fetch.endianness) <= 3) {
       uint32_t upper = texture_util::GetTiledAddressUpperBound2D(w, h, pitch, 2);
+      impl_->render_targets->MaterializeLazy(base, upper);
       if (impl_->render_targets->IsGpuResident(base, upper)) {
         use_store = true;
         perf::Add(perf::kGpuFrontBlits);
@@ -1414,8 +1428,8 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
                                              uint32_t(fetch.format), 1);
       }
     }
-    // Next: the front buffer is exactly a recent resolve whose GPU snapshot can be shown directly.
-    if (!use_store && !cpu_forced && REXCVAR_GET(gl_resolve_gpu_copy) && fetch.tiled && fmt_8888 &&
+    // Old order fallback (gl_present_snapshot = false): snapshot after the store.
+    if (!use_store && !use_snap && !cpu_forced && REXCVAR_GET(gl_resolve_gpu_copy) && fetch.tiled && fmt_8888 &&
         impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), 1, snap_tex,
                                             snap_swap_rb)) {
       use_snap = true;

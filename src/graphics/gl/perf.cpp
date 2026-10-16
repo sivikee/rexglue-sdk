@@ -54,6 +54,11 @@ int64_t g_pw_sum = 0, g_pw_max = INT64_MIN, g_pw_n = 0;  // present wait beyond 
 uint64_t g_lag_prev_gpu = 0, g_lag_prev_cpu = 0, g_clk_gpu = 0, g_clk_cpu = 0;
 Rec* g_last_frame_end = nullptr;  // newest frame end record waiting for aux_cpu_ns
 uint64_t g_stamp_fail = 0;
+// ns per raw GL_TIMESTAMP unit. Mesa nouveau on the Switch returns the raw GPU timer, which ticks at 614.4 MHz
+// (19.2 MHz * 32; yuzu/Eden emulate it as ns * 384 / 625), not in ns: unscaled, every GPU time was reported
+// 0.6144x too small ("clk ratio" ~0.61 in v0.1.10) and the GPU/CPU offset drifted (bogus lag / present wait).
+double g_ts_scale = 625.0 / 384.0;
+uint64_t ScaleTs(uint64_t raw) { return uint64_t(double(raw) * g_ts_scale); }
 
 // ---- frame fences ----
 struct FrameFence {
@@ -78,6 +83,8 @@ void Give(int h) {
 }  // namespace
 
 const std::string* OverlayLines() { return g_lines; }
+
+extern "C" uint32_t rex_switch_gpu_clock_mhz() __attribute__((weak));
 
 uint64_t ThreadCpuTicks() {
   static bool failed = false;
@@ -105,11 +112,13 @@ void GpuTimersInit() {
     REXGPU_WARN("perf: GL_TIMESTAMP has {} counter bits, GPU timers disabled", bits);
     return;
   }
+  const double sc = REXCVAR_GET(gl_gpu_timestamp_scale);
+  g_ts_scale = sc > 0.0 ? sc : 625.0 / 384.0;
   glGenQueries(kPool, g_q);
   g_free.clear();
   for (int i = kPool - 1; i >= 0; --i) g_free.push_back(i);
   g_timers = true;
-  REXGPU_INFO("perf: GPU timer queries enabled (GL_TIMESTAMP {} bits, pool {})", bits, kPool);
+  REXGPU_INFO("perf: GPU timer queries enabled (GL_TIMESTAMP {} bits, pool {}, {:.6f} ns per tick)", bits, kPool, g_ts_scale);
 }
 
 int GpuStamp() {
@@ -163,10 +172,12 @@ void GpuPoll() {
     if (!avail) break;
     GLuint64 ta = 0, tb = 0;
     glGetQueryObjectui64v(g_q[r.a], GL_QUERY_RESULT, &ta);
+    ta = ScaleTs(ta);
     int64_t off_a = int64_t(ta) - int64_t(g_q_cpu_ns[r.a]);
     g_min_offset = std::min(g_min_offset, off_a);
     if (r.kind == kRecSeg) {
       glGetQueryObjectui64v(g_q[r.b], GL_QUERY_RESULT, &tb);
+      tb = ScaleTs(tb);
       g_min_offset = std::min(g_min_offset, int64_t(tb) - int64_t(g_q_cpu_ns[r.b]));
       if (tb >= ta) {
         g_seg_ns[r.seg] += tb - ta;
@@ -287,7 +298,7 @@ void OnSwap() {
   double fps = g_frames / secs;
   double avg = g_frames ? Ms(g_sum_ft) / g_frames : 0.0;
   double mx = Ms(g_max_ft);
-  char l1[320], l2[320], l3[160], l4[400], l5[480], l6[480];
+  char l1[320], l2[320], l3[160], l4[480], l5[480], l6[560];
   std::snprintf(l1, sizeof l1,
                 "perf: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
                 "copies=%llu (%.0f ms, readback %.0f ms)",
@@ -303,10 +314,12 @@ void OnSwap() {
                 c[kSmUploadBytes] / 1048576.0, Ms(c[kSmUploadTicks]), Ms(c[kFinishTicks]));
   std::snprintf(l3, sizeof l3, "perf: sm copy %.0f ms resolve convert %.0f ms gpu-copy hits tex=%llu front=%llu", Ms(c[kSmCopyTicks]), Ms(c[kResolveConvTicks]), (unsigned long long)c[kResolveGpuHits], (unsigned long long)c[kResolveFrontHits]);
   std::snprintf(l4, sizeof l4,
-                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu | front gpu=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
+                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu deferred=%llu materialized=%llu | front snap=%llu store=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
                 "flushes: tex=%llu sm=%llu front=%llu age=%llu cap=%llu sync=%llu other=%llu",
                 (unsigned long long)c[kGpuResolves], Ms(c[kGpuResolveTicks]), (unsigned long long)c[kCpuResolves],
-                (unsigned long long)c[kResolveSuperseded], (unsigned long long)c[kGpuFrontBlits],
+                (unsigned long long)c[kResolveSuperseded], (unsigned long long)c[kLazyDeferred],
+                (unsigned long long)c[kLazyMaterialized], (unsigned long long)c[kResolveFrontHits],
+                (unsigned long long)c[kGpuFrontBlits],
                 (unsigned long long)c[kCpuFrontFrames], (unsigned long long)c[kLazyDownloads],
                 c[kLazyDownloadBytes] / 1048576.0, Ms(c[kLazyDownloadTicks]), (unsigned long long)c[kFlushTex],
                 (unsigned long long)c[kFlushSm], (unsigned long long)c[kFlushFront], (unsigned long long)c[kFlushAge],
@@ -357,16 +370,26 @@ void OnSwap() {
     std::fprintf(g_file, "%s\n%s\n%s\n%s\n%s\n%s\n", l1, l2, l3, l4, l5, l6);
     std::fflush(g_file);
   }
-  char o1[64], o2[64], o3[64];
+  char o1[64], o2[64], o3[80];
   std::snprintf(o1, sizeof o1, "FPS %.1f  MS %.1f  MAX %.0f", fps, avg, mx);
   double dpf = g_frames ? double(c[kDraws]) / g_frames : 0.0;
-  std::snprintf(o2, sizeof o2, "DRAWS %.0f  SHD %llu  TEX %llu", dpf, (unsigned long long)c[kXlateCount],
-                (unsigned long long)c[kTexUploads]);
+  const unsigned gpu_mhz = rex_switch_gpu_clock_mhz ? rex_switch_gpu_clock_mhz() : 0;
+  std::snprintf(o2, sizeof o2, "DRAWS %.0f  SHD %llu  TEX %llu  GPU %uMHZ", dpf, (unsigned long long)c[kXlateCount],
+                (unsigned long long)c[kTexUploads], gpu_mhz);
   // Per frame: whole swap, its first clear (back buffer acquire), GPU thread idle, GPU lag.
   const double nf = g_frames ? double(g_frames) : 1.0;
-  std::snprintf(o3, sizeof o3, "SWAP %.0f CLR %.0f IDLE %.0f LAG %.0f", Ms(c[kSwapTicks]) / nf,
-                Ms(c[kSwapClearTicks]) / nf, (Ms(cp_idle) + Ms(cp_waitmem)) / nf,
-                g_lag_n ? double(g_lag_sum) / g_lag_n / 1e6 : 0.0);
+  // GPU per frame (corrected timestamps): D = frame span minus resolves/snapshots (draws + GPU idle),
+  // R = compute resolves + snapshot copies, P = present (clear + front blit + overlay).
+  const double g_res = (seg_ms(kGpuSegResolve) + seg_ms(kGpuSegSnapshot)) / nf;
+  const double g_draw = std::max(0.0, seg_ms(kGpuSegFrame) / nf - g_res);
+  if (g_timers) {
+    std::snprintf(o3, sizeof o3, "SWAP %.0f CLR %.0f IDLE %.0f GPU D%.0f R%.0f P%.0f", Ms(c[kSwapTicks]) / nf,
+                  Ms(c[kSwapClearTicks]) / nf, (Ms(cp_idle) + Ms(cp_waitmem)) / nf, g_draw, g_res,
+                  seg_ms(kGpuSegSwap) / nf);
+  } else {
+    std::snprintf(o3, sizeof o3, "SWAP %.0f CLR %.0f IDLE %.0f", Ms(c[kSwapTicks]) / nf,
+                  Ms(c[kSwapClearTicks]) / nf, (Ms(cp_idle) + Ms(cp_waitmem)) / nf);
+  }
   g_lines[0] = o1;
   g_lines[1] = o2;
   g_lines[2] = o3;

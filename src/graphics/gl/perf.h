@@ -29,6 +29,7 @@ enum Counter : int {
   kFlushTex, kFlushSm, kFlushFront, kFlushAge, kFlushCap, kFlushSync, kFlushOther,
   kGpuResolves, kCpuResolves, kGpuFrontBlits, kCpuFrontFrames, kLazyDownloads, kLazyDownloadBytes, kLazyDownloadTicks,
   kResolveSuperseded, kGpuResolveTicks,
+  kLazyDeferred, kLazyMaterialized,             // lazy GPU resolves: compute write deferred / run later on demand
   // IssueSwap split (CPU wall time of each sub-step on the GPU thread)
   kSwapPreTicks, kSwapClearTicks, kSwapBlitTicks, kSwapMiscTicks, kSwapOverlayTicks, kSwapPostTicks,
   kSwapCpuTicks,      // CPU time the GPU thread actually consumed inside IssueSwap (svc ThreadTickCount)

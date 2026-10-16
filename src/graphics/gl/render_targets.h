@@ -101,6 +101,13 @@ class GlRenderTargets {
   // True if the guest range [start, start + length) is entirely held by the shared memory store as the result
   // of GPU resolves (no CPU-path resolve pending on it), so shaders can read it from the store.
   bool IsGpuResident(uint32_t start, uint32_t length) const;
+  // Lazy GPU resolves (gl_lazy_resolve): a resolve with an exact GPU snapshot does not run the compute shader
+  // at once; the snapshot is the source of truth until something reads the guest range through the shared
+  // memory store (vertex / index fetch, store blit) or guest memory (FlushPending), or it ages out. Superseded
+  // lazy resolves are never written at all. Call before reading [start, start + length) from the store.
+  void MaterializeLazy(uint32_t start, uint32_t length) {
+    if (lazy_count_) MaterializeLazySlow(start, length);
+  }
   void ClearGpuResident() { resident_.clear(); }
   bool DebugReadColor(uint32_t base, std::vector<uint8_t>& rgba, uint32_t& w, uint32_t& h);
 
@@ -123,6 +130,7 @@ class GlRenderTargets {
     bool done = false;       // nothing left to write back (superseded by a newer resolve)
     bool dl_started = false; // gpu: store -> PBO copy issued, fence pending
     int gpu_kind = -1;       // gpu: dest layout (see kGpuKind*)
+    bool lazy = false;       // gpu: compute write into the store deferred (data only in the snapshot)
   };
   struct Snapshot {
     GLuint texture = 0;
@@ -156,6 +164,10 @@ class GlRenderTargets {
   static GLenum GetInternalFormat(xenos::ColorRenderTargetFormat format);
   bool CreateGpuResolveProgram();
   bool GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x0, uint32_t y0);
+  // Runs the resolve compute shader for pr, reading texture (2D render target at x0,y0 or the 2D array snapshot).
+  void GpuResolveDispatch(PendingResolve& pr, GLuint texture, bool from_snapshot, uint32_t x0, uint32_t y0);
+  void Materialize(PendingResolve& pr);
+  void MaterializeLazySlow(uint32_t start, uint32_t length);
   void ResidentAdd(uint32_t start, uint32_t length);
   void ResidentRemove(uint32_t start, uint32_t length);
   GLuint GetFramebuffer(const FbKey& key);
@@ -176,6 +188,9 @@ class GlRenderTargets {
   std::vector<Snapshot> free_snapshots_;
   GlSharedMemory* sm_ = nullptr;
   GLuint gpu_prog_ = 0;
+  GLuint gpu_prog_array_ = 0;  // same shader reading a GL_TEXTURE_2D_ARRAY snapshot (lazy materialization)
+  GLint ua_src_ = -1, ua_dst_ = -1, ua_base_ = -1, ua_fmt_ = -1;
+  uint32_t lazy_count_ = 0;   // pending resolves with lazy == true
   int gpu_checks_left_ = 8;
   GLint u_src_ = -1, u_dst_ = -1, u_base_ = -1, u_fmt_ = -1;
   std::vector<uint64_t> resolve_sigs_;  // diagnostics: resolve configurations already logged
