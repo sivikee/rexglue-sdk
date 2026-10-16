@@ -1,6 +1,7 @@
 #include "gl_context.h"
 #include "gl_ext.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -16,6 +17,13 @@
 REXCVAR_DEFINE_BOOL(gl_egl_depth_stencil, false, "GPU",
                     "GL backend: request depth 24 / stencil 8 for the EGL window surface (the default framebuffer is only "
                     "cleared and blitted to; render targets are FBOs)");
+
+REXCVAR_DEFINE_INT32(gl_nvc0_code_area_mb, 8, "GPU",
+                     "GL backend: grow nouveau's shader code area to this size (MiB, max 8) right after start-up. Mesa "
+                     "starts with 512 KiB and, when the translated in-game shaders do not fit, evicts every shader and "
+                     "reallocates it in the middle of a frame (suspected cause of an Eden hang). 0 = leave as is");
+extern "C" int nvc0_screen_resize_text_area(void* screen, uint64_t size);
+extern "C" void nvc0_program_library_upload(void* nvc0_context);
 
 REXCVAR_DEFINE_STRING(gl_mesa_env, "", "GPU",
                       "GL backend: environment variables for Mesa, set before EGL starts, as NAME=VALUE pairs separated "
@@ -164,7 +172,58 @@ bool GlContext::Initialize() {
               major, minor, caps_.renderer, caps_.version, caps_.glsl_version, w, h,
               caps_.max_texture_size, caps_.max_ssbo_block_size);
   eglSwapInterval(display, 1);
+  GrowShaderCodeArea();
   return true;
+}
+
+// Mesa 20.1 nvc0 (devkitPro build, statically linked): struct st_manager starts with its pipe_screen*; in the
+// pipe_screen (= nvc0_screen) get_name() is at +16 (+0 num_contexts, +8 destroy; st_get_string(GL_RENDERER) loads
+// [screen + 16]); nvc0_screen::text (the code segment BO) is at
+// +632 and nouveau_bo::size at +16 (disassembly of nvc0_screen_resize_text_area / nvc0_program_upload). Checked:
+// get_name() must return the GL_RENDERER string and the code area must still have its initial 512 KiB.
+void GlContext::GrowShaderCodeArea() {
+  const int mb = std::min(REXCVAR_GET(gl_nvc0_code_area_mb), 8);
+  if (mb <= 0 || !display_) return;
+  void** driver_data = *reinterpret_cast<void***>(static_cast<char*>(display_) + 88);
+  void* smapi = driver_data ? driver_data[0] : nullptr;
+  void* screen = smapi ? *reinterpret_cast<void**>(smapi) : nullptr;
+  if (!screen) {
+    REXGPU_WARN("GL: shader code area left as is (no pipe screen found)");
+    return;
+  }
+  using GetNameFn = const char* (*)(void*);
+  GetNameFn get_name = *reinterpret_cast<GetNameFn*>(static_cast<char*>(screen) + 16);
+  const char* name = get_name ? get_name(screen) : nullptr;
+  if (!name || caps_.renderer != name) {
+    REXGPU_WARN("GL: shader code area left as is (screen layout check failed: name '{}' vs renderer '{}')",
+                name ? name : "?", caps_.renderer);
+    return;
+  }
+  void* text = *reinterpret_cast<void**>(static_cast<char*>(screen) + 632);
+  const uint64_t size = text ? *reinterpret_cast<uint64_t*>(static_cast<char*>(text) + 16) : 0;
+  const uint64_t want = uint64_t(mb) << 20;
+  // Only the builtin library may live in the code heap (uploaded by nvc0_create): nvc0_screen::text_heap at +0x2A8
+  // is the root node {prev, next, priv, start, size, in_use} whose next must be the library node (+0x2B0, priv NULL,
+  // no next). The resize frees both nodes, so the library is uploaded again through the main context
+  // (st_context::pipe at +104 of the main context's st_context, checked via pipe_context::screen at +0).
+  void* heap = *reinterpret_cast<void**>(static_cast<char*>(screen) + 0x2A8);
+  void* lib = *reinterpret_cast<void**>(static_cast<char*>(screen) + 0x2B0);
+  auto field = [](void* node, size_t off) { return *reinterpret_cast<void**>(static_cast<char*>(node) + off); };
+  const bool heap_ok = heap && lib && field(heap, 8) == lib && !field(lib, 8) && !field(lib, 16) &&
+                       *reinterpret_cast<int*>(static_cast<char*>(lib) + 32) == 1;
+  void* st = context_ ? *reinterpret_cast<void**>(static_cast<char*>(context_) + 104) : nullptr;
+  void* pipe = st ? *reinterpret_cast<void**>(static_cast<char*>(st) + 104) : nullptr;
+  const bool pipe_ok = pipe && *reinterpret_cast<void**>(pipe) == screen;
+  if (size != 0x80000 || want <= size || !heap_ok || !pipe_ok) {
+    REXGPU_WARN("GL: shader code area left as is (size 0x{:X}, wanted 0x{:X}, heap ok {}, pipe ok {})", size, want,
+                heap_ok, pipe_ok);
+    return;
+  }
+  const int rc = nvc0_screen_resize_text_area(screen, want);
+  if (rc == 0) nvc0_program_library_upload(pipe);
+  void* lib_after = *reinterpret_cast<void**>(static_cast<char*>(screen) + 0x2B0);
+  REXGPU_INFO("GL: shader code area grown from {} KiB to {} MiB (rc {}, library re-uploaded {})", size >> 10, mb, rc,
+              lib_after != nullptr);
 }
 
 void GlContext::Shutdown() {

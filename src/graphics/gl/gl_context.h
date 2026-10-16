@@ -45,6 +45,8 @@ class GlContext {
   void* context_ = nullptr;
   void* config_ = nullptr;
   GlCaps caps_;
+  // nouveau: grow the shader code segment once at start-up (gl_nvc0_code_area_mb).
+  void GrowShaderCodeArea();
 };
 
 // Returns the GL error string for glGetError values.
