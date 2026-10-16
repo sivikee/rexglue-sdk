@@ -34,9 +34,20 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+namespace {
+// Switch: no fault-and-resume, so host writes into guest physical memory must hit mapped pages.
+inline uint8_t* PhysW(rex::memory::Memory* m, uint32_t addr) {
+  uint8_t* p = m->TranslatePhysical(addr);
+#if REX_PLATFORM_SWITCH
+  rex::memory::SwitchEnsureMapped(p, 4, "GPU writeback");
+#endif
+  return p;
+}
+}  // namespace
 
 #if REX_PLATFORM_SWITCH
 #include <atomic>
+
 namespace rex::graphics {
 // Switch diagnostics read by the app heartbeat: what the command processor is doing right now.
 std::atomic<uint64_t> g_switch_gpu_packets{0};
@@ -256,7 +267,7 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+      memory::store_and_swap<uint32_t>(PhysW(memory_, read_ptr_writeback_ptr_),
                                        read_ptr_index_);
     }
 
@@ -378,7 +389,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      memory::store_and_swap<uint32_t>(PhysW(memory_, mem_addr), value);
     }
   } else {
     switch (index) {
@@ -1121,7 +1132,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  memory::store(PhysW(memory_, mem_addr), reg_val);
 
   return true;
 }
@@ -1135,7 +1146,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    memory::store(PhysW(memory_, addr), write_data);
     write_addr += 4;
   }
 
@@ -1196,7 +1207,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      memory::store(PhysW(memory_, write_reg_addr), write_data);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1241,7 +1252,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  memory::store(PhysW(memory_, address), data_value);
   return true;
 }
 
