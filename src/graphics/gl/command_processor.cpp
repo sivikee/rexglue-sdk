@@ -1,6 +1,7 @@
 #include "command_processor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -48,6 +49,8 @@ REXCVAR_DEFINE_BOOL(gl_gpu_front, true, "GPU", "GL backend: the front buffer is 
 REXCVAR_DEFINE_BOOL(gl_cpu_frontbuffer, false, "GPU", "GL backend: force the old CPU detile + upload of the front buffer (debugging)");
 REXCVAR_DEFINE_INT32(gl_resolve_log, 12, "GPU", "GL backend: log budget for resolve configurations and failed GPU-copy lookups (0 = off)")
 ;
+REXCVAR_DEFINE_BOOL(gl_gpu_timers, true, "GPU", "GL backend: GPU timestamp queries + frame fences for the perf report (GPU-side present / resolve time, GPU lag)");
+REXCVAR_DEFINE_INT32(gl_swap_interval, 1, "GPU", "GL backend: eglSwapInterval (1 = wait for vsync; 0 = present without waiting for vsync)");
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
 REXCVAR_DEFINE_INT32(gl_log_draws, 0, "GPU", "GL backend: log the first N draws in detail");
@@ -55,6 +58,10 @@ REXCVAR_DEFINE_INT32(gl_log_draws_from, 0, "GPU", "GL backend: also log 12 draws
 REXCVAR_DEFINE_INT32(gl_debug_raster, 0, "GPU", "GL debug bitmask: 1=no scissor 2=no cull 4=force colour write/no blend 8=no depth/stencil 16=viewport=full RT");
 REXCVAR_DEFINE_INT32(gl_max_viewport, 16384, "GPU", "GL backend: max viewport dimension used when computing the host viewport");
 REXCVAR_DEFINE_INT32(gl_dump_rt_swaps, 0, "GPU", "GL backend: dump colour RT 0 to rt_<swap>.ppm every N swaps");
+
+namespace rex::graphics {
+extern std::atomic<uint32_t> g_switch_vdswap_count;  // base command_processor.cpp, bumped by VdSwap
+}  // namespace rex::graphics
 
 namespace rex::graphics::gl {
 
@@ -173,7 +180,10 @@ const uint8_t* OverlayGlyph(char ch) {
       {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}}, {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}},
       {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}}, {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
       {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}}, {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
-      {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+      {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}}, {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+      {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}}, {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+      {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}}, {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+      {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}}, {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
   };
   for (const auto& g : kGlyphs) {
     if (g.c == ch) return g.r;
@@ -301,8 +311,12 @@ struct GlCommandProcessor::Impl {
   GLuint empty_vao = 0;
   GLuint front_tex = 0;
   GLuint dbg_program = 0;
-  GLuint overlay_tex = 0;
+  // Two overlay textures, alternated on every text change (once per second): the one rewritten was last sampled a
+  // second ago, so the upload never waits for the GPU to finish with a texture still in use.
+  GLuint overlay_tex[2] = {0, 0};
+  int overlay_cur = 0;
   uint32_t overlay_w = 0, overlay_h = 0;
+  int gpu_frame_begin = -1;  // GPU timestamp handle issued after the previous present
   std::string overlay_text_cached;
   uint32_t front_w = 0, front_h = 0;
   std::vector<uint32_t> front_pixels;
@@ -492,6 +506,13 @@ void main() {
     REXGPU_ERROR("GL: failed to initialise the draw subsystems");
     return false;
   }
+
+  {
+    const int interval = std::clamp(REXCVAR_GET(gl_swap_interval), 0, 4);
+    if (interval != 1) context_.SetSwapInterval(interval);
+    REXGPU_INFO("GL: swap interval {}", interval);
+  }
+  perf::GpuTimersInit();
 
   // Show something immediately so the window is not stale.
   glClearColor(0.f, 0.f, 0.25f, 1.f);
@@ -1234,22 +1255,27 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
     max_chars = std::max(max_chars, lines[i].size());
   }
   uint32_t w = uint32_t(max_chars * kCell + 2 * kPad), h = uint32_t(nlines * kLineH + 2 * kPad);
-  if (!impl_->overlay_tex) glGenTextures(1, &impl_->overlay_tex);
+  if (!impl_->overlay_tex[0]) glGenTextures(2, impl_->overlay_tex);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, impl_->overlay_tex);
   glBindSampler(0, 0);
   std::string key = lines[0] + "|" + lines[1] + "|" + lines[2];
   if (impl_->overlay_w != w || impl_->overlay_h != h) {
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, GLsizei(w), GLsizei(h), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    for (int k = 0; k < 2; ++k) {
+      glBindTexture(GL_TEXTURE_2D, impl_->overlay_tex[k]);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, GLsizei(w), GLsizei(h), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     impl_->overlay_w = w;
     impl_->overlay_h = h;
     impl_->overlay_text_cached.clear();
   }
-  if (key != impl_->overlay_text_cached) {
+  const bool update = key != impl_->overlay_text_cached;
+  if (update) impl_->overlay_cur ^= 1;
+  glBindTexture(GL_TEXTURE_2D, impl_->overlay_tex[impl_->overlay_cur]);
+  if (update) {
     impl_->overlay_text_cached = key;
     std::vector<uint32_t> buf(size_t(w) * h, 0xFF000000u);  // opaque black box, row 0 = top
     int line_y = kPad;
@@ -1292,6 +1318,23 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   ++swap_count_;
   perf::OnSwap();
   perf::Scope perf_swap_scope(perf::kSwapTicks);
+  // Sub-step timing: each step() adds the wall time since the previous step to a counter.
+  const uint64_t swap_cpu0 = perf::ThreadCpuTicks();
+  uint64_t t_step = armGetSystemTick();
+  auto step = [&t_step](perf::Counter c) {
+    uint64_t n = armGetSystemTick();
+    perf::Add(c, n - t_step);
+    t_step = n;
+  };
+  {
+    // Guest swaps already queued (VdSwap called) beyond this one: > 0 means the guest is ahead of the GPU thread.
+    const uint32_t guest_swaps = g_switch_vdswap_count.load(std::memory_order_relaxed);
+    if (guest_swaps > swap_count_) perf::Add(perf::kSwapGuestAhead, guest_swaps - swap_count_);
+  }
+  perf::GpuSegEnd(perf::kGpuSegFrame, impl_->gpu_frame_begin);
+  impl_->gpu_frame_begin = -1;
+  perf::GpuLagMark();
+  const int gpu_swap_begin = perf::GpuStamp();
 #if REX_PLATFORM_SWITCH
   rex::input::switchpad::g_swap_counter.store(swap_count_, std::memory_order_relaxed);
 #endif
@@ -1340,7 +1383,12 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   impl_->raster_cache.Invalidate();
   float pulse = float(swap_count_ & 63) / 63.0f;
   glClearColor(0.f, pulse * 0.2f, 0.2f, 1.f);
+  step(perf::kSwapPreTicks);
+  // First use of the default framebuffer after the previous eglSwapBuffers: Mesa acquires the next back buffer
+  // here, so a wait for a free swapchain image (GPU completion / vsync / compositor) shows up in this step.
   glClear(GL_COLOR_BUFFER_BIT);
+  step(perf::kSwapClearTicks);
+  perf::NotePresentAcquired();
   GLuint snap_tex = 0;
   bool snap_swap_rb = false;
   bool use_snap = false;
@@ -1469,8 +1517,11 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
       glUseProgram(impl_->blit_program);
     }
     glBindVertexArray(impl_->empty_vao);
+    const int gpu_blit_begin = perf::GpuStamp();
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    perf::GpuSegEnd(perf::kGpuSegBlit, gpu_blit_begin);
   }
+  step(perf::kSwapBlitTicks);
   std::string dir = REXCVAR_GET(gl_screenshot_dir);
   if (!dir.empty()) {
     int every = REXCVAR_GET(gl_screenshot_swaps);
@@ -1504,11 +1555,18 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
       }
     }
   }
+  step(perf::kSwapMiscTicks);
   DrawFpsOverlay(sw, sh);
+  step(perf::kSwapOverlayTicks);
+  perf::GpuSegEnd(perf::kGpuSegSwap, gpu_swap_begin);
+  perf::GpuFrameEndMark();
   {
     perf::Scope perf_swapbuf_scope(perf::kSwapBufTicks);
     context_.SwapBuffers();
   }
+  t_step = armGetSystemTick();
+  perf::FrameFenceIssue();
+  impl_->gpu_frame_begin = perf::GpuStamp();
 
   // Per-frame housekeeping.
   impl_->shared_memory->SetSystemPageBlocksValidWithGpuDataWritten();
@@ -1518,6 +1576,10 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   impl_->render_targets->EndFrame();
   impl_->vertex_buffer_hashes.clear();
 if (!impl_->stream) {    impl_->ubo_ring_offset = 0;    glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);    glBufferData(GL_UNIFORM_BUFFER, Impl::kUboRingSize, nullptr, GL_STREAM_DRAW);  }
+  perf::GpuPoll();
+  step(perf::kSwapPostTicks);
+  const uint64_t swap_cpu1 = perf::ThreadCpuTicks();
+  if (swap_cpu0 && swap_cpu1 > swap_cpu0) perf::Add(perf::kSwapCpuTicks, swap_cpu1 - swap_cpu0);
 }
 
 }  // namespace rex::graphics::gl

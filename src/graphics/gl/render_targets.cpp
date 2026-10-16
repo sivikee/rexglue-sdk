@@ -465,8 +465,10 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
           }
           pr.snapshot_w = rw;
           pr.snapshot_h = rh;
+          const int gpu_snap_begin = perf::GpuStamp();
           glCopyImageSubData(rt->texture, GL_TEXTURE_2D, 0, GLint(x0), GLint(y0), 0, pr.snapshot,
                              GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, GLsizei(rw), GLsizei(rh), 1);
+          perf::GpuSegEnd(perf::kGpuSegSnapshot, gpu_snap_begin);
         }
         // Log distinct resolve configurations (up to gl_resolve_log * 4) for diagnostics.
         {
@@ -942,7 +944,9 @@ bool GlRenderTargets::GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x
   glUniform4i(u_dst_, GLint(pr.ox), GLint(pr.oy), GLint(pitch_aligned), GLint(pr.bpp_log2));
   glUniform1ui(u_base_, pr.dest_base);
   glUniform4i(u_fmt_, kind, GLint(uint32_t(pr.endian)), pr.swap_rb ? 1 : 0, 0);
+  const int gpu_cs_begin = perf::GpuStamp();
   glDispatchCompute((pr.rw + 7) / 8, (pr.rh + 7) / 8, 1);
+  perf::GpuSegEnd(perf::kGpuSegResolve, gpu_cs_begin);
   glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
                   GL_ELEMENT_ARRAY_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT |
                   GL_UNIFORM_BARRIER_BIT);
@@ -1031,10 +1035,7 @@ void GlRenderTargets::FinishGpuDownload(PendingResolve& pr) {
   const void* data = nullptr;
   {
     perf::Scope perf_readback_scope(perf::kReadbackTicks);
-    GLenum r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-    while (r == GL_TIMEOUT_EXPIRED) {
-      r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-    }
+    perf::FenceWaitLogged(pr.fence, "resolve write-back");
     glBindBuffer(GL_COPY_WRITE_BUFFER, pr.pbo);
     data = glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, pr.extent_length, GL_MAP_READ_BIT);
   }
@@ -1142,10 +1143,7 @@ void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
   const void* data = nullptr;
   {
     perf::Scope perf_readback_scope(perf::kReadbackTicks);
-    GLenum r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-    while (r == GL_TIMEOUT_EXPIRED) {
-      r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-    }
+    perf::FenceWaitLogged(pr.fence, "resolve readback");
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
     data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, pr.rw * pr.rh * (pr.src_is_8888 ? 4 : 16), GL_MAP_READ_BIT);
   }

@@ -25,6 +25,7 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
@@ -32,6 +33,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
+
+#if REX_PLATFORM_SWITCH
+namespace rex::graphics {
+extern std::atomic<uint32_t> g_switch_vdswap_count;  // command_processor.cpp (GL perf report)
+}
+#endif
 
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
@@ -513,6 +520,9 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
 
   dwords[offset++] = *width;
   dwords[offset++] = *height;
+#if REX_PLATFORM_SWITCH
+  rex::graphics::g_switch_vdswap_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {

@@ -55,7 +55,19 @@ std::atomic<uint32_t> g_switch_gpu_opcode{0};
 std::atomic<uint32_t> g_switch_gpu_wait_info{0}, g_switch_gpu_wait_addr{0}, g_switch_gpu_wait_ref{0},
     g_switch_gpu_wait_mask{0}, g_switch_gpu_wait_value{0};
 std::atomic<uint32_t> g_switch_gpu_waiting{0};
+// Perf (read and reset by the GL backend's per-second report): GPU thread time spent with an empty ring
+// (waiting for the guest) and inside WAIT_REG_MEM sleeps, in system ticks; guest VdSwap calls.
+std::atomic<uint64_t> g_switch_cp_idle_ticks{0}, g_switch_cp_waitmem_ticks{0}, g_switch_cp_waitmem_count{0};
+std::atomic<uint32_t> g_switch_cp_state{0};  // 0 = executing packets, 1 = ring empty, 2 = WAIT_REG_MEM
+std::atomic<uint32_t> g_switch_vdswap_count{0};
 }  // namespace rex::graphics
+namespace {
+inline uint64_t SwitchTick() {
+  uint64_t v;
+  __asm__ __volatile__("mrs %x0, cntpct_el0" : "=r"(v));
+  return v;
+}
+}  // namespace
 #endif
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
@@ -236,6 +248,10 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+#if REX_PLATFORM_SWITCH
+      const uint64_t idle_t0 = SwitchTick();
+      g_switch_cp_state.store(1, std::memory_order_relaxed);
+#endif
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -255,6 +271,10 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+#if REX_PLATFORM_SWITCH
+      g_switch_cp_idle_ticks.fetch_add(SwitchTick() - idle_t0, std::memory_order_relaxed);
+      g_switch_cp_state.store(0, std::memory_order_relaxed);
+#endif
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -985,7 +1005,13 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+#if REX_PLATFORM_SWITCH
+  g_switch_cp_state.store(3, std::memory_order_relaxed);  // in IssueSwap (heartbeat diagnostics)
+#endif
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+#if REX_PLATFORM_SWITCH
+  g_switch_cp_state.store(0, std::memory_order_relaxed);
+#endif
 
   ++counter_;
   return true;
@@ -1017,6 +1043,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+#if REX_PLATFORM_SWITCH
+  uint64_t waitmem_t0 = 0;
+#endif
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1064,6 +1093,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       g_switch_gpu_wait_ref.store(ref, std::memory_order_relaxed);
       g_switch_gpu_wait_mask.store(mask, std::memory_order_relaxed);
       g_switch_gpu_wait_value.store(value, std::memory_order_relaxed);
+      if (!waitmem_t0) {
+        waitmem_t0 = SwitchTick();
+        g_switch_cp_state.store(2, std::memory_order_relaxed);
+      }
 #endif
       // Wait.
       if (wait >= 0x100) {
@@ -1088,6 +1121,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   } while (!matched);
 #if REX_PLATFORM_SWITCH
   g_switch_gpu_waiting.store(0, std::memory_order_relaxed);
+  if (waitmem_t0) {
+    g_switch_cp_waitmem_ticks.fetch_add(SwitchTick() - waitmem_t0, std::memory_order_relaxed);
+    g_switch_cp_waitmem_count.fetch_add(1, std::memory_order_relaxed);
+    g_switch_cp_state.store(0, std::memory_order_relaxed);
+  }
 #endif
 
   return true;

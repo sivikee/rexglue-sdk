@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -1377,9 +1378,22 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     uint32_t state = page_table_[page_number].state;
     if ((allocation_type == memory::kMemoryAllocationReserve) && state) {
       // Already reserved.
+#if REX_PLATFORM_SWITCH
+      // The title probes fixed addresses at boot (~430 hits in 2 s); every error line is flushed to the SD card,
+      // so only a sample is logged.
+      static std::atomic<uint32_t> already_reserved_count{0};
+      const uint32_t n = already_reserved_count.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 1000) == 0) {
+        REXSYS_ERROR(
+            "BaseHeap::AllocFixed attempting to reserve an already reserved range {:08X}+{:X} (#{}, logging "
+            "the first 8 and every 1000th)",
+            base_address, size, n);
+      }
+#else
       REXSYS_ERROR(
           "BaseHeap::AllocFixed attempting to reserve an already reserved "
           "range");
+#endif
       return false;
     }
     if ((allocation_type == memory::kMemoryAllocationCommit) &&

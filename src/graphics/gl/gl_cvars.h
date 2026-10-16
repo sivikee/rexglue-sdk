@@ -11,3 +11,5 @@ REXCVAR_DECLARE(bool, gl_gpu_resolve);
 REXCVAR_DECLARE(bool, gl_gpu_front);
 REXCVAR_DECLARE(bool, gl_cpu_frontbuffer);
 REXCVAR_DECLARE(int32_t, gl_resolve_log);
+REXCVAR_DECLARE(bool, gl_gpu_timers);
+REXCVAR_DECLARE(int32_t, gl_swap_interval);

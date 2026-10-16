@@ -5,6 +5,7 @@
 #include <rex/logging.h>
 
 #include "gl_ext.h"
+#include "perf.h"
 
 namespace rex::graphics::gl {
 
@@ -82,10 +83,7 @@ void StreamRing::Enter(int segment) {
     Commit();  // wrapped onto a segment that was left but never fenced
   }
   if (fences_[segment]) {
-    GLenum r = glClientWaitSync(fences_[segment], GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-    while (r == GL_TIMEOUT_EXPIRED) {
-      r = glClientWaitSync(fences_[segment], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
-    }
+    perf::FenceWaitLogged(fences_[segment], "stream ring");
     glDeleteSync(fences_[segment]);
     fences_[segment] = nullptr;
   }

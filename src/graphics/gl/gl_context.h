@@ -29,6 +29,7 @@ class GlContext {
   bool Initialize();
   void Shutdown();
   void SwapBuffers();
+  void SetSwapInterval(int interval);
   // Shared (resource-sharing) context for worker threads: make it current on the worker with
   // MakeCurrentWorker (surfaceless).
   void* CreateSharedContext();

@@ -43,6 +43,15 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+#if REX_PLATFORM_SWITCH
+// Horizon maps every host thread stack into the 2 GiB stack region, most of which the guest memory windows use
+// (memory_switch.cpp leaves ~448 MiB). At 16 MiB per guest thread the ~20th thread creation failed with
+// STATUS_NO_MEMORY (Bink's decode thread, a loader thread). Recompiled code keeps guest locals on the guest
+// stack, so host frames are small; the guest main thread keeps 16 MiB.
+REXCVAR_DEFINE_INT32(switch_guest_thread_host_stack_kb, 4096, "Kernel",
+                     "Switch: host stack size (KiB) of guest threads other than the main thread (min 512); host-side XHostThreads keep 16 MiB");
+#endif
+
 namespace rex::system {
 
 const uint32_t XAPC::kSize;
@@ -431,6 +440,12 @@ X_STATUS XThread::Create() {
 
   rex::thread::Thread::CreationParameters params;
   params.stack_size = 16_MiB;  // Allocate a big host stack.
+#if REX_PLATFORM_SWITCH
+  if (!main_thread_ && guest_thread_) {  // host threads (GPU command processor: Mesa compiles) keep 16 MiB
+    params.stack_size =
+        size_t(std::max<int32_t>(512, REXCVAR_GET(switch_guest_thread_host_stack_kb))) * 1024;
+  }
+#endif
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
@@ -461,7 +476,8 @@ X_STATUS XThread::Create() {
 
   if (!thread_) {
     // TODO(benvanik): translate error?
-    REXSYS_ERROR("CreateThread failed");
+    REXSYS_ERROR("CreateThread failed (host stack {} KiB, name '{}')", params.stack_size / 1024,
+                 thread_name_);
     return X_STATUS_NO_MEMORY;
   }
 

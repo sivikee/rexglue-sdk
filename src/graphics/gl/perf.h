@@ -29,6 +29,12 @@ enum Counter : int {
   kFlushTex, kFlushSm, kFlushFront, kFlushAge, kFlushCap, kFlushSync, kFlushOther,
   kGpuResolves, kCpuResolves, kGpuFrontBlits, kCpuFrontFrames, kLazyDownloads, kLazyDownloadBytes, kLazyDownloadTicks,
   kResolveSuperseded, kGpuResolveTicks,
+  // IssueSwap split (CPU wall time of each sub-step on the GPU thread)
+  kSwapPreTicks, kSwapClearTicks, kSwapBlitTicks, kSwapMiscTicks, kSwapOverlayTicks, kSwapPostTicks,
+  kSwapCpuTicks,      // CPU time the GPU thread actually consumed inside IssueSwap (svc ThreadTickCount)
+  kSwapGuestAhead,    // sum over swaps of (guest VdSwap count - presented swap count)
+  kPerfQueryTicks,    // GPU timer query / fence polling overhead
+  kFenceWaitTicks,    // blocking CPU waits on GL fences (stream rings, resolve read-backs)
   kCounterCount
 };
 
@@ -46,11 +52,55 @@ struct Scope {
 void OnSwap();
 // Text of the last report for the on-screen overlay (array of 3 strings).
 const std::string* OverlayLines();
+
+// ---- GPU-side timing (GL_TIMESTAMP queries) and frame completion fences; GL thread only ----
+enum GpuSeg : int {
+  kGpuSegFrame,     // GPU timestamp span from the end of the previous present to the start of this one (incl. idle)
+  kGpuSegSwap,      // present work: clear + front buffer blit + overlay
+  kGpuSegBlit,      // front buffer blit draw alone
+  kGpuSegResolve,   // compute resolves (dispatch)
+  kGpuSegSnapshot,  // resolve snapshot copies (glCopyImageSubData)
+  kGpuSegCount
+};
+// Initialises the query pool (call once with a current context). Logs timer support.
+void GpuTimersInit();
+// Issues a timestamp; returns a handle (or -1 when disabled / pool exhausted).
+int GpuStamp();
+// Issues the end timestamp of a segment that began with GpuStamp(); the duration is added when available.
+void GpuSegEnd(GpuSeg seg, int begin);
+// Timestamp at the start of a present: measures how far the GPU runs behind the CPU (lag).
+void GpuLagMark();
+// Timestamp at the end of a frame's GPU work (just before eglSwapBuffers). The next NotePresentAcquired() (CPU
+// time the next frame got its back buffer, i.e. after the first clear of the default framebuffer) gives the
+// present wait beyond GPU completion (vsync / compositor).
+void GpuFrameEndMark();
+void NotePresentAcquired();
+// Frame completion fence (after eglSwapBuffers) and non-blocking polling of older ones.
+void FrameFenceIssue();
+void FrameFencePoll();
+// Collects available query results (call once per swap).
+void GpuPoll();
+// Waits on a fence like the backend's loops (GL_SYNC_FLUSH_COMMANDS_BIT, 1 s slices) and warns about long waits.
+void FenceWaitLogged(void* sync, const char* who);
+// CPU time consumed by the calling thread (svcGetInfo ThreadTickCount), in system ticks; 0 if unavailable.
+uint64_t ThreadCpuTicks();
 #else
 inline void Add(Counter, uint64_t = 1) {}
 struct Scope { explicit Scope(Counter) {} };
 inline void OnSwap() {}
 inline const std::string* OverlayLines() { return nullptr; }
+enum GpuSeg : int { kGpuSegFrame, kGpuSegSwap, kGpuSegBlit, kGpuSegResolve, kGpuSegSnapshot, kGpuSegCount };
+inline void GpuTimersInit() {}
+inline int GpuStamp() { return -1; }
+inline void GpuSegEnd(GpuSeg, int) {}
+inline void GpuLagMark() {}
+inline void GpuFrameEndMark() {}
+inline void NotePresentAcquired() {}
+inline void FrameFenceIssue() {}
+inline void FrameFencePoll() {}
+inline void GpuPoll() {}
+inline void FenceWaitLogged(void*, const char*) {}
+inline uint64_t ThreadCpuTicks() { return 0; }
 #endif
 
 }  // namespace rex::graphics::gl::perf

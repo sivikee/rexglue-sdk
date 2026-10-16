@@ -133,6 +133,10 @@ void GlContext::Shutdown() {
   display_ = surface_ = context_ = nullptr;
 }
 
+void GlContext::SetSwapInterval(int interval) {
+  if (display_) eglSwapInterval(static_cast<EGLDisplay>(display_), interval);
+}
+
 void GlContext::SwapBuffers() {
   eglSwapBuffers(static_cast<EGLDisplay>(display_), static_cast<EGLSurface>(surface_));
 }
