@@ -67,7 +67,10 @@ struct State {
   uint8_t* pool = nullptr;
   size_t pool_units = 0;
   std::vector<bool> pool_used;   // per pool unit
-  std::vector<int32_t> pool_of;  // per guest unit: pool unit index or -1
+  std::vector<int32_t> pool_of;  // per guest unit: pool unit index, -1 = uncommitted, -2 = blocked (foreign mapping)
+  std::vector<std::pair<uint32_t, uint32_t>> blocked;  // guest {addr, size} of foreign mappings
+  int lazy_logged = 0;
+  int fault_commits = 0;
   size_t total_units = 0;
   int protect_logged = 0;
 };
@@ -203,12 +206,18 @@ bool CommitLocked(State& s, const void* addr, size_t length) {
   FindWindow(s, reinterpret_cast<void*>(end - 1), &last_unit);
   size_t u = first_unit;
   while (u <= last_unit) {
+    if (s.pool_of[u] == -2) {
+      REXLOG_ERROR("Switch commit hits a blocked unit (foreign host mapping) at guest 0x{:08X}",
+                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(UnitAddr(s, win, u)) -
+                                         reinterpret_cast<uintptr_t>(s.base)));
+      return false;
+    }
     if (s.pool_of[u] >= 0) {
       ++u;
       continue;
     }
     size_t run = 1;
-    while (u + run <= last_unit && s.pool_of[u + run] < 0) {
+    while (u + run <= last_unit && s.pool_of[u + run] == -1) {
       ++run;
     }
     if (!CommitRun(s, win, u, run)) {
@@ -302,12 +311,32 @@ void* SwitchInitGuestArena() {
       u64 qa = reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo, qend = qa + g_windows[i].size;
       u32 qpi = 0;
       int nblocks = 0;
-      while (qa < qend && nblocks < 16) {
+      while (qa < qend) {
         MemoryInfo qm{};
         if (R_FAILED(svcQueryMemory(&qm, &qpi, qa))) break;
-        BOOTLOG("arena: win%d block addr=0x%llx size=0x%llx type=%u perm=%u", i, (unsigned long long)qm.addr,
-                (unsigned long long)qm.size, qm.type, qm.perm);
-        ++nblocks;
+        if (qm.type != 0) {
+          // Foreign host mapping inside the window (e.g. a libnx thread stack mirror created before
+          // the arena was reserved; its address is randomised on hardware). Block whole units.
+          u64 b0 = qm.addr;
+          u64 lo = b0 < reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo
+                       ? reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo
+                       : b0;
+          u64 hi = qm.addr + qm.size > qend ? qend : qm.addr + qm.size;
+          lo &= ~(u64(kUnit) - 1);
+          hi = (hi + kUnit - 1) & ~(u64(kUnit) - 1);
+          if (lo < reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo) lo = reinterpret_cast<u64>(s.base) + g_windows[i].guest_lo;
+          if (hi > qend) hi = qend;
+          if (hi > lo) {
+            if (!s.blocked.empty() && s.blocked.back().first + s.blocked.back().second == uint32_t(lo - reinterpret_cast<u64>(s.base)))
+              s.blocked.back().second += uint32_t(hi - lo);
+            else
+              s.blocked.push_back({uint32_t(lo - reinterpret_cast<u64>(s.base)), uint32_t(hi - lo)});
+          }
+          if (nblocks < 16)
+            BOOTLOG("arena: win%d FOREIGN block addr=0x%llx size=0x%llx type=%u perm=%u -> blocked", i,
+                    (unsigned long long)qm.addr, (unsigned long long)qm.size, qm.type, qm.perm);
+          ++nblocks;
+        }
         if (!qm.size) break;
         qa = qm.addr + qm.size;
       }
@@ -320,6 +349,13 @@ void* SwitchInitGuestArena() {
   virtmemUnlock();
   s.total_units = units;
   s.pool_of.assign(units, -1);
+  for (const auto& b : s.blocked) {
+    for (uint64_t g = b.first; g < uint64_t(b.first) + b.second; g += kUnit) {
+      size_t unit = 0;
+      if (FindWindow(s, s.base + g, &unit) >= 0) s.pool_of[unit] = -2;
+    }
+    BOOTLOG("arena: blocked guest range 0x%08x + 0x%x", b.first, b.second);
+  }
   BOOTLOG("arena: reservations done");
   LogWindowBlocks(s, "guest arena init");
   s.arena_ready = true;
@@ -337,10 +373,50 @@ bool HandleGuestMemoryFault(uintptr_t address) {
   }
   bool ok = false;
   if (FindWindow(s, reinterpret_cast<void*>(address), nullptr) >= 0) {
+    ++s.fault_commits;
+    REXLOG_ERROR("Switch demand-commit fault #{} at guest 0x{:08X} (should not happen: commits are eager)",
+                 s.fault_commits, static_cast<uint32_t>(address - reinterpret_cast<uintptr_t>(s.base)));
     ok = CommitLocked(s, reinterpret_cast<void*>(address), 1);
   }
   s.mutex.unlock();
   return ok;
+}
+
+void* SwitchArenaBase() {
+  State& s = S();
+  return s.arena_ready ? s.base : nullptr;
+}
+
+bool SwitchGuestMapped(uint32_t g) {
+  State& s = S();
+  if (!s.arena_ready) return false;
+  size_t unit = 0;
+  if (FindWindow(s, s.base + g, &unit) < 0) return false;
+  return s.pool_of[unit] >= 0;
+}
+
+void SwitchGetBlockedRanges(std::vector<std::pair<uint32_t, uint32_t>>* out) {
+  State& s = S();
+  for (const auto& b : s.blocked) out->push_back(b);
+}
+
+bool SwitchEnsureMapped(const void* host_addr, size_t length, const char* why) {
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  size_t unit = 0;
+  if (!s.arena_ready || FindWindow(s, host_addr, &unit) < 0 || !length) return true;
+  bool lazy = false;
+  uintptr_t a = reinterpret_cast<uintptr_t>(host_addr);
+  for (uintptr_t p = a & ~(uintptr_t(kUnit) - 1); p < a + length; p += kUnit) {
+    size_t u = 0;
+    if (FindWindow(s, reinterpret_cast<void*>(p), &u) >= 0 && s.pool_of[u] == -1) lazy = true;
+  }
+  if (lazy && s.lazy_logged < 32) {
+    ++s.lazy_logged;
+    REXLOG_WARN("Switch: {} touches reserved-but-uncommitted guest memory 0x{:08X}+0x{:X}; mapping eagerly", why,
+                static_cast<uint32_t>(a - reinterpret_cast<uintptr_t>(s.base)), length);
+  }
+  return CommitLocked(s, host_addr, length);
 }
 
 void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,

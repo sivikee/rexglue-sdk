@@ -252,6 +252,23 @@ bool Memory::Initialize() {
                           rex::memory::PageAccess::kReadWrite);
 #endif
 
+#if REX_PLATFORM_SWITCH
+  {
+    // Foreign host mappings (libnx thread stacks created before the arena was reserved; randomised
+    // on hardware) sit inside the guest windows and can never be committed: keep the guest heaps
+    // from ever handing those pages out.
+    std::vector<std::pair<uint32_t, uint32_t>> blocked;
+    rex::memory::SwitchGetBlockedRanges(&blocked);
+    for (const auto& b : blocked) {
+      BaseHeap* h = LookupHeap(b.first);
+      bool ok = h && h->AllocFixed(b.first, b.second, 64 * 1024, memory::kMemoryAllocationReserve,
+                                   memory::kMemoryProtectNoAccess);
+      REXSYS_WARN("Switch: blocked guest range 0x{:08X}+0x{:X} (foreign host mapping) reserved in heap: {}",
+                  b.first, b.second, ok ? "ok" : "FAILED");
+    }
+  }
+#endif
+
   // Install MMIO handler for physical address translation and MMIO ranges
   mmio_handler_ = runtime::MMIOHandler::Install(
       virtual_membase_, physical_membase_, physical_membase_ + 0x1FFFFFFF, HostToGuestVirtualThunk,
