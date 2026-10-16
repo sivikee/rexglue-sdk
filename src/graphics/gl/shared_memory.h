@@ -11,12 +11,15 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
 #include <glad/glad.h>
 
 #include <rex/graphics/shared_memory.h>
+
+#include "stream_ring.h"
 
 namespace rex::graphics::gl {
 
@@ -41,6 +44,8 @@ class GlSharedMemory final : public SharedMemory {
   // False if the range is not resident or not contiguous in the store.
   bool GetHostRange(uint32_t address, uint32_t length, GLuint& buffer, GLintptr& offset) const;
   uint32_t total_bytes() const { return next_slot_ << kGranuleLog2; }
+  // Called with a guest physical range before it is read from guest memory (flushes pending async resolves).
+  void SetPreReadHook(std::function<void(uint32_t, uint32_t)> hook) { pre_read_hook_ = std::move(hook); }
 
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -50,6 +55,8 @@ class GlSharedMemory final : public SharedMemory {
  private:
   bool EnsureCapacity(uint32_t slots_needed_total);
 
+  StreamRing staging_;
+  std::function<void(uint32_t, uint32_t)> pre_read_hook_;
   GLuint store_ = 0;
   GLuint store_tbo_ = 0;
   GLuint pt_ = 0;

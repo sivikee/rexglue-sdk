@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -64,7 +65,42 @@ class GlRenderTargets {
   bool Resolve(uint32_t& extent_start_out, uint32_t& extent_length_out);
 
   void EndFrame() { ++frame_; }
+
+  // ---- Asynchronous resolves ----
+  // Resolves read the render target back through a PBO and are converted to guest memory later. Anything
+  // that reads guest memory must call FlushPending first for the range it reads.
+  void FlushPending(uint32_t start, uint32_t length);
+  void FlushAll();
+  // Per-swap housekeeping: converts resolves that are ready / too old.
+  void PollPending();
+  // A recent, not yet written-back resolve that wrote exactly this 32bpp 2D tiled image (origin 0,0, rw x rh
+  // pixels, pitch in pixels, endian). Returns a GL_TEXTURE_2D_ARRAY (1 layer, RGBA8) snapshot of the
+  // render target as it was at the resolve. swap_rb: guest byte0 is the snapshot blue channel.
+  bool FindSnapshot(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t endian,
+                    GLuint& texture_out, bool& swap_rb_out) const;
   bool DebugReadColor(uint32_t base, std::vector<uint8_t>& rgba, uint32_t& w, uint32_t& h);
+
+  struct PendingResolve {
+    uint64_t frame = 0;
+    uint32_t dest_base = 0, extent_start = 0, extent_length = 0;
+    uint32_t ox = 0, oy = 0, rw = 0, rh = 0, dest_pitch = 0;
+    xenos::TextureFormat dest_format = xenos::TextureFormat::k_8_8_8_8;
+    uint32_t bpp = 4, bpp_log2 = 2;
+    xenos::Endian128 endian = xenos::Endian128::kNone;
+    bool swap_rb = false, src_is_8888 = false;
+    GLuint pbo = 0;
+    uint32_t pbo_size = 0;
+    GLsync fence = nullptr;
+    GLuint snapshot = 0;
+    uint32_t snapshot_w = 0, snapshot_h = 0;
+  };
+  struct Snapshot {
+    GLuint texture = 0;
+    uint32_t w = 0, h = 0;
+  };
+  void ConvertPending(PendingResolve& pr, const void* pixels);
+  void FlushFront(bool wait);
+  void ReleasePending(PendingResolve& pr);
 
  private:
   struct FbKey {
@@ -93,6 +129,9 @@ class GlRenderTargets {
   bool bound_depth_ = false;
   uint64_t frame_ = 0;
   uint32_t resolve_count_ = 0;
+  std::deque<PendingResolve> pending_;
+  std::vector<std::pair<GLuint, uint32_t>> free_pbos_;
+  std::vector<Snapshot> free_snapshots_;
 };
 
 }  // namespace rex::graphics::gl

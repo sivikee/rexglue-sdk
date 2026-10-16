@@ -9,7 +9,9 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+#include "gl_cvars.h"
 #include "gl_ext.h"
+#include "tiling.h"
 
 namespace rex::graphics::gl {
 
@@ -359,132 +361,90 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
       bool swap_rb = ri.copy_dest_info.copy_dest_swap;
       bool src_is_8888 = rt->internal_format == GL_RGBA8;
       if (rw && rh) {
-        std::vector<uint8_t> px8;
-        std::vector<float> pxf;
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo_);
-        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->texture, 0);
-        glReadBuffer(GL_COLOR_ATTACHMENT0);
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        PendingResolve pr;
+        pr.frame = frame_;
+        pr.dest_base = ri.copy_dest_base;
+        pr.extent_start = ri.copy_dest_extent_start;
+        pr.extent_length = ri.copy_dest_extent_length;
+        pr.ox = ox;
+        pr.oy = oy;
+        pr.rw = rw;
+        pr.rh = rh;
+        pr.dest_pitch = dest_pitch;
+        pr.dest_format = dest_format;
+        pr.bpp = bpp;
+        pr.bpp_log2 = bpp_log2;
+        pr.endian = endian;
+        pr.swap_rb = swap_rb;
+        pr.src_is_8888 = src_is_8888;
+        const bool sync = REXCVAR_GET(gl_sync_resolve);
+        pr.pbo_size = rw * rh * (src_is_8888 ? 4 : 16);
         {
           perf::Scope perf_readback_scope(perf::kReadbackTicks);
-          if (src_is_8888) {
-            px8.resize(size_t(rw) * rh * 4);
-            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px8.data());
+          glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo_);
+          glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->texture, 0);
+          glReadBuffer(GL_COLOR_ATTACHMENT0);
+          glPixelStorei(GL_PACK_ALIGNMENT, 1);
+          for (size_t k = 0; k < free_pbos_.size(); ++k) {
+            if (free_pbos_[k].second >= pr.pbo_size && free_pbos_[k].second <= pr.pbo_size * 2) {
+              pr.pbo = free_pbos_[k].first;
+              pr.pbo_size = free_pbos_[k].second;
+              free_pbos_.erase(free_pbos_.begin() + k);
+              break;
+            }
+          }
+          if (!pr.pbo) {
+            glGenBuffers(1, &pr.pbo);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+            glBufferData(GL_PIXEL_PACK_BUFFER, pr.pbo_size, nullptr, GL_STREAM_READ);
           } else {
-            pxf.resize(size_t(rw) * rh * 4);
-            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_FLOAT, pxf.data());
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
           }
-        }
-        const bool log_first = resolve_count_ <= 4;
-        uint8_t* dest_base = memory_.TranslatePhysical(ri.copy_dest_base);
-        uint8_t texel[16];
-        for (uint32_t j = 0; j < rh; ++j) {
-          for (uint32_t i = 0; i < rw; ++i) {
-            float c[4];
-            uint8_t b8[4];
-            size_t si = size_t(j) * rw + i;
-            if (src_is_8888) {
-              for (int k = 0; k < 4; ++k) {
-                b8[k] = px8[si * 4 + k];
-                c[k] = b8[k] * (1.0f / 255.0f);
-              }
-            } else {
-              for (int k = 0; k < 4; ++k) {
-                c[k] = pxf[si * 4 + k];
-                b8[k] = uint8_t(std::clamp(c[k], 0.0f, 1.0f) * 255.0f + 0.5f);
-              }
-            }
-            if (swap_rb) {
-              std::swap(b8[0], b8[2]);
-              std::swap(c[0], c[2]);
-            }
-            std::memset(texel, 0, sizeof(texel));
-            switch (xenos::ColorFormat(dest_format)) {
-              case xenos::ColorFormat::k_8_8_8_8:
-              case xenos::ColorFormat::k_8_8_8_8_A:
-              case xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16:
-                std::memcpy(texel, b8, 4);
-                break;
-              case xenos::ColorFormat::k_8:
-              case xenos::ColorFormat::k_8_A:
-              case xenos::ColorFormat::k_8_B:
-                texel[0] = b8[0];
-                break;
-              case xenos::ColorFormat::k_8_8:
-                texel[0] = b8[0];
-                texel[1] = b8[1];
-                break;
-              case xenos::ColorFormat::k_5_6_5: {
-                uint16_t v = uint16_t(((b8[0] >> 3) << 11) | ((b8[1] >> 2) << 5) | (b8[2] >> 3));
-                std::memcpy(texel, &v, 2);
-                break;
-              }
-              case xenos::ColorFormat::k_1_5_5_5: {
-                uint16_t v = uint16_t(((b8[3] >> 7) << 15) | ((b8[0] >> 3) << 10) |
-                                      ((b8[1] >> 3) << 5) | (b8[2] >> 3));
-                std::memcpy(texel, &v, 2);
-                break;
-              }
-              case xenos::ColorFormat::k_4_4_4_4: {
-                uint16_t v = uint16_t(((b8[3] >> 4) << 12) | ((b8[0] >> 4) << 8) | ((b8[1] >> 4) << 4) |
-                                      (b8[2] >> 4));
-                std::memcpy(texel, &v, 2);
-                break;
-              }
-              case xenos::ColorFormat::k_2_10_10_10:
-              case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16: {
-                uint32_t r = uint32_t(std::clamp(c[0], 0.0f, 1.0f) * 1023.0f + 0.5f);
-                uint32_t g = uint32_t(std::clamp(c[1], 0.0f, 1.0f) * 1023.0f + 0.5f);
-                uint32_t bl = uint32_t(std::clamp(c[2], 0.0f, 1.0f) * 1023.0f + 0.5f);
-                uint32_t a = uint32_t(std::clamp(c[3], 0.0f, 1.0f) * 3.0f + 0.5f);
-                uint32_t v = r | (g << 10) | (bl << 20) | (a << 30);
-                std::memcpy(texel, &v, 4);
-                break;
-              }
-              case xenos::ColorFormat::k_16_16_16_16_FLOAT:
-              case xenos::ColorFormat::k_16_16_FLOAT:
-              case xenos::ColorFormat::k_16_FLOAT: {
-                uint16_t hv[4] = {FloatToHalf(c[0]), FloatToHalf(c[1]), FloatToHalf(c[2]), FloatToHalf(c[3])};
-                std::memcpy(texel, hv, bpp);
-                break;
-              }
-              case xenos::ColorFormat::k_32_FLOAT:
-                std::memcpy(texel, &c[0], 4);
-                break;
-              case xenos::ColorFormat::k_32_32_FLOAT:
-                std::memcpy(texel, &c[0], 4);
-                std::memcpy(texel + 4, &c[1], 4);
-                break;
-              case xenos::ColorFormat::k_32_32_32_32_FLOAT:
-                std::memcpy(texel, c, 16);
-                break;
-              case xenos::ColorFormat::k_16:
-              case xenos::ColorFormat::k_16_16:
-              case xenos::ColorFormat::k_16_16_16_16: {
-                uint16_t uv[4];
-                for (int k = 0; k < 4; ++k) {
-                  uv[k] = uint16_t(std::clamp(c[k], 0.0f, 1.0f) * 65535.0f + 0.5f);
-                }
-                std::memcpy(texel, uv, bpp);
-                break;
-              }
-              default:
-                std::memcpy(texel, b8, 4);
-                break;
-            }
-            ApplyEndian(texel, bpp, endian);
-            uint32_t off = uint32_t(texture_util::GetTiledOffset2D(int32_t(ox + i), int32_t(oy + j),
-                                                                   dest_pitch, bpp_log2));
-            std::memcpy(dest_base + off, texel, bpp);
+          if (src_is_8888) {
+            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+          } else {
+            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_FLOAT, nullptr);
           }
+          glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+          pr.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         }
-        if (log_first) {
+        const bool rgba8_dest = src_is_8888 && bpp == 4 &&
+                                (dest_format == xenos::TextureFormat::k_8_8_8_8 ||
+                                 dest_format == xenos::TextureFormat::k_8_8_8_8_A);
+        if (rgba8_dest && ox == 0 && oy == 0 && !sync && REXCVAR_GET(gl_resolve_gpu_copy)) {
+          // GPU-side snapshot of the resolved rectangle for consumers (textures, front buffer).
+          for (size_t k = 0; k < free_snapshots_.size(); ++k) {
+            if (free_snapshots_[k].w == rw && free_snapshots_[k].h == rh) {
+              pr.snapshot = free_snapshots_[k].texture;
+              free_snapshots_.erase(free_snapshots_.begin() + k);
+              break;
+            }
+          }
+          if (!pr.snapshot) {
+            glGenTextures(1, &pr.snapshot);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, pr.snapshot);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, rw, rh, 1);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
+          }
+          pr.snapshot_w = rw;
+          pr.snapshot_h = rh;
+          glCopyImageSubData(rt->texture, GL_TEXTURE_2D, 0, GLint(x0), GLint(y0), 0, pr.snapshot,
+                             GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, GLsizei(rw), GLsizei(rh), 1);
+        }
+        if (resolve_count_ <= 4) {
           REXGPU_INFO(
               "GL resolve #{}: RT base={} {}x{} fmt={} -> dest 0x{:08X} fmt={} pitch={} rect=({},{}) {}x{} "
-              "endian={} swap={}",
+              "endian={} swap={} snapshot={}",
               resolve_count_, uint32_t(color_info.color_base), rt->width, rt->height, uint32_t(color_info.color_format),
               ri.copy_dest_base, uint32_t(dest_format), dest_pitch, x0, y0, rw, rh, uint32_t(endian),
-              uint32_t(swap_rb));
+              uint32_t(swap_rb), pr.snapshot != 0);
+        }
+        pending_.push_back(pr);
+        if (sync) {
+          FlushAll();
+        } else {
+          while (pending_.size() > 8) FlushFront(true);
         }
         extent_start_out = ri.copy_dest_extent_start;
         extent_length_out = ri.copy_dest_extent_length;
@@ -591,4 +551,241 @@ bool GlRenderTargets::DebugReadColor(uint32_t base, std::vector<uint8_t>& rgba, 
   }
   return false;
 }
+}  // namespace rex::graphics::gl
+
+namespace rex::graphics::gl {
+
+void GlRenderTargets::ConvertPending(PendingResolve& pr, const void* pixels) {
+  perf::Scope perf_conv_scope(perf::kResolveConvTicks);
+  const uint32_t rw = pr.rw, rh = pr.rh, ox = pr.ox, oy = pr.oy, dest_pitch = pr.dest_pitch, bpp = pr.bpp,
+                 bpp_log2 = pr.bpp_log2;
+  const bool src_is_8888 = pr.src_is_8888, swap_rb = pr.swap_rb;
+  const xenos::TextureFormat dest_format = pr.dest_format;
+  const xenos::Endian128 endian = pr.endian;
+  uint8_t* dest_base = memory_.TranslatePhysical(pr.dest_base);
+  const uint8_t* px8 = src_is_8888 ? static_cast<const uint8_t*>(pixels) : nullptr;
+  const float* pxf = src_is_8888 ? nullptr : static_cast<const float*>(pixels);
+  const bool fast_dest = dest_format == xenos::TextureFormat::k_8_8_8_8 ||
+                         dest_format == xenos::TextureFormat::k_8_8_8_8_A ||
+                         dest_format == xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16;
+  if (src_is_8888 && bpp == 4 && fast_dest && uint32_t(endian) <= uint32_t(xenos::Endian128::k16in32)) {
+    // Fast path: 32-bit texel, endian swap by bit tricks, inline tiling.
+    const uint32_t pitch_aligned = (dest_pitch + 31) & ~31u;
+    for (uint32_t j = 0; j < rh; ++j) {
+      const uint8_t* row = px8 + size_t(j) * rw * 4;
+      for (uint32_t i = 0; i < rw; ++i) {
+        uint32_t v;
+        std::memcpy(&v, row + size_t(i) * 4, 4);
+        if (swap_rb) v = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
+        switch (endian) {
+          case xenos::Endian128::k8in16: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+          case xenos::Endian128::k8in32: v = __builtin_bswap32(v); break;
+          case xenos::Endian128::k16in32: v = (v << 16) | (v >> 16); break;
+          default: break;
+        }
+        std::memcpy(dest_base + TiledOffset2D(ox + i, oy + j, pitch_aligned, 2), &v, 4);
+      }
+    }
+    return;
+  }
+  uint8_t texel[16];
+        for (uint32_t j = 0; j < rh; ++j) {
+          for (uint32_t i = 0; i < rw; ++i) {
+            float c[4];
+            uint8_t b8[4];
+            size_t si = size_t(j) * rw + i;
+            if (src_is_8888) {
+              for (int k = 0; k < 4; ++k) {
+                b8[k] = px8[si * 4 + k];
+                c[k] = b8[k] * (1.0f / 255.0f);
+              }
+            } else {
+              for (int k = 0; k < 4; ++k) {
+                c[k] = pxf[si * 4 + k];
+                b8[k] = uint8_t(std::clamp(c[k], 0.0f, 1.0f) * 255.0f + 0.5f);
+              }
+            }
+            if (swap_rb) {
+              std::swap(b8[0], b8[2]);
+              std::swap(c[0], c[2]);
+            }
+            std::memset(texel, 0, sizeof(texel));
+            switch (xenos::ColorFormat(dest_format)) {
+              case xenos::ColorFormat::k_8_8_8_8:
+              case xenos::ColorFormat::k_8_8_8_8_A:
+              case xenos::ColorFormat::k_8_8_8_8_AS_16_16_16_16:
+                std::memcpy(texel, b8, 4);
+                break;
+              case xenos::ColorFormat::k_8:
+              case xenos::ColorFormat::k_8_A:
+              case xenos::ColorFormat::k_8_B:
+                texel[0] = b8[0];
+                break;
+              case xenos::ColorFormat::k_8_8:
+                texel[0] = b8[0];
+                texel[1] = b8[1];
+                break;
+              case xenos::ColorFormat::k_5_6_5: {
+                uint16_t v = uint16_t(((b8[0] >> 3) << 11) | ((b8[1] >> 2) << 5) | (b8[2] >> 3));
+                std::memcpy(texel, &v, 2);
+                break;
+              }
+              case xenos::ColorFormat::k_1_5_5_5: {
+                uint16_t v = uint16_t(((b8[3] >> 7) << 15) | ((b8[0] >> 3) << 10) |
+                                      ((b8[1] >> 3) << 5) | (b8[2] >> 3));
+                std::memcpy(texel, &v, 2);
+                break;
+              }
+              case xenos::ColorFormat::k_4_4_4_4: {
+                uint16_t v = uint16_t(((b8[3] >> 4) << 12) | ((b8[0] >> 4) << 8) | ((b8[1] >> 4) << 4) |
+                                      (b8[2] >> 4));
+                std::memcpy(texel, &v, 2);
+                break;
+              }
+              case xenos::ColorFormat::k_2_10_10_10:
+              case xenos::ColorFormat::k_2_10_10_10_AS_16_16_16_16: {
+                uint32_t r = uint32_t(std::clamp(c[0], 0.0f, 1.0f) * 1023.0f + 0.5f);
+                uint32_t g = uint32_t(std::clamp(c[1], 0.0f, 1.0f) * 1023.0f + 0.5f);
+                uint32_t bl = uint32_t(std::clamp(c[2], 0.0f, 1.0f) * 1023.0f + 0.5f);
+                uint32_t a = uint32_t(std::clamp(c[3], 0.0f, 1.0f) * 3.0f + 0.5f);
+                uint32_t v = r | (g << 10) | (bl << 20) | (a << 30);
+                std::memcpy(texel, &v, 4);
+                break;
+              }
+              case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+              case xenos::ColorFormat::k_16_16_FLOAT:
+              case xenos::ColorFormat::k_16_FLOAT: {
+                uint16_t hv[4] = {FloatToHalf(c[0]), FloatToHalf(c[1]), FloatToHalf(c[2]), FloatToHalf(c[3])};
+                std::memcpy(texel, hv, bpp);
+                break;
+              }
+              case xenos::ColorFormat::k_32_FLOAT:
+                std::memcpy(texel, &c[0], 4);
+                break;
+              case xenos::ColorFormat::k_32_32_FLOAT:
+                std::memcpy(texel, &c[0], 4);
+                std::memcpy(texel + 4, &c[1], 4);
+                break;
+              case xenos::ColorFormat::k_32_32_32_32_FLOAT:
+                std::memcpy(texel, c, 16);
+                break;
+              case xenos::ColorFormat::k_16:
+              case xenos::ColorFormat::k_16_16:
+              case xenos::ColorFormat::k_16_16_16_16: {
+                uint16_t uv[4];
+                for (int k = 0; k < 4; ++k) {
+                  uv[k] = uint16_t(std::clamp(c[k], 0.0f, 1.0f) * 65535.0f + 0.5f);
+                }
+                std::memcpy(texel, uv, bpp);
+                break;
+              }
+              default:
+                std::memcpy(texel, b8, 4);
+                break;
+            }
+            ApplyEndian(texel, bpp, endian);
+            uint32_t off = uint32_t(texture_util::GetTiledOffset2D(int32_t(ox + i), int32_t(oy + j),
+                                                                   dest_pitch, bpp_log2));
+            std::memcpy(dest_base + off, texel, bpp);
+          }
+        }
+}
+
+void GlRenderTargets::ReleasePending(PendingResolve& pr) {
+  if (pr.fence) {
+    glDeleteSync(pr.fence);
+    pr.fence = nullptr;
+  }
+  if (pr.pbo) {
+    free_pbos_.emplace_back(pr.pbo, pr.pbo_size);
+    pr.pbo = 0;
+    while (free_pbos_.size() > 6) {
+      glDeleteBuffers(1, &free_pbos_.front().first);
+      free_pbos_.erase(free_pbos_.begin());
+    }
+  }
+  if (pr.snapshot) {
+    free_snapshots_.push_back({pr.snapshot, pr.snapshot_w, pr.snapshot_h});
+    pr.snapshot = 0;
+    while (free_snapshots_.size() > 6) {
+      glDeleteTextures(1, &free_snapshots_.front().texture);
+      free_snapshots_.erase(free_snapshots_.begin());
+    }
+  }
+}
+
+void GlRenderTargets::FlushFront(bool wait) {
+  if (pending_.empty()) return;
+  PendingResolve& pr = pending_.front();
+  if (!wait) {
+    GLenum r = glClientWaitSync(pr.fence, 0, 0);
+    if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED) return;
+  }
+  const void* data = nullptr;
+  {
+    perf::Scope perf_readback_scope(perf::kReadbackTicks);
+    GLenum r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+    while (r == GL_TIMEOUT_EXPIRED) {
+      r = glClientWaitSync(pr.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pr.pbo);
+    data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, pr.rw * pr.rh * (pr.src_is_8888 ? 4 : 16), GL_MAP_READ_BIT);
+  }
+  if (data) {
+    ConvertPending(pr, data);
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+  }
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  ReleasePending(pr);
+  pending_.pop_front();
+}
+
+void GlRenderTargets::FlushPending(uint32_t start, uint32_t length) {
+  if (pending_.empty()) return;
+  int last = -1;
+  uint64_t end = uint64_t(start) + length;
+  for (size_t i = 0; i < pending_.size(); ++i) {
+    const PendingResolve& pr = pending_[i];
+    if (uint64_t(pr.extent_start) < end && uint64_t(pr.extent_start) + pr.extent_length > start) last = int(i);
+  }
+  for (int i = 0; i <= last; ++i) FlushFront(true);
+}
+
+void GlRenderTargets::FlushAll() {
+  while (!pending_.empty()) FlushFront(true);
+}
+
+void GlRenderTargets::PollPending() {
+  const int64_t max_age = std::max(0, REXCVAR_GET(gl_resolve_max_age));
+  while (!pending_.empty()) {
+    int64_t age = int64_t(frame_) - int64_t(pending_.front().frame);
+    if (age >= max_age) {
+      FlushFront(true);
+    } else if (age >= 1) {
+      size_t before = pending_.size();
+      FlushFront(false);
+      if (pending_.size() == before) break;
+    } else {
+      break;
+    }
+  }
+}
+
+bool GlRenderTargets::FindSnapshot(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch,
+                                   uint32_t endian, GLuint& texture_out, bool& swap_rb_out) const {
+  for (size_t i = pending_.size(); i-- > 0;) {
+    const PendingResolve& pr = pending_[i];
+    // A newer resolve covering the base that is not an exact match makes older snapshots unreliable.
+    // Newest resolve overlapping the texture range decides; only an exact match is usable.
+    if (pr.snapshot && pr.dest_base == base && pr.rw == width && pr.rh == height &&
+        ((pr.dest_pitch + 31) & ~31u) == ((pitch + 31) & ~31u) && uint32_t(pr.endian) == endian) {
+      texture_out = pr.snapshot;
+      swap_rb_out = pr.swap_rb;
+      return true;
+    }
+if (pr.extent_start <= base && base < uint64_t(pr.extent_start) + pr.extent_length) return false;
+  }
+  return false;
+}
+
 }  // namespace rex::graphics::gl

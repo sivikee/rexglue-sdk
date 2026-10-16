@@ -11,8 +11,6 @@ namespace rex::graphics::gl::perf {
 namespace {
 std::string g_lines[3];
 uint64_t g_last_report = 0, g_last_swap = 0, g_sum_ft = 0, g_max_ft = 0, g_frames = 0;
-uint64_t g_idle_prev[4] = {};
-bool g_idle_valid = false;
 FILE* g_file = nullptr;
 bool g_file_tried = false;
 
@@ -43,30 +41,12 @@ void OnSwap() {
   double fps = g_frames / secs;
   double avg = g_frames ? Ms(g_sum_ft) / g_frames : 0.0;
   double mx = Ms(g_max_ft);
-  // Idle ticks per core (INVALID_HANDLE + core index); busy% = 1 - idle/elapsed.
-  double busy[4] = {-1, -1, -1, -1};
-  uint64_t idle[4];
-  bool ok = true;
-  for (int i = 0; i < 4; ++i) {
-    idle[i] = 0;
-    if (R_FAILED(svcGetInfo(&idle[i], InfoType_IdleTickCount, INVALID_HANDLE, i))) ok = false;
-  }
-  if (ok && g_idle_valid) {
-    for (int i = 0; i < 4; ++i) {
-      double b = 100.0 * (1.0 - double(idle[i] - g_idle_prev[i]) / double(elapsed));
-      busy[i] = std::clamp(b, 0.0, 100.0);
-    }
-  }
-  if (ok) {
-    for (int i = 0; i < 4; ++i) g_idle_prev[i] = idle[i];
-    g_idle_valid = true;
-  }
   char l1[320], l2[320], l3[160];
   std::snprintf(l1, sizeof l1,
-                "perf: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms) "
+                "perf: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
                 "copies=%llu (%.0f ms, readback %.0f ms)",
                 fps, avg, mx, Ms(c[kSwapTicks]), Ms(c[kSwapBufTicks]), Ms(c[kSwapDetileTicks]),
-                (unsigned long long)c[kDraws], Ms(c[kDrawTicks]), (unsigned long long)c[kCopies], Ms(c[kCopyTicks]),
+                (unsigned long long)c[kDraws], Ms(c[kDrawTicks]), Ms(c[kConstUpTicks]), Ms(c[kDrawTicks]) - Ms(c[kConstUpTicks]) - Ms(c[kTexUploadTicks]) - Ms(c[kSmUploadTicks]), (unsigned long long)c[kCopies], Ms(c[kCopyTicks]),
                 Ms(c[kReadbackTicks]));
   std::snprintf(l2, sizeof l2,
                 "perf: xlate=%llu (%.0f ms) link=%llu (%.0f ms) | tex up=%llu %.1f MiB (%.0f ms) hash %.1f MiB (%.0f ms) | "
@@ -75,7 +55,7 @@ void OnSwap() {
                 Ms(c[kLinkTicks]), (unsigned long long)c[kTexUploads], c[kTexUploadBytes] / 1048576.0,
                 Ms(c[kTexUploadTicks]), c[kTexHashBytes] / 1048576.0, Ms(c[kTexHashTicks]),
                 c[kSmUploadBytes] / 1048576.0, Ms(c[kSmUploadTicks]), Ms(c[kFinishTicks]));
-  std::snprintf(l3, sizeof l3, "perf: core busy%% = %.0f %.0f %.0f %.0f (-1 = n/a)", busy[0], busy[1], busy[2], busy[3]);
+  std::snprintf(l3, sizeof l3, "perf: sm copy %.0f ms resolve convert %.0f ms gpu-copy hits tex=%llu front=%llu", Ms(c[kSmCopyTicks]), Ms(c[kResolveConvTicks]), (unsigned long long)c[kResolveGpuHits], (unsigned long long)c[kResolveFrontHits]);
   REXGPU_INFO("{}", l1);
   REXGPU_INFO("{}", l2);
   REXGPU_INFO("{}", l3);

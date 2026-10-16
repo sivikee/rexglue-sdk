@@ -5,6 +5,7 @@
 
 #include <rex/logging.h>
 
+#include "gl_cvars.h"
 #include "gl_ext.h"
 #include "perf.h"
 #include "spirv_to_glsl.h"
@@ -13,6 +14,9 @@ namespace rex::graphics::gl {
 
 bool GlSharedMemory::Initialize() {
   InitializeCommon();
+  if (REXCVAR_GET(gl_stream_uploads)) {
+    if (!staging_.Initialize(32u << 20, 16, GL_COPY_READ_BUFFER, true)) staging_.Shutdown();
+  }
   InitializeSparseHostGpuMemory(kGranuleLog2);
   std::fill(std::begin(page_table_), std::end(page_table_), 0xFFFFFFFFu);
   glGenBuffers(1, &pt_);
@@ -35,6 +39,7 @@ bool GlSharedMemory::Initialize() {
 }
 
 void GlSharedMemory::Shutdown(bool from_destructor) {
+  staging_.Shutdown();
   if (store_) glDeleteBuffers(1, &store_);
   if (pt_) glDeleteBuffers(1, &pt_);
   if (store_tbo_) glDeleteTextures(1, &store_tbo_);
@@ -130,9 +135,17 @@ bool GlSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocation
 
 bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   perf::Scope perf_sm_scope(perf::kSmUploadTicks);
+  const bool staged = staging_.valid();
+  uint8_t* block = nullptr;  // current staging block
+  uint32_t block_off = 0, block_used = 0, block_cap = 0;
+  uint32_t total_remaining = 0;
+  if (staged) {
+    for (const auto& range : upload_page_ranges) total_remaining += range.second << page_size_log2();
+  }
   for (const auto& range : upload_page_ranges) {
     uint32_t start = range.first << page_size_log2();
     uint32_t length = range.second << page_size_log2();
+    if (pre_read_hook_) pre_read_hook_(start, length);
     MakeRangeValid(start, length, false);
     while (length) {
       uint32_t g = start >> kGranuleLog2;
@@ -140,15 +153,50 @@ bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t
       uint32_t part = std::min(length, kGranuleSize - in);
       if (g >= kGranuleCount || page_table_[g] == 0xFFFFFFFFu) {
         REXGPU_ERROR("GL shared memory: upload outside resident granule (address {:08X}+{:X})", start, part);
+        if (staged) staging_.Commit();
         return false;
       }
-      glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
       perf::Add(perf::kSmUploadBytes, part);
-      glBufferSubData(GL_COPY_WRITE_BUFFER, GLintptr(page_table_[g]) * 4 + in, part,
-                      memory().TranslatePhysical(start));
+      GLintptr dst_offset = GLintptr(page_table_[g]) * 4 + in;
+      if (!staged) {
+        glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
+        glBufferSubData(GL_COPY_WRITE_BUFFER, dst_offset, part, memory().TranslatePhysical(start));
+      } else {
+        const uint8_t* src = memory().TranslatePhysical(start);
+        uint32_t left = part;
+        while (left) {
+          if (!block || block_used >= block_cap) {
+            block_cap = std::min(total_remaining, staging_.segment_size());
+            block_used = 0;
+            block = static_cast<uint8_t*>(staging_.Alloc(block_cap, 16, block_off));
+            if (!block) {
+              // Staging failed (should not happen): direct upload of the rest.
+              glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
+              glBufferSubData(GL_COPY_WRITE_BUFFER, dst_offset + (part - left), left, src + (part - left));
+              total_remaining -= left;
+              left = 0;
+              block_cap = block_used = 0;
+              break;
+            }
+          }
+          uint32_t n = std::min(left, block_cap - block_used);
+          std::memcpy(block + block_used, src + (part - left), n);
+          glBindBuffer(GL_COPY_READ_BUFFER, staging_.buffer());
+          glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
+          glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, block_off + block_used,
+                              dst_offset + (part - left), n);
+          block_used += n;
+          total_remaining -= n;
+          left -= n;
+        }
+      }
       start += part;
       length -= part;
     }
+  }
+  if (staged) {
+    staging_.Commit();
+    glBindBuffer(GL_COPY_READ_BUFFER, 0);
   }
   return true;
 }

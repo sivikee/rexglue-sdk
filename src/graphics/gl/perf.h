@@ -21,6 +21,9 @@ enum Counter : int {
   kTexHashBytes, kTexHashTicks,
   kSmUploadBytes, kSmUploadTicks,
   kFinishTicks,
+  kConstUpTicks,                                // per-draw uniform upload (nested inside draw ticks)
+  kResolveConvTicks, kResolveGpuHits, kResolveFrontHits,  // deferred resolve CPU conversion, GPU-copy consumers
+  kSmCopyTicks,
   kSwapTicks, kSwapDetileTicks, kSwapBufTicks,
   kCounterCount
 };

@@ -33,6 +33,7 @@ set(REXGPU_GL_SOURCES
     gl/graphics_system.cpp
     gl/command_processor.cpp
     gl/perf.cpp
+    gl/stream_ring.cpp
     gl/spirv_to_glsl.cpp
     gl/shader.cpp
     gl/shared_memory.cpp

@@ -101,16 +101,20 @@ bool GlContext::Initialize() {
   glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &caps_.max_texture_units);
   glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &caps_.max_color_attachments);
   GLint n = 0;
+  bool have_buffer_storage = false;
   glGetIntegerv(GL_NUM_EXTENSIONS, &n);
   for (GLint i = 0; i < n; ++i) {
     const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
     if (!e) continue;
     if (!strcmp(e, "GL_EXT_texture_filter_anisotropic")) caps_.ext_texture_filter_anisotropic = true;
     if (!strcmp(e, "GL_ARB_cull_distance")) caps_.arb_cull_distance = true;
+    if (!strcmp(e, "GL_ARB_buffer_storage")) have_buffer_storage = true;
     if (!strcmp(e, "GL_EXT_demote_to_helper_invocation")) caps_.ext_demote_to_helper = true;
     if (!strcmp(e, "GL_EXT_texture_compression_s3tc")) caps_.s3tc = true;
   }
   int w = 0, h = 0;
+  if (!have_buffer_storage) glBufferStorage_ = nullptr;
+  REXGPU_INFO("GL: ARB_buffer_storage {}", have_buffer_storage ? "available" : "missing");
   QuerySurfaceSize(w, h);
   REXGPU_INFO("GL: EGL {}.{} renderer='{}' version='{}' glsl='{}' surface={}x{} max_tex={} max_ssbo={}",
               major, minor, caps_.renderer, caps_.version, caps_.glsl_version, w, h,

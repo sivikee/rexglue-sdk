@@ -22,7 +22,10 @@
 #include "pipeline_cache.h"
 #include "primitive_processor.h"
 #include "render_targets.h"
+#include "gl_cvars.h"
 #include "shared_memory.h"
+#include "stream_ring.h"
+#include "tiling.h"
 #include "texture_cache.h"
 
 REXCVAR_DEFINE_STRING(gl_screenshot_dir, "", "GPU",
@@ -35,6 +38,12 @@ REXCVAR_DEFINE_INT32(gl_screenshot_from_every, 5, "GPU", "GL backend: interval u
 REXCVAR_DEFINE_INT32(gl_screenshot_first, 1, "GPU",
                      "GL backend: also screenshot the swap with this index (1-based, 0 = none)");
 REXCVAR_DEFINE_BOOL(switch_fps_overlay, true, "GPU", "Switch: draw an FPS / frame-time overlay in the top-left corner");
+REXCVAR_DEFINE_BOOL(gl_stream_uploads, true, "GPU", "GL backend: upload constants / shared memory / textures through unsynchronised streaming rings (avoids nouveau pipeline stalls); false = old glBufferSubData paths");
+REXCVAR_DEFINE_BOOL(gl_sync_resolve, false, "GPU", "GL backend: resolve (EDRAM copy) readback is synchronous like the original implementation (debugging)");
+REXCVAR_DEFINE_BOOL(gl_resolve_gpu_copy, true, "GPU", "GL backend: textures / front buffer matching a pending resolve use a GPU-side copy of the render target instead of guest memory");
+REXCVAR_DEFINE_INT32(gl_resolve_max_age, 3, "GPU", "GL backend: a pending async resolve is written to guest memory after at most this many swaps");
+REXCVAR_DEFINE_BOOL(gl_state_cache, true, "GPU", "GL backend: skip redundant raster state GL calls")
+;
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
 REXCVAR_DEFINE_INT32(gl_log_draws, 0, "GPU", "GL backend: log the first N draws in detail");
@@ -167,6 +176,119 @@ const uint8_t* OverlayGlyph(char ch) {
   }
   return nullptr;
 }
+
+// Redundant-state filter for the raster state set per draw. Anything outside ApplyRasterState that changes
+// this state (resolves, swap) must call Invalidate().
+struct RasterStateCache {
+  bool enabled = true;
+  static constexpr int kCaps = 10;
+  GLenum cap_ids[kCaps] = {GL_SCISSOR_TEST, GL_DEPTH_CLAMP, GL_CULL_FACE, GL_POLYGON_OFFSET_FILL,
+                           GL_POLYGON_OFFSET_LINE, GL_POLYGON_OFFSET_POINT, GL_DEPTH_TEST, GL_STENCIL_TEST,
+                           GL_BLEND, 0};
+  int8_t cap_state[kCaps];
+  int8_t blend_state[4];
+  // Values.
+  bool vp_valid = false, sc_valid = false, dr_valid = false, po_valid = false, bc_valid = false;
+  GLint vp[4], sc[4];
+  double dr[2];
+  float po[2], bc[4];
+  GLenum cull = 0, front = 0, polymode = 0, depth_func = 0;
+  int8_t depth_mask = -1;
+  struct Stencil {
+    bool valid = false;
+    GLenum func, fail, zfail, zpass;
+    GLint ref;
+    GLuint mask, wmask;
+  } stencil[2];
+  struct Rt {
+    int8_t mask = -1;
+    bool blend_valid = false;
+    GLenum fs, fd, as, ad, ec, ea;
+  } rt[4];
+
+  RasterStateCache() { Invalidate(); }
+  void Invalidate() {
+    for (auto& c : cap_state) c = -1;
+    for (auto& c : blend_state) c = -1;
+    vp_valid = sc_valid = dr_valid = po_valid = bc_valid = false;
+    cull = front = polymode = depth_func = 0;
+    depth_mask = -1;
+    for (auto& s : stencil) s.valid = false;
+    for (auto& r : rt) r = Rt();
+  }
+  void Cap(GLenum cap, bool on) {
+    if (enabled) {
+      for (int i = 0; i < kCaps - 2; ++i) {
+        if (cap_ids[i] == cap) {
+          if (cap_state[i] == int8_t(on)) return;
+          cap_state[i] = int8_t(on);
+          break;
+        }
+      }
+    }
+    if (on) glEnable(cap); else glDisable(cap);
+  }
+  void Viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
+    if (enabled && vp_valid && vp[0] == x && vp[1] == y && vp[2] == w && vp[3] == h) return;
+    vp[0] = x; vp[1] = y; vp[2] = w; vp[3] = h; vp_valid = true;
+    glViewport(x, y, w, h);
+  }
+  void Scissor(GLint x, GLint y, GLsizei w, GLsizei h) {
+    if (enabled && sc_valid && sc[0] == x && sc[1] == y && sc[2] == w && sc[3] == h) return;
+    sc[0] = x; sc[1] = y; sc[2] = w; sc[3] = h; sc_valid = true;
+    glScissor(x, y, w, h);
+  }
+  void DepthRange(double n, double f) {
+    if (enabled && dr_valid && dr[0] == n && dr[1] == f) return;
+    dr[0] = n; dr[1] = f; dr_valid = true;
+    glDepthRange(n, f);
+  }
+  void CullFace(GLenum m) { if (enabled && cull == m) return; cull = m; glCullFace(m); }
+  void FrontFace(GLenum m) { if (enabled && front == m) return; front = m; glFrontFace(m); }
+  void PolygonMode(GLenum m) { if (enabled && polymode == m) return; polymode = m; glPolygonMode(GL_FRONT_AND_BACK, m); }
+  void PolygonOffset(float slope, float constant) {
+    if (enabled && po_valid && po[0] == slope && po[1] == constant) return;
+    po[0] = slope; po[1] = constant; po_valid = true;
+    glPolygonOffset(slope, constant);
+  }
+  void DepthFunc(GLenum f) { if (enabled && depth_func == f) return; depth_func = f; glDepthFunc(f); }
+  void DepthMask(bool m) { if (enabled && depth_mask == int8_t(m)) return; depth_mask = int8_t(m); glDepthMask(m ? GL_TRUE : GL_FALSE); }
+  void StencilSide(int side, GLenum func, GLint ref, GLuint mask, GLenum fail, GLenum zfail, GLenum zpass, GLuint wmask) {
+    Stencil& s = stencil[side];
+    if (enabled && s.valid && s.func == func && s.ref == ref && s.mask == mask && s.fail == fail && s.zfail == zfail &&
+        s.zpass == zpass && s.wmask == wmask) {
+      return;
+    }
+    s = {true, func, fail, zfail, zpass, ref, mask, wmask};
+    GLenum face = side ? GL_BACK : GL_FRONT;
+    glStencilFuncSeparate(face, func, ref, mask);
+    glStencilOpSeparate(face, fail, zfail, zpass);
+    glStencilMaskSeparate(face, wmask);
+  }
+  void BlendColor(const float* c) {
+    if (enabled && bc_valid && !std::memcmp(bc, c, sizeof(bc))) return;
+    std::memcpy(bc, c, sizeof(bc)); bc_valid = true;
+    glBlendColor(c[0], c[1], c[2], c[3]);
+  }
+  void ColorMask(uint32_t i, uint32_t mask) {
+    if (enabled && rt[i].mask == int8_t(mask)) return;
+    rt[i].mask = int8_t(mask);
+    glColorMaski(i, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1, (mask >> 3) & 1);
+  }
+  void BlendEnable(uint32_t i, bool on) {
+    if (enabled && blend_state[i] == int8_t(on)) return;
+    blend_state[i] = int8_t(on);
+    if (on) glEnablei(GL_BLEND, i); else glDisablei(GL_BLEND, i);
+  }
+  void BlendFunc(uint32_t i, GLenum fs, GLenum fd, GLenum as, GLenum ad, GLenum ec, GLenum ea) {
+    Rt& r = rt[i];
+    if (enabled && r.blend_valid && r.fs == fs && r.fd == fd && r.as == as && r.ad == ad && r.ec == ec && r.ea == ea) return;
+    r.blend_valid = true; r.fs = fs; r.fd = fd; r.as = as; r.ad = ad; r.ec = ec; r.ea = ea;
+    glBlendFuncSeparatei(i, fs, fd, as, ad);
+    glBlendEquationSeparatei(i, ec, ea);
+  }
+};
+
 }  // namespace
 
 struct GlCommandProcessor::Impl {
@@ -191,6 +313,14 @@ struct GlCommandProcessor::Impl {
   GLuint ubo_ring = 0;
   static constexpr uint32_t kUboRingSize = 8u << 20;
   uint32_t ubo_ring_offset = 0;
+  std::vector<float> floats_vs, floats_ps;
+  StreamRing const_ring;  // uniform streaming (gl_stream_uploads)
+  RasterStateCache raster_cache;
+  StreamRing tex_ring;    // pixel-unpack streaming (textures, front buffer)
+  bool stream = false;
+  uint32_t ubo_align = 256;
+  GLuint blit_array_program = 0;
+  GLint blit_array_swap_loc = -1;
   GlTextureCache::FetchInfo fetch_info[32];
   std::unordered_map<uint64_t, uint64_t> vertex_buffer_hashes;
   uint32_t texture_bound_mask = 0;
@@ -217,6 +347,24 @@ bool GlCommandProcessor::SetupContext() {
   glLinkProgram(impl_->blit_program);
   glDeleteShader(vs);
   glDeleteShader(fs);
+  {
+    const char* fs_arr = R"(#version 430 core
+in vec2 uv;
+layout(binding = 0) uniform sampler2DArray tex;
+uniform int swap_rb;
+out vec4 o;
+void main() { vec3 c = texture(tex, vec3(uv, 0.0)).rgb; o = vec4(swap_rb != 0 ? c.bgr : c, 1.0); }
+)";
+    GLuint avs = Compile(GL_VERTEX_SHADER, kBlitVs);
+    GLuint afs = Compile(GL_FRAGMENT_SHADER, fs_arr);
+    impl_->blit_array_program = glCreateProgram();
+    glAttachShader(impl_->blit_array_program, avs);
+    glAttachShader(impl_->blit_array_program, afs);
+    glLinkProgram(impl_->blit_array_program);
+    glDeleteShader(avs);
+    glDeleteShader(afs);
+    impl_->blit_array_swap_loc = glGetUniformLocation(impl_->blit_array_program, "swap_rb");
+  }
   glGenTextures(1, &impl_->front_tex);
   {
     const char* vs_src = "#version 430 core\nvoid main(){ vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
@@ -238,6 +386,7 @@ bool GlCommandProcessor::SetupContext() {
   glGenBuffers(1, &impl_->ubo_ring);
   glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);
   glBufferData(GL_UNIFORM_BUFFER, Impl::kUboRingSize, nullptr, GL_STREAM_DRAW);
+{    GLint ua = 256;    glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &ua);    impl_->ubo_align = uint32_t(std::max(ua, 16));    impl_->stream = REXCVAR_GET(gl_stream_uploads);    if (impl_->stream) {      bool ok = impl_->const_ring.Initialize(16u << 20, 16, GL_UNIFORM_BUFFER, true) &&                impl_->tex_ring.Initialize(48u << 20, 12, GL_PIXEL_UNPACK_BUFFER, true);      if (!ok) {        REXGPU_WARN("GL: streaming rings unavailable, using synchronous uploads");        impl_->const_ring.Shutdown();        impl_->tex_ring.Shutdown();        impl_->stream = false;      }    }  }
 
   impl_->shared_memory = std::make_unique<GlSharedMemory>(*memory_);
   impl_->primitive_processor =
@@ -245,6 +394,11 @@ bool GlCommandProcessor::SetupContext() {
   impl_->pipeline_cache = std::make_unique<GlPipelineCache>(*register_file_);
   impl_->render_targets = std::make_unique<GlRenderTargets>(*register_file_, *memory_);
   impl_->texture_cache = std::make_unique<GlTextureCache>(*register_file_, *memory_);
+  impl_->texture_cache->SetRenderTargets(impl_->render_targets.get());
+  impl_->texture_cache->SetStreamRing(impl_->stream ? &impl_->tex_ring : nullptr);
+  impl_->shared_memory->SetPreReadHook([this](uint32_t start, uint32_t length) {
+    if (impl_->render_targets) impl_->render_targets->FlushPending(start, length);
+  });
   if (!impl_->shared_memory->Initialize() || !impl_->primitive_processor->Initialize() ||
       !impl_->pipeline_cache->Initialize(&context_) || !impl_->render_targets->Initialize() ||
       !impl_->texture_cache->Initialize()) {
@@ -261,6 +415,8 @@ bool GlCommandProcessor::SetupContext() {
 }
 
 void GlCommandProcessor::ShutdownContext() {
+  impl_->const_ring.Shutdown();
+  impl_->tex_ring.Shutdown();
   impl_->texture_cache.reset();
   impl_->render_targets.reset();
   impl_->pipeline_cache.reset();
@@ -487,22 +643,8 @@ void GlCommandProcessor::UpdateSystemConstants(bool primitive_polygonal,
 }
 
 void GlCommandProcessor::UploadAndBindConstants(const Shader* vertex_shader, const Shader* pixel_shader) {
+  perf::Scope perf_const_scope(perf::kConstUpTicks);
   const RegisterFile& regs = *register_file_;
-  auto upload = [&](uint32_t binding, const void* data, uint32_t size) {
-    uint32_t aligned = (size + 255) & ~255u;
-    if (impl_->ubo_ring_offset + aligned > Impl::kUboRingSize) {
-      glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);
-      glBufferData(GL_UNIFORM_BUFFER, Impl::kUboRingSize, nullptr, GL_STREAM_DRAW);
-      impl_->ubo_ring_offset = 0;
-    }
-    glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);
-    glBufferSubData(GL_UNIFORM_BUFFER, impl_->ubo_ring_offset, size, data);
-    glBindBufferRange(GL_UNIFORM_BUFFER, binding, impl_->ubo_ring, impl_->ubo_ring_offset, aligned);
-    impl_->ubo_ring_offset += aligned;
-  };
-  upload(kUboBindingSystem, &system_constants_, sizeof(system_constants_));
-  if (REXCVAR_GET(gl_log_draws_from) > 0 && glGetError() != GL_NO_ERROR) { REXGPU_WARN("GL: error after system constants upload (offset {})", impl_->ubo_ring_offset); }
-
   auto pack_floats = [&](const Shader& shader, uint32_t reg_base, std::vector<float>& out) {
     const Shader::ConstantRegisterMap& map = shader.constant_register_map();
     out.assign(size_t(std::max<uint32_t>(map.float_count, 1)) * 4, 0.0f);
@@ -517,17 +659,57 @@ void GlCommandProcessor::UploadAndBindConstants(const Shader* vertex_shader, con
       }
     }
   };
-  std::vector<float> floats;
-  pack_floats(*vertex_shader, XE_GPU_REG_SHADER_CONSTANT_000_X, floats);
-  upload(kUboBindingFloatVertex, floats.data(), uint32_t(floats.size() * 4));
+  std::vector<float>& floats_vs = impl_->floats_vs;
+  std::vector<float>& floats_ps = impl_->floats_ps;
+  pack_floats(*vertex_shader, XE_GPU_REG_SHADER_CONSTANT_000_X, floats_vs);
   if (pixel_shader) {
-    pack_floats(*pixel_shader, XE_GPU_REG_SHADER_CONSTANT_256_X, floats);
+    pack_floats(*pixel_shader, XE_GPU_REG_SHADER_CONSTANT_256_X, floats_ps);
   } else {
-    floats.assign(4, 0.0f);
+    floats_ps.assign(4, 0.0f);
   }
-  upload(kUboBindingFloatPixel, floats.data(), uint32_t(floats.size() * 4));
-  upload(kUboBindingBoolLoop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(uint32_t) * (8 + 32));
-  upload(kUboBindingFetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(uint32_t) * 6 * 32);
+  struct Item {
+    uint32_t binding;
+    const void* data;
+    uint32_t size;
+  };
+  const Item items[5] = {
+      {kUboBindingSystem, &system_constants_, uint32_t(sizeof(system_constants_))},
+      {kUboBindingFloatVertex, floats_vs.data(), uint32_t(floats_vs.size() * 4)},
+      {kUboBindingFloatPixel, floats_ps.data(), uint32_t(floats_ps.size() * 4)},
+      {kUboBindingBoolLoop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], uint32_t(sizeof(uint32_t) * (8 + 32))},
+      {kUboBindingFetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], uint32_t(sizeof(uint32_t) * 6 * 32)},
+  };
+  const uint32_t align = std::max<uint32_t>(impl_->ubo_align, 16);
+  auto aligned_size = [&](uint32_t size) { return (size + 255) & ~255u; };
+  if (impl_->stream) {
+    // One contiguous streamed block for all five uniform ranges (never touches memory the GPU still reads).
+    uint32_t total = 0;
+    for (const Item& it : items) total += (aligned_size(it.size) + align - 1) / align * align;
+    uint32_t base = 0;
+    uint8_t* dst = static_cast<uint8_t*>(impl_->const_ring.Alloc(total, align, base));
+    if (dst) {
+      uint32_t off = 0;
+      for (const Item& it : items) {
+        std::memcpy(dst + off, it.data, it.size);
+        glBindBufferRange(GL_UNIFORM_BUFFER, it.binding, impl_->const_ring.buffer(), base + off, aligned_size(it.size));
+        off += (aligned_size(it.size) + align - 1) / align * align;
+      }
+      impl_->const_ring.Commit();
+      return;
+    }
+  }
+  for (const Item& it : items) {
+    uint32_t aligned = aligned_size(it.size);
+    if (impl_->ubo_ring_offset + aligned > Impl::kUboRingSize) {
+      glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);
+      glBufferData(GL_UNIFORM_BUFFER, Impl::kUboRingSize, nullptr, GL_STREAM_DRAW);
+      impl_->ubo_ring_offset = 0;
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);
+    glBufferSubData(GL_UNIFORM_BUFFER, impl_->ubo_ring_offset, it.size, it.data);
+    glBindBufferRange(GL_UNIFORM_BUFFER, it.binding, impl_->ubo_ring, impl_->ubo_ring_offset, aligned);
+    impl_->ubo_ring_offset += aligned;
+  }
 }
 
 void GlCommandProcessor::ApplyRasterState(bool primitive_polygonal, reg::RB_DEPTHCONTROL depth_control,
@@ -535,52 +717,50 @@ void GlCommandProcessor::ApplyRasterState(bool primitive_polygonal, reg::RB_DEPT
                                           const draw_util::ViewportInfo& viewport_info,
                                           bool depth_stencil_bound) {
   const RegisterFile& regs = *register_file_;
+  RasterStateCache& rc = impl_->raster_cache;
+  rc.enabled = REXCVAR_GET(gl_state_cache);
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
 
   // Viewport / scissor / depth range (window y is the framebuffer row index; the NDC y flip is done in the
   // translated shader through ndc_scale / ndc_offset with origin_bottom_left).
   if (viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
-    glViewport(GLint(viewport_info.xy_offset[0]), GLint(viewport_info.xy_offset[1]),
-               GLsizei(viewport_info.xy_extent[0]), GLsizei(viewport_info.xy_extent[1]));
+    rc.Viewport(GLint(viewport_info.xy_offset[0]), GLint(viewport_info.xy_offset[1]),
+                GLsizei(viewport_info.xy_extent[0]), GLsizei(viewport_info.xy_extent[1]));
   } else {
-    glViewport(-1, -1, 1, 1);
+    rc.Viewport(-1, -1, 1, 1);
   }
-  glDepthRange(viewport_info.z_min, viewport_info.z_max);
+  rc.DepthRange(viewport_info.z_min, viewport_info.z_max);
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
-  glEnable(GL_SCISSOR_TEST);
-  glScissor(GLint(scissor.offset[0]), GLint(scissor.offset[1]), GLsizei(scissor.extent[0]),
-            GLsizei(scissor.extent[1]));
+  rc.Cap(GL_SCISSOR_TEST, true);
+  rc.Scissor(GLint(scissor.offset[0]), GLint(scissor.offset[1]), GLsizei(scissor.extent[0]),
+             GLsizei(scissor.extent[1]));
 
   // Rasterizer.
-  if (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
-    glEnable(GL_DEPTH_CLAMP);
-  } else {
-    glDisable(GL_DEPTH_CLAMP);
-  }
+  rc.Cap(GL_DEPTH_CLAMP, regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable);
   if (primitive_polygonal) {
     bool cull_front = pa_su_sc_mode_cntl.cull_front, cull_back = pa_su_sc_mode_cntl.cull_back;
     if (cull_front || cull_back) {
-      glEnable(GL_CULL_FACE);
-      glCullFace(cull_front && cull_back ? GL_FRONT_AND_BACK : (cull_front ? GL_FRONT : GL_BACK));
+      rc.Cap(GL_CULL_FACE, true);
+      rc.CullFace(cull_front && cull_back ? GL_FRONT_AND_BACK : (cull_front ? GL_FRONT : GL_BACK));
     } else {
-      glDisable(GL_CULL_FACE);
+      rc.Cap(GL_CULL_FACE, false);
     }
     bool clockwise = pa_su_sc_mode_cntl.face != 0;
     if (REXCVAR_GET(gl_flip_front_face)) {
       clockwise = !clockwise;
     }
-    glFrontFace(clockwise ? GL_CCW : GL_CW);
+    rc.FrontFace(clockwise ? GL_CCW : GL_CW);
     xenos::PolygonType polygon_type = xenos::PolygonType::kTriangles;
     if (!cull_front) polygon_type = std::min(polygon_type, pa_su_sc_mode_cntl.polymode_front_ptype);
     if (!cull_back) polygon_type = std::min(polygon_type, pa_su_sc_mode_cntl.polymode_back_ptype);
     if (pa_su_sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDualMode) {
       polygon_type = xenos::PolygonType::kTriangles;
     }
-    glPolygonMode(GL_FRONT_AND_BACK, polygon_type == xenos::PolygonType::kTriangles ? GL_FILL : GL_LINE);
+    rc.PolygonMode(polygon_type == xenos::PolygonType::kTriangles ? GL_FILL : GL_LINE);
   } else {
-    glDisable(GL_CULL_FACE);
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    rc.Cap(GL_CULL_FACE, false);
+    rc.PolygonMode(GL_FILL);
   }
   float bias_constant, bias_slope;
   draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, bias_slope, bias_constant);
@@ -589,66 +769,61 @@ void GlCommandProcessor::ApplyRasterState(bool primitive_polygonal, reg::RB_DEPT
                        : draw_util::kD3D10PolygonOffsetFactorFloat24;
   bias_slope *= xenos::kPolygonOffsetScaleSubpixelUnit;
   if (bias_constant != 0.0f || bias_slope != 0.0f) {
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glEnable(GL_POLYGON_OFFSET_LINE);
-    glEnable(GL_POLYGON_OFFSET_POINT);
-    glPolygonOffset(bias_slope, bias_constant);
+    rc.Cap(GL_POLYGON_OFFSET_FILL, true);
+    rc.Cap(GL_POLYGON_OFFSET_LINE, true);
+    rc.Cap(GL_POLYGON_OFFSET_POINT, true);
+    rc.PolygonOffset(bias_slope, bias_constant);
   } else {
-    glDisable(GL_POLYGON_OFFSET_FILL);
-    glDisable(GL_POLYGON_OFFSET_LINE);
-    glDisable(GL_POLYGON_OFFSET_POINT);
+    rc.Cap(GL_POLYGON_OFFSET_FILL, false);
+    rc.Cap(GL_POLYGON_OFFSET_LINE, false);
+    rc.Cap(GL_POLYGON_OFFSET_POINT, false);
   }
 
   // Depth / stencil.
   if (depth_stencil_bound) {
     if (depth_control.z_enable) {
-      glEnable(GL_DEPTH_TEST);
-      glDepthFunc(CompareFunc(depth_control.zfunc));
-      glDepthMask(depth_control.z_write_enable ? GL_TRUE : GL_FALSE);
+      rc.Cap(GL_DEPTH_TEST, true);
+      rc.DepthFunc(CompareFunc(depth_control.zfunc));
+      rc.DepthMask(depth_control.z_write_enable);
     } else {
-      glDisable(GL_DEPTH_TEST);
-      glDepthMask(GL_FALSE);
+      rc.Cap(GL_DEPTH_TEST, false);
+      rc.DepthMask(false);
     }
     if (depth_control.stencil_enable) {
-      glEnable(GL_STENCIL_TEST);
+      rc.Cap(GL_STENCIL_TEST, true);
       auto ref_front = regs.Get<reg::RB_STENCILREFMASK>();
       auto ref_back = ref_front;
       bool two_sided = primitive_polygonal && depth_control.backface_enable;
       if (two_sided) {
         ref_back = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
       }
-      glStencilFuncSeparate(GL_FRONT, CompareFunc(depth_control.stencilfunc), ref_front.stencilref,
-                            ref_front.stencilmask);
-      glStencilOpSeparate(GL_FRONT, StencilOpGl(depth_control.stencilfail), StencilOpGl(depth_control.stencilzfail),
-                          StencilOpGl(depth_control.stencilzpass));
-      glStencilMaskSeparate(GL_FRONT, ref_front.stencilwritemask);
+      rc.StencilSide(0, CompareFunc(depth_control.stencilfunc), ref_front.stencilref, ref_front.stencilmask,
+                     StencilOpGl(depth_control.stencilfail), StencilOpGl(depth_control.stencilzfail),
+                     StencilOpGl(depth_control.stencilzpass), ref_front.stencilwritemask);
       if (two_sided) {
-        glStencilFuncSeparate(GL_BACK, CompareFunc(depth_control.stencilfunc_bf), ref_back.stencilref,
-                              ref_back.stencilmask);
-        glStencilOpSeparate(GL_BACK, StencilOpGl(depth_control.stencilfail_bf),
-                            StencilOpGl(depth_control.stencilzfail_bf), StencilOpGl(depth_control.stencilzpass_bf));
-        glStencilMaskSeparate(GL_BACK, ref_back.stencilwritemask);
+        rc.StencilSide(1, CompareFunc(depth_control.stencilfunc_bf), ref_back.stencilref, ref_back.stencilmask,
+                       StencilOpGl(depth_control.stencilfail_bf), StencilOpGl(depth_control.stencilzfail_bf),
+                       StencilOpGl(depth_control.stencilzpass_bf), ref_back.stencilwritemask);
       } else {
-        glStencilFuncSeparate(GL_BACK, CompareFunc(depth_control.stencilfunc), ref_front.stencilref,
-                              ref_front.stencilmask);
-        glStencilOpSeparate(GL_BACK, StencilOpGl(depth_control.stencilfail),
-                            StencilOpGl(depth_control.stencilzfail), StencilOpGl(depth_control.stencilzpass));
-        glStencilMaskSeparate(GL_BACK, ref_front.stencilwritemask);
+        rc.StencilSide(1, CompareFunc(depth_control.stencilfunc), ref_front.stencilref, ref_front.stencilmask,
+                       StencilOpGl(depth_control.stencilfail), StencilOpGl(depth_control.stencilzfail),
+                       StencilOpGl(depth_control.stencilzpass), ref_front.stencilwritemask);
       }
     } else {
-      glDisable(GL_STENCIL_TEST);
+      rc.Cap(GL_STENCIL_TEST, false);
     }
   } else {
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_STENCIL_TEST);
+    rc.Cap(GL_DEPTH_TEST, false);
+    rc.Cap(GL_STENCIL_TEST, false);
   }
 
   // Blending and color write masks per render target.
-  glBlendColor(regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-               regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA));
+  const float blend_color[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+                                regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
+  rc.BlendColor(blend_color);
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     uint32_t mask = (color_mask >> (i * 4)) & 0xF;
-    glColorMaski(i, mask & 1, (mask >> 1) & 1, (mask >> 2) & 1, (mask >> 3) & 1);
+    rc.ColorMask(i, mask);
     auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
     bool blending = mask && !(blend.color_srcblend == xenos::BlendFactor::kOne &&
                               blend.color_destblend == xenos::BlendFactor::kZero &&
@@ -657,12 +832,12 @@ void GlCommandProcessor::ApplyRasterState(bool primitive_polygonal, reg::RB_DEPT
                               blend.alpha_destblend == xenos::BlendFactor::kZero &&
                               blend.alpha_comb_fcn == xenos::BlendOp::kAdd);
     if (blending) {
-      glEnablei(GL_BLEND, i);
-      glBlendFuncSeparatei(i, BlendFactorGl(blend.color_srcblend), BlendFactorGl(blend.color_destblend),
-                           BlendFactorGl(blend.alpha_srcblend), BlendFactorGl(blend.alpha_destblend));
-      glBlendEquationSeparatei(i, BlendOpGl(blend.color_comb_fcn), BlendOpGl(blend.alpha_comb_fcn));
+      rc.BlendEnable(i, true);
+      rc.BlendFunc(i, BlendFactorGl(blend.color_srcblend), BlendFactorGl(blend.color_destblend),
+                   BlendFactorGl(blend.alpha_srcblend), BlendFactorGl(blend.alpha_destblend),
+                   BlendOpGl(blend.color_comb_fcn), BlendOpGl(blend.alpha_comb_fcn));
     } else {
-      glDisablei(GL_BLEND, i);
+      rc.BlendEnable(i, false);
     }
   }
 }
@@ -821,6 +996,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   chk("raster");
   {
     int dbg = REXCVAR_GET(gl_debug_raster);
+    if (dbg) impl_->raster_cache.Invalidate();
     if (dbg & 1) glDisable(GL_SCISSOR_TEST);
     if (dbg & 2) glDisable(GL_CULL_FACE);
     if (dbg & 4) { for (uint32_t i = 0; i < 4; ++i) { glColorMaski(i, 1, 1, 1, 1); glDisablei(GL_BLEND, i); } }
@@ -940,6 +1116,7 @@ bool GlCommandProcessor::IssueCopy() {
   uint32_t start = 0, length = 0;
   glDisable(GL_SCISSOR_TEST);
   bool ok = impl_->render_targets->Resolve(start, length);
+  impl_->raster_cache.Invalidate();
   if (length) {
     impl_->shared_memory->MemoryInvalidationCallback(start, length, true);
   }
@@ -1067,69 +1244,103 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   glDisable(GL_POLYGON_OFFSET_FILL);
   glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
   glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+  impl_->raster_cache.Invalidate();
   float pulse = float(swap_count_ & 63) / 63.0f;
   glClearColor(0.f, pulse * 0.2f, 0.2f, 1.f);
   glClear(GL_COLOR_BUFFER_BIT);
+  GLuint snap_tex = 0;
+  bool snap_swap_rb = false;
+  bool use_snap = false;
+  uint32_t front_ring_offset = 0;
+  bool front_from_ring = false;
   if (have) {
     uint32_t pitch = std::max<uint32_t>(uint32_t(fetch.pitch) << 5, w);
-    const uint8_t* mem = memory_->TranslatePhysical(base);
-    perf::Scope perf_detile_scope(perf::kSwapDetileTicks);
-    auto& px = impl_->front_pixels;
-    px.resize(size_t(w) * h);
-    for (uint32_t y = 0; y < h; ++y) {
-      for (uint32_t x = 0; x < w; ++x) {
-        uint32_t off = fetch.tiled
-                           ? uint32_t(texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch, 2))
-                           : (y * pitch + x) * 4;
-        const uint8_t* b = mem + off;
-        uint32_t v;
-        switch (fetch.endianness) {
-          case xenos::Endian::k8in32:
-            v = uint32_t(b[3]) | uint32_t(b[2]) << 8 | uint32_t(b[1]) << 16 | uint32_t(b[0]) << 24;
-            break;
-          case xenos::Endian::k8in16:
-            v = uint32_t(b[1]) | uint32_t(b[0]) << 8 | uint32_t(b[3]) << 16 | uint32_t(b[2]) << 24;
-            break;
-          case xenos::Endian::k16in32:
-            v = uint32_t(b[2]) | uint32_t(b[3]) << 8 | uint32_t(b[0]) << 16 | uint32_t(b[1]) << 24;
-            break;
-          default:
-            v = uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
-            break;
-        }
-        // Apply the fetch-constant swizzle to the colour channels (RGBA identity = no change).
-        uint32_t swz = uint32_t(fetch.swizzle);
-        if ((swz & 0x1FF) != 0x88) {
-          uint32_t comp[6] = {v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF, 0, 0xFF};
-          uint32_t r = comp[std::min<uint32_t>(swz & 7, 5)], g = comp[std::min<uint32_t>((swz >> 3) & 7, 5)],
-                   b = comp[std::min<uint32_t>((swz >> 6) & 7, 5)];
-          v = r | (g << 8) | (b << 16) | (v & 0xFF000000u);
-        }
-        px[size_t(y) * w + x] = v;
-      }
+    // GPU path: the front buffer is exactly a recent, not yet written back resolve of the render target.
+    if (REXCVAR_GET(gl_resolve_gpu_copy) && fetch.tiled && (uint32_t(fetch.swizzle) & 0x1FF) == 0x88 &&
+        (fetch.format == xenos::TextureFormat::k_8_8_8_8 || fetch.format == xenos::TextureFormat::k_8_8_8_8_A) &&
+        impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), snap_tex, snap_swap_rb)) {
+      use_snap = true;
+      perf::Add(perf::kResolveFrontHits);
     }
-    bool all_zero = std::all_of(px.begin(), px.end(), [](uint32_t v) { return v == 0; });
-    if (all_zero) {
-      have = false;
+    if (!use_snap) {
+      const uint32_t pitch_al = (pitch + 31) & ~31u;
+      impl_->render_targets->FlushPending(base, pitch_al * ((h + 31) & ~31u) * 4);
+      const uint8_t* mem = memory_->TranslatePhysical(base);
+      perf::Scope perf_detile_scope(perf::kSwapDetileTicks);
+      uint32_t* out_px = nullptr;
+      size_t bytes = size_t(w) * h * 4;
+      if (impl_->stream && bytes <= impl_->tex_ring.segment_size()) {
+        out_px = static_cast<uint32_t*>(impl_->tex_ring.Alloc(uint32_t(bytes), 64, front_ring_offset));
+        front_from_ring = out_px != nullptr;
+      }
+      if (!front_from_ring) {
+        impl_->front_pixels.resize(size_t(w) * h);
+        out_px = impl_->front_pixels.data();
+      }
+      const uint32_t swz = uint32_t(fetch.swizzle);
+      const bool need_swz = (swz & 0x1FF) != 0x88;
+      const bool tiled = fetch.tiled;
+      const xenos::Endian endian = fetch.endianness;
+      uint32_t any_nonzero = 0;
+      for (uint32_t y = 0; y < h; ++y) {
+        uint32_t* drow = out_px + size_t(y) * w;
+        for (uint32_t x = 0; x < w; ++x) {
+          uint32_t off = tiled ? TiledOffset2D(x, y, pitch_al, 2) : (y * pitch + x) * 4;
+          uint32_t v;
+          std::memcpy(&v, mem + off, 4);
+          switch (endian) {
+            case xenos::Endian::k8in32: v = __builtin_bswap32(v); break;
+            case xenos::Endian::k8in16: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+            case xenos::Endian::k16in32: v = (v << 16) | (v >> 16); break;
+            default: break;
+          }
+          if (need_swz) {
+            // Apply the fetch-constant swizzle to the colour channels.
+            uint32_t comp[6] = {v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF, 0, 0xFF};
+            uint32_t r = comp[std::min<uint32_t>(swz & 7, 5)], g = comp[std::min<uint32_t>((swz >> 3) & 7, 5)],
+                     b = comp[std::min<uint32_t>((swz >> 6) & 7, 5)];
+            v = r | (g << 8) | (b << 16) | (v & 0xFF000000u);
+          }
+          any_nonzero |= v;
+          drow[x] = v;
+        }
+      }
+      if (front_from_ring) impl_->tex_ring.Commit();
+      if (!any_nonzero) {
+        have = false;
+      }
     }
   }
   if (have) {
-    auto& px = impl_->front_pixels;
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, impl_->front_tex);
-    if (impl_->front_w != w || impl_->front_h != h) {
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      impl_->front_w = w;
-      impl_->front_h = h;
+    if (use_snap) {
+      glBindTexture(GL_TEXTURE_2D_ARRAY, snap_tex);
+      glBindSampler(0, 0);
+      glUseProgram(impl_->blit_array_program);
+      glUniform1i(impl_->blit_array_swap_loc, snap_swap_rb ? 1 : 0);
+    } else {
+      glBindTexture(GL_TEXTURE_2D, impl_->front_tex);
+      if (impl_->front_w != w || impl_->front_h != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        impl_->front_w = w;
+        impl_->front_h = h;
+      }
+      glBindSampler(0, 0);
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      if (front_from_ring) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, impl_->tex_ring.buffer());
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE,
+                        reinterpret_cast<const void*>(uintptr_t(front_ring_offset)));
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+      } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, impl_->front_pixels.data());
+      }
+      glUseProgram(impl_->blit_program);
     }
-    glBindSampler(0, 0);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-    glUseProgram(impl_->blit_program);
     glBindVertexArray(impl_->empty_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
   }
@@ -1176,11 +1387,10 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   impl_->shared_memory->SetSystemPageBlocksValidWithGpuDataWritten();
   impl_->primitive_processor->EndFrame();
   impl_->texture_cache->EndFrame();
+  impl_->render_targets->PollPending();
   impl_->render_targets->EndFrame();
   impl_->vertex_buffer_hashes.clear();
-  impl_->ubo_ring_offset = 0;
-  glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);
-  glBufferData(GL_UNIFORM_BUFFER, Impl::kUboRingSize, nullptr, GL_STREAM_DRAW);
+if (!impl_->stream) {    impl_->ubo_ring_offset = 0;    glBindBuffer(GL_UNIFORM_BUFFER, impl_->ubo_ring);    glBufferData(GL_UNIFORM_BUFFER, Impl::kUboRingSize, nullptr, GL_STREAM_DRAW);  }
 }
 
 }  // namespace rex::graphics::gl

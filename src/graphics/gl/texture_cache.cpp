@@ -3,13 +3,18 @@
 
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
 
 #include <xxhash.h>
 
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
 
+#include "gl_cvars.h"
 #include "gl_ext.h"
+#include "render_targets.h"
+#include "stream_ring.h"
+#include "tiling.h"
 
 namespace rex::graphics::gl {
 
@@ -220,6 +225,22 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     }
     return nullptr;
   }
+  if (render_targets_ && info.is_tiled && info.mip_max_level == 0 && REXCVAR_GET(gl_resolve_gpu_copy)) {
+    xenos::TextureFormat bf = GetBaseFormat(info.format);
+    if (bf == xenos::TextureFormat::k_8_8_8_8 || bf == xenos::TextureFormat::k_8_8_8_8_A) {
+      GLuint snap = 0;
+      bool swap_rb = false;
+      if (render_targets_->FindSnapshot(info.memory.base_address, info.width + 1, info.height + 1, info.pitch,
+                                        uint32_t(info.endianness), snap, swap_rb)) {
+        snapshot_tex_.id = snap;
+        snapshot_tex_.target = GL_TEXTURE_2D_ARRAY;
+        snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+        snapshot_tex_.valid = true;
+        perf::Add(perf::kResolveGpuHits);
+        return &snapshot_tex_;
+      }
+    }
+  }
   uint64_t key = info.hash();
   auto it = textures_.find(key);
   Texture* tex;
@@ -243,6 +264,7 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     }
     size = std::min<uint32_t>(size, 0x20000000 - address);
     size = std::min<uint32_t>(size, 64u << 20);
+    if (render_targets_) render_targets_->FlushPending(address, size);
     h ^= XXH3_64bits(memory_.TranslatePhysical(address), size) + 0x9E3779B97F4A7C15ull + (h << 6);
   };
   {
@@ -292,6 +314,7 @@ bool GlTextureCache::Upload(Texture& t) {
   uint32_t bpb = fi->bytes_per_block();
   uint32_t bpb_log2 = bpb >= 16 ? 4 : bpb >= 8 ? 3 : bpb >= 4 ? 2 : bpb >= 2 ? 1 : 0;
   std::vector<uint8_t> out;
+  const bool use_ring = ring_ && ring_->valid();
   for (uint32_t level = 0; level < levels; ++level) {
     uint32_t mip_w = std::max(1u, w >> level), mip_h = std::max(1u, h >> level);
     uint32_t blocks_w = (mip_w + fi->block_width - 1) / fi->block_width;
@@ -306,67 +329,155 @@ bool GlTextureCache::Upload(Texture& t) {
     uint32_t pitch_blocks = extent.block_pitch_h;
     const uint8_t* mem = memory_.TranslatePhysical(address);
     uint32_t out_stride = blocks_w * hf.out_bytes_per_block;
-    out.assign(size_t(out_stride) * blocks_h, 0);
-    uint8_t block[16];
-    for (uint32_t by = 0; by < blocks_h; ++by) {
-      for (uint32_t bx = 0; bx < blocks_w; ++bx) {
-        uint32_t off;
-        if (info.is_tiled) {
-          off = uint32_t(texture_util::GetTiledOffset2D(int32_t(bx + ox), int32_t(by + oy), pitch_blocks, bpb_log2));
-        } else {
-          off = ((by + oy) * pitch_blocks + bx + ox) * bpb;
+    size_t out_size = size_t(out_stride) * blocks_h;
+    uint8_t* dst_base = nullptr;
+    uint32_t ring_offset = 0;
+    bool from_ring = false;
+    if (use_ring && out_size <= ring_->segment_size()) {
+      dst_base = static_cast<uint8_t*>(ring_->Alloc(uint32_t(out_size), 64, ring_offset));
+      from_ring = dst_base != nullptr;
+    }
+    if (!from_ring) {
+      out.assign(out_size, 0);
+      dst_base = out.data();
+    } else {
+      std::memset(dst_base, 0, out_size);
+    }
+    const uint32_t pitch_aligned = (pitch_blocks + 31) & ~31u;
+    const uint32_t max_off_limit = 0x20000000u - address;  // offsets must stay below this
+    if (hf.convert == Convert::kCopy && (bpb == 1 || bpb == 2 || bpb == 4 || bpb == 8 || bpb == 16)) {
+      auto run = [&](auto bpb_c) {
+        constexpr uint32_t B = decltype(bpb_c)::value;
+        constexpr uint32_t L = B >= 16 ? 4 : B >= 8 ? 3 : B >= 4 ? 2 : B >= 2 ? 1 : 0;
+        for (uint32_t by = 0; by < blocks_h; ++by) {
+          uint8_t* drow = dst_base + size_t(by) * out_stride;
+          if (info.is_tiled) {
+            for (uint32_t bx = 0; bx < blocks_w; ++bx) {
+              uint32_t off = TiledOffset2D(bx + ox, by + oy, pitch_aligned, L);
+              if (off + B > max_off_limit) continue;
+              std::memcpy(drow + size_t(bx) * B, mem + off, B);
+            }
+          } else {
+            uint32_t off = ((by + oy) * pitch_blocks + ox) * B;
+            if (uint64_t(off) + uint64_t(blocks_w) * B <= max_off_limit) {
+              std::memcpy(drow, mem + off, size_t(blocks_w) * B);
+            }
+          }
+          // Endian swap over the whole row (units never straddle blocks when B >= unit size).
+          const uint32_t row_bytes = blocks_w * B;
+          switch (info.endianness) {
+            case xenos::Endian::k8in16:
+              if (B >= 2) {
+                for (uint32_t o = 0; o + 2 <= row_bytes; o += 2) {
+                  uint16_t v;
+                  std::memcpy(&v, drow + o, 2);
+                  v = __builtin_bswap16(v);
+                  std::memcpy(drow + o, &v, 2);
+                }
+              }
+              break;
+            case xenos::Endian::k8in32:
+              if (B >= 4) {
+                for (uint32_t o = 0; o + 4 <= row_bytes; o += 4) {
+                  uint32_t v;
+                  std::memcpy(&v, drow + o, 4);
+                  v = __builtin_bswap32(v);
+                  std::memcpy(drow + o, &v, 4);
+                }
+              }
+              break;
+            case xenos::Endian::k16in32:
+              if (B >= 4) {
+                for (uint32_t o = 0; o + 4 <= row_bytes; o += 4) {
+                  uint32_t v;
+                  std::memcpy(&v, drow + o, 4);
+                  v = (v << 16) | (v >> 16);
+                  std::memcpy(drow + o, &v, 4);
+                }
+              }
+              break;
+            default:
+              break;
+          }
         }
-        if (address + off + bpb > 0x20000000) {
-          continue;
-        }
-        std::memcpy(block, mem + off, bpb);
-        ApplyEndian(block, bpb, info.endianness);
-        uint8_t* dst = out.data() + size_t(by) * out_stride + size_t(bx) * hf.out_bytes_per_block;
-        switch (hf.convert) {
-          case Convert::kCopy:
-            std::memcpy(dst, block, bpb);
-            break;
-          case Convert::k565: {
-            uint32_t v = block[0] | (block[1] << 8);
-            dst[0] = Expand5(v & 31);
-            dst[1] = Expand6((v >> 5) & 63);
-            dst[2] = Expand5(v >> 11);
-            dst[3] = 255;
-            break;
+      };
+      switch (bpb) {
+        case 1: run(std::integral_constant<uint32_t, 1>{}); break;
+        case 2: run(std::integral_constant<uint32_t, 2>{}); break;
+        case 4: run(std::integral_constant<uint32_t, 4>{}); break;
+        case 8: run(std::integral_constant<uint32_t, 8>{}); break;
+        default: run(std::integral_constant<uint32_t, 16>{}); break;
+      }
+    } else {
+      uint8_t block[16];
+      for (uint32_t by = 0; by < blocks_h; ++by) {
+        for (uint32_t bx = 0; bx < blocks_w; ++bx) {
+          uint32_t off;
+          if (info.is_tiled) {
+            off = TiledOffset2D(bx + ox, by + oy, pitch_aligned, bpb_log2);
+          } else {
+            off = ((by + oy) * pitch_blocks + bx + ox) * bpb;
           }
-          case Convert::k1555: {
-            uint32_t v = block[0] | (block[1] << 8);
-            dst[0] = Expand5(v & 31);
-            dst[1] = Expand5((v >> 5) & 31);
-            dst[2] = Expand5((v >> 10) & 31);
-            dst[3] = (v >> 15) ? 255 : 0;
-            break;
+          if (address + off + bpb > 0x20000000) {
+            continue;
           }
-          case Convert::k4444: {
-            uint32_t v = block[0] | (block[1] << 8);
-            dst[0] = Expand4(v & 15);
-            dst[1] = Expand4((v >> 4) & 15);
-            dst[2] = Expand4((v >> 8) & 15);
-            dst[3] = Expand4(v >> 12);
-            break;
-          }
-          case Convert::kDepth24:
-          case Convert::kDepth24Float: {
-            uint32_t v = block[0] | (block[1] << 8) | (block[2] << 16) | (uint32_t(block[3]) << 24);
-            float f = xenos::UNorm24To32(v >> 8);
-            std::memcpy(dst, &f, 4);
-            break;
+          std::memcpy(block, mem + off, bpb);
+          ApplyEndian(block, bpb, info.endianness);
+          uint8_t* dst = dst_base + size_t(by) * out_stride + size_t(bx) * hf.out_bytes_per_block;
+          switch (hf.convert) {
+            case Convert::kCopy:
+              std::memcpy(dst, block, bpb);
+              break;
+            case Convert::k565: {
+              uint32_t v = block[0] | (block[1] << 8);
+              dst[0] = Expand5(v & 31);
+              dst[1] = Expand6((v >> 5) & 63);
+              dst[2] = Expand5(v >> 11);
+              dst[3] = 255;
+              break;
+            }
+            case Convert::k1555: {
+              uint32_t v = block[0] | (block[1] << 8);
+              dst[0] = Expand5(v & 31);
+              dst[1] = Expand5((v >> 5) & 31);
+              dst[2] = Expand5((v >> 10) & 31);
+              dst[3] = (v >> 15) ? 255 : 0;
+              break;
+            }
+            case Convert::k4444: {
+              uint32_t v = block[0] | (block[1] << 8);
+              dst[0] = Expand4(v & 15);
+              dst[1] = Expand4((v >> 4) & 15);
+              dst[2] = Expand4((v >> 8) & 15);
+              dst[3] = Expand4(v >> 12);
+              break;
+            }
+            case Convert::kDepth24:
+            case Convert::kDepth24Float: {
+              uint32_t v = block[0] | (block[1] << 8) | (block[2] << 16) | (uint32_t(block[3]) << 24);
+              float f = xenos::UNorm24To32(v >> 8);
+              std::memcpy(dst, &f, 4);
+              break;
+            }
           }
         }
       }
     }
-    perf::Add(perf::kTexUploadBytes, out.size());
+    perf::Add(perf::kTexUploadBytes, out_size);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (from_ring) {
+      ring_->Commit();  // (persistent: arms fences; fallback: unmaps before the GL call that reads it)
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, ring_->buffer());
+    }
+    const void* data_arg = from_ring ? reinterpret_cast<const void*>(uintptr_t(ring_offset)) : out.data();
     if (hf.compressed) {
       glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, level, 0, 0, 0, mip_w, mip_h, 1, hf.internal,
-                                GLsizei(out.size()), out.data());
+                                GLsizei(out_size), data_arg);
     } else {
-      glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-      glTexSubImage3D(GL_TEXTURE_2D_ARRAY, level, 0, 0, 0, mip_w, mip_h, 1, hf.format, hf.type, out.data());
+      glTexSubImage3D(GL_TEXTURE_2D_ARRAY, level, 0, 0, 0, mip_w, mip_h, 1, hf.format, hf.type, data_arg);
+    }
+    if (from_ring) {
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     }
   }
   t.host_swizzle = hf.swizzle;

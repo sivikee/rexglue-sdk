@@ -22,6 +22,9 @@
 
 namespace rex::graphics::gl {
 
+class GlRenderTargets;
+class StreamRing;
+
 class GlTextureCache {
  public:
   struct FetchInfo {
@@ -36,6 +39,8 @@ class GlTextureCache {
   bool Initialize();
   void Shutdown();
   void EndFrame() { ++frame_; }
+  void SetRenderTargets(GlRenderTargets* render_targets) { render_targets_ = render_targets; }
+  void SetStreamRing(StreamRing* ring) { ring_ = ring; }
 
   // Binds textures and samplers for one shader stage (texture units from CombinedSampler::unit).
   // fetch_info receives data for the system constants for every fetch constant used.
@@ -71,6 +76,9 @@ class GlTextureCache {
   const RegisterFile& regs_;
   memory::Memory& memory_;
   uint64_t frame_ = 0;
+  GlRenderTargets* render_targets_ = nullptr;
+  StreamRing* ring_ = nullptr;
+  Texture snapshot_tex_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   std::unordered_map<SamplerKey, GLuint, SamplerKeyHash> samplers_;
   GLuint dummy_2d_array_ = 0, dummy_3d_ = 0, dummy_cube_ = 0, dummy_sampler_ = 0;
