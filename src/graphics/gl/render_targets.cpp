@@ -1,4 +1,5 @@
 #include "render_targets.h"
+#include "perf.h"
 
 #include <algorithm>
 #include <cstring>
@@ -364,12 +365,15 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->texture, 0);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        if (src_is_8888) {
-          px8.resize(size_t(rw) * rh * 4);
-          glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px8.data());
-        } else {
-          pxf.resize(size_t(rw) * rh * 4);
-          glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_FLOAT, pxf.data());
+        {
+          perf::Scope perf_readback_scope(perf::kReadbackTicks);
+          if (src_is_8888) {
+            px8.resize(size_t(rw) * rh * 4);
+            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px8.data());
+          } else {
+            pxf.resize(size_t(rw) * rh * 4);
+            glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_FLOAT, pxf.data());
+          }
         }
         const bool log_first = resolve_count_ <= 4;
         uint8_t* dest_base = memory_.TranslatePhysical(ri.copy_dest_base);

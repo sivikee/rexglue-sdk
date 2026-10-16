@@ -892,7 +892,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_CONTEXT_UPDATE: {
       assert_true(count == 1);
       uint32_t value = reader->ReadAndSwap<uint32_t>();
-      REXGPU_INFO("GPU context update = {:08X}", value);
+      REXGPU_TRACE("GPU context update = {:08X}", value);
       assert_true(value == 0);
       result = true;
       break;
@@ -901,7 +901,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       // This opcode is used by 5454084E while going / being ingame.
       assert_true(count == 1);
       uint32_t value = reader->ReadAndSwap<uint32_t>();
-      REXGPU_INFO("GPU wait for idle = {:08X}", value);
+      REXGPU_TRACE("GPU wait for idle = {:08X}", value);
       result = true;
       break;
     }
@@ -1632,11 +1632,11 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
     // On hardware this clears the internal state of the scan converter (which
     // is different to the register)
     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
-    REXGPU_INFO("Begin viz query ID {:02X}", id);
+    REXGPU_TRACE("Begin viz query ID {:02X}", id);
   } else {
     // end the viz query
     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
-    REXGPU_INFO("End viz query ID {:02X}", id);
+    REXGPU_TRACE("End viz query ID {:02X}", id);
     // The scan converter writes the internal result back to the register here.
     // We just fake it and say it was visible in case it is read back.
     if (id < 32) {

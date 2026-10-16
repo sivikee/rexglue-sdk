@@ -1,4 +1,5 @@
 #include "texture_cache.h"
+#include "perf.h"
 
 #include <algorithm>
 #include <cstring>
@@ -244,9 +245,13 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     size = std::min<uint32_t>(size, 64u << 20);
     h ^= XXH3_64bits(memory_.TranslatePhysical(address), size) + 0x9E3779B97F4A7C15ull + (h << 6);
   };
-  hash_range(info.memory.base_address, info.memory.base_size);
-  if (info.mip_max_level > 0) {
-    hash_range(info.memory.mip_address, info.memory.mip_size);
+  {
+    perf::Scope perf_hash_scope(perf::kTexHashTicks);
+    hash_range(info.memory.base_address, info.memory.base_size);
+    if (info.mip_max_level > 0) {
+      hash_range(info.memory.mip_address, info.memory.mip_size);
+    }
+    perf::Add(perf::kTexHashBytes, info.memory.base_size + (info.mip_max_level > 0 ? info.memory.mip_size : 0));
   }
   tex->checked_frame = frame_;
   if (!tex->valid || h != tex->content_hash) {
@@ -257,6 +262,8 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
 }
 
 bool GlTextureCache::Upload(Texture& t) {
+  perf::Add(perf::kTexUploads);
+  perf::Scope perf_upload_scope(perf::kTexUploadTicks);
   const TextureInfo& info = t.info;
   HostFormat hf;
   xenos::TextureFormat base_format = GetBaseFormat(info.format);
@@ -353,6 +360,7 @@ bool GlTextureCache::Upload(Texture& t) {
         }
       }
     }
+    perf::Add(perf::kTexUploadBytes, out.size());
     if (hf.compressed) {
       glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY, level, 0, 0, 0, mip_w, mip_h, 1, hf.internal,
                                 GLsizei(out.size()), out.data());

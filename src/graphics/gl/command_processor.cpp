@@ -18,6 +18,7 @@
 #include <rex/memory.h>
 
 #include "gl_ext.h"
+#include "perf.h"
 #include "pipeline_cache.h"
 #include "primitive_processor.h"
 #include "render_targets.h"
@@ -33,6 +34,7 @@ REXCVAR_DEFINE_INT32(gl_screenshot_from, 0, "GPU",
 REXCVAR_DEFINE_INT32(gl_screenshot_from_every, 5, "GPU", "GL backend: interval used with gl_screenshot_from");
 REXCVAR_DEFINE_INT32(gl_screenshot_first, 1, "GPU",
                      "GL backend: also screenshot the swap with this index (1-based, 0 = none)");
+REXCVAR_DEFINE_BOOL(switch_fps_overlay, true, "GPU", "Switch: draw an FPS / frame-time overlay in the top-left corner");
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
 REXCVAR_DEFINE_INT32(gl_log_draws, 0, "GPU", "GL backend: log the first N draws in detail");
@@ -141,6 +143,30 @@ GLenum BlendOpGl(xenos::BlendOp op) {
     default: return GL_FUNC_ADD;
   }
 }
+
+// ---- tiny 5x7 bitmap font for the FPS overlay (digits, '.', '-' and the letters the overlay prints) ----
+const uint8_t* OverlayGlyph(char ch) {
+  static const struct { char c; uint8_t r[7]; } kGlyphs[] = {
+      {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}}, {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+      {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}}, {'3', {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}},
+      {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}}, {'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
+      {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}}, {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+      {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}}, {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+      {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}}, {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+      {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}}, {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+      {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}}, {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+      {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}}, {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+      {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}}, {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
+      {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}}, {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}},
+      {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}}, {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+      {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}}, {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+      {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+  };
+  for (const auto& g : kGlyphs) {
+    if (g.c == ch) return g.r;
+  }
+  return nullptr;
+}
 }  // namespace
 
 struct GlCommandProcessor::Impl {
@@ -149,6 +175,9 @@ struct GlCommandProcessor::Impl {
   GLuint empty_vao = 0;
   GLuint front_tex = 0;
   GLuint dbg_program = 0;
+  GLuint overlay_tex = 0;
+  uint32_t overlay_w = 0, overlay_h = 0;
+  std::string overlay_text_cached;
   uint32_t front_w = 0, front_h = 0;
   std::vector<uint32_t> front_pixels;
 
@@ -472,7 +501,7 @@ void GlCommandProcessor::UploadAndBindConstants(const Shader* vertex_shader, con
     impl_->ubo_ring_offset += aligned;
   };
   upload(kUboBindingSystem, &system_constants_, sizeof(system_constants_));
-  if (glGetError() != GL_NO_ERROR) { REXGPU_WARN("GL: error after system constants upload (offset {})", impl_->ubo_ring_offset); }
+  if (REXCVAR_GET(gl_log_draws_from) > 0 && glGetError() != GL_NO_ERROR) { REXGPU_WARN("GL: error after system constants upload (offset {})", impl_->ubo_ring_offset); }
 
   auto pack_floats = [&](const Shader& shader, uint32_t reg_base, std::vector<float>& out) {
     const Shader::ConstantRegisterMap& map = shader.constant_register_map();
@@ -654,6 +683,8 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   if (edram_mode == xenos::EdramMode::kCopy) {
     return IssueCopy();
   }
+  perf::Add(perf::kDraws);
+  perf::Scope perf_draw_scope(perf::kDrawTicks);
   if (!REXCVAR_GET(gl_draw)) {
     return true;
   }
@@ -776,7 +807,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   { static int isp_logged = 0; if (isp_logged++ < 3) REXGPU_INFO("GL: program {} glIsProgram={} (async)", program->program, int(glIsProgram(program->program))); }
   chk("sysconst");
   glUseProgram(program->program);
-  { static int up_logged = 0; GLenum e = glGetError(); if (e != GL_NO_ERROR && up_logged++ < 6) { GLint ls = -1, att = -1; glGetProgramiv(program->program, GL_LINK_STATUS, &ls); glGetProgramiv(program->program, GL_ATTACHED_SHADERS, &att); std::string ex; for (GLuint i = 1; i <= 12; ++i) ex += glIsProgram(i) ? "1" : "0"; REXGPU_WARN("GL: glUseProgram({}) error {} link={} attached={} isprog={} exists[1..12]={}", program->program, GlErrorString(e), ls, att, int(glIsProgram(program->program)), ex); } }
+  if (log_this) { static int up_logged = 0; GLenum e = glGetError(); if (e != GL_NO_ERROR && up_logged++ < 6) { GLint ls = -1, att = -1; glGetProgramiv(program->program, GL_LINK_STATUS, &ls); glGetProgramiv(program->program, GL_ATTACHED_SHADERS, &att); std::string ex; for (GLuint i = 1; i <= 12; ++i) ex += glIsProgram(i) ? "1" : "0"; REXGPU_WARN("GL: glUseProgram({}) error {} link={} attached={} isprog={} exists[1..12]={}", program->program, GlErrorString(e), ls, att, int(glIsProgram(program->program)), ex); } }
   UploadAndBindConstants(vertex_shader, pixel_shader);
   chk("ubo");
   impl_->shared_memory->BindStorageBuffers(kSsboBindingSharedMemory);
@@ -904,6 +935,8 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
 }
 
 bool GlCommandProcessor::IssueCopy() {
+  perf::Add(perf::kCopies);
+  perf::Scope perf_copy_scope(perf::kCopyTicks);
   uint32_t start = 0, length = 0;
   glDisable(GL_SCISSOR_TEST);
   bool ok = impl_->render_targets->Resolve(start, length);
@@ -917,9 +950,78 @@ bool GlCommandProcessor::IssueCopy() {
 // Swap
 // ---------------------------------------------------------------------------------------------
 
+void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
+#if REX_PLATFORM_SWITCH
+  if (!REXCVAR_GET(switch_fps_overlay)) return;
+  const std::string* lines = perf::OverlayLines();
+  if (!lines || lines[0].empty()) return;
+  constexpr int kScale = 2, kCell = 6 * kScale, kLineH = 8 * kScale, kPad = 3;
+  size_t max_chars = 0;
+  int nlines = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (lines[i].empty()) continue;
+    ++nlines;
+    max_chars = std::max(max_chars, lines[i].size());
+  }
+  uint32_t w = uint32_t(max_chars * kCell + 2 * kPad), h = uint32_t(nlines * kLineH + 2 * kPad);
+  if (!impl_->overlay_tex) glGenTextures(1, &impl_->overlay_tex);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, impl_->overlay_tex);
+  glBindSampler(0, 0);
+  std::string key = lines[0] + "|" + lines[1] + "|" + lines[2];
+  if (impl_->overlay_w != w || impl_->overlay_h != h) {
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, GLsizei(w), GLsizei(h), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    impl_->overlay_w = w;
+    impl_->overlay_h = h;
+    impl_->overlay_text_cached.clear();
+  }
+  if (key != impl_->overlay_text_cached) {
+    impl_->overlay_text_cached = key;
+    std::vector<uint32_t> buf(size_t(w) * h, 0xFF000000u);  // opaque black box, row 0 = top
+    int line_y = kPad;
+    for (int li = 0; li < 3; ++li) {
+      if (lines[li].empty()) continue;
+      for (size_t ci = 0; ci < lines[li].size(); ++ci) {
+        const uint8_t* g = OverlayGlyph(lines[li][ci]);
+        if (!g) continue;
+        for (int ry = 0; ry < 7; ++ry) {
+          for (int rx = 0; rx < 5; ++rx) {
+            if (!((g[ry] >> (4 - rx)) & 1)) continue;
+            for (int sy = 0; sy < kScale; ++sy) {
+              for (int sx = 0; sx < kScale; ++sx) {
+                buf[size_t(line_y + ry * kScale + sy) * w + size_t(kPad + int(ci) * kCell + rx * kScale + sx)] =
+                    0xFFFFFFFFu;
+              }
+            }
+          }
+        }
+      }
+      line_y += kLineH;
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GLsizei(w), GLsizei(h), GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+  }
+  // The swap path already disabled scissor/blend/depth/cull; draw the box into the top-left corner.
+  glViewport(0, sh - GLint(h), GLsizei(w), GLsizei(h));
+  glUseProgram(impl_->blit_program);
+  glBindVertexArray(impl_->empty_vao);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glViewport(0, 0, sw, sh);
+#else
+  (void)sw;
+  (void)sh;
+#endif
+}
+
 void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                    uint32_t frontbuffer_height) {
   ++swap_count_;
+  perf::OnSwap();
+  perf::Scope perf_swap_scope(perf::kSwapTicks);
 #if REX_PLATFORM_SWITCH
   rex::input::switchpad::g_swap_counter.store(swap_count_, std::memory_order_relaxed);
 #endif
@@ -971,6 +1073,7 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   if (have) {
     uint32_t pitch = std::max<uint32_t>(uint32_t(fetch.pitch) << 5, w);
     const uint8_t* mem = memory_->TranslatePhysical(base);
+    perf::Scope perf_detile_scope(perf::kSwapDetileTicks);
     auto& px = impl_->front_pixels;
     px.resize(size_t(w) * h);
     for (uint32_t y = 0; y < h; ++y) {
@@ -1063,7 +1166,11 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
       }
     }
   }
-  context_.SwapBuffers();
+  DrawFpsOverlay(sw, sh);
+  {
+    perf::Scope perf_swapbuf_scope(perf::kSwapBufTicks);
+    context_.SwapBuffers();
+  }
 
   // Per-frame housekeeping.
   impl_->shared_memory->SetSystemPageBlocksValidWithGpuDataWritten();

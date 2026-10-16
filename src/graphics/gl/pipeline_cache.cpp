@@ -1,4 +1,5 @@
 #include "pipeline_cache.h"
+#include "perf.h"
 
 #include <chrono>
 #include <cstdio>
@@ -292,6 +293,8 @@ void GlPipelineCache::WorkerMain() {
 }
 
 void GlPipelineCache::TranslateProgram(GlProgram& program) {
+  perf::Add(perf::kXlateCount);
+  perf::Scope perf_xlate_scope(perf::kXlateTicks);
   GlShader::GlTranslation* vertex = program.vertex;
   GlShader::GlTranslation* pixel = program.pixel;
   if (!EnsureShadersTranslated(vertex, pixel)) {
@@ -308,6 +311,7 @@ void GlPipelineCache::TranslateProgram(GlProgram& program) {
 }
 
 void GlPipelineCache::StartLink(GlProgram& program) {
+  perf::Scope perf_link_scope(perf::kLinkTicks);
   const GlslShader* vs_glsl = program.vertex->glsl();
   const GlslShader* ps_glsl = program.pixel ? program.pixel->glsl() : nullptr;
   program.link_start = std::chrono::steady_clock::now();
@@ -417,6 +421,7 @@ void GlPipelineCache::StartLink(GlProgram& program) {
 }
 
 void GlPipelineCache::FinishLink(GlProgram& program, bool block) {
+  perf::Scope perf_link_scope(perf::kLinkTicks);
   if (!block) {
     GLint done = 1;
     if (glMaxShaderCompilerThreadsKHR_ && REXCVAR_GET(gl_parallel_compile)) {
@@ -495,6 +500,7 @@ void GlPipelineCache::FinishLink(GlProgram& program, bool block) {
     }
     program.sm_base_location = glGetUniformLocation(program.program, "xe_sm_base");
     program.state = GlProgram::kReady;
+    perf::Add(perf::kLinkCount);
   }
   glDeleteShader(program.vs_id);
   if (program.fs_id) {

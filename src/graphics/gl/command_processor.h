@@ -43,6 +43,7 @@ class GlCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  void DrawFpsOverlay(int sw, int sh);
 
  private:
   struct Impl;

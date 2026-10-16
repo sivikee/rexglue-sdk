@@ -6,6 +6,7 @@
 #include <rex/logging.h>
 
 #include "gl_ext.h"
+#include "perf.h"
 #include "spirv_to_glsl.h"
 
 namespace rex::graphics::gl {
@@ -76,7 +77,10 @@ bool GlSharedMemory::EnsureCapacity(uint32_t slots_needed_total) {
     glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, pt_);  // detach
     glDeleteBuffers(1, &store_);
     store_ = 0;
-    glFinish();
+    {
+      perf::Scope perf_finish_scope(perf::kFinishTicks);
+      glFinish();
+    }
     InvalidateAllPages();
     copied = false;
     if (!alloc(nb)) {
@@ -125,6 +129,7 @@ bool GlSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocation
 }
 
 bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+  perf::Scope perf_sm_scope(perf::kSmUploadTicks);
   for (const auto& range : upload_page_ranges) {
     uint32_t start = range.first << page_size_log2();
     uint32_t length = range.second << page_size_log2();
@@ -138,6 +143,7 @@ bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t
         return false;
       }
       glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
+      perf::Add(perf::kSmUploadBytes, part);
       glBufferSubData(GL_COPY_WRITE_BUFFER, GLintptr(page_table_[g]) * 4 + in, part,
                       memory().TranslatePhysical(start));
       start += part;
