@@ -16,6 +16,12 @@
 #include "stream_ring.h"
 #include "tiling.h"
 
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_BOOL(gl_snapshot_subrect, true, "GPU",
+                    "GL backend: textures that are the top-left part of a larger GPU resolve snapshot use a GPU copy of "
+                    "that part instead of a synchronous readback through guest memory (HDR luminance chain)");
+
 namespace rex::graphics::gl {
 
 namespace {
@@ -210,6 +216,20 @@ void GlTextureCache::Shutdown() {
   }
 }
 
+void GlTextureCache::EndFrame() {
+  ++frame_;
+  if ((frame_ & 63) == 0) {
+    for (auto it = sub_snapshots_.begin(); it != sub_snapshots_.end();) {
+      if (frame_ - it->second.last_used_frame > 120) {
+        glDeleteTextures(1, &it->second.texture);
+        it = sub_snapshots_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+}
+
 GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   TextureInfo info;
   if (!TextureInfo::Prepare(fetch, &info)) {
@@ -241,6 +261,40 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
       if (render_targets_->FindSnapshot(info.memory.base_address, info.width + 1, info.height + 1, info.pitch,
                                         uint32_t(info.endianness), snap_kind, snap, swap_rb)) {
         snapshot_tex_.id = snap;
+        snapshot_tex_.target = GL_TEXTURE_2D_ARRAY;
+        snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+        snapshot_tex_.valid = true;
+        perf::Add(perf::kResolveGpuHits);
+        return &snapshot_tex_;
+      }
+      GLenum sub_format = 0;
+      uint64_t serial = 0;
+      const uint32_t w = info.width + 1, h = info.height + 1;
+      if (REXCVAR_GET(gl_snapshot_subrect) && w <= 0xFFFF && h <= 0xFFFF &&
+          render_targets_->FindSnapshotContaining(info.memory.base_address, w, h, info.pitch,
+                                                  uint32_t(info.endianness), snap_kind, snap, swap_rb, sub_format,
+                                                  serial)) {
+        SubSnapshot& s = sub_snapshots_[(uint64_t(snap) << 32) | (uint64_t(w) << 16) | h];
+        if (s.texture && s.format != sub_format) {
+          glDeleteTextures(1, &s.texture);
+          s.texture = 0;
+        }
+        if (!s.texture) {
+          glGenTextures(1, &s.texture);
+          glBindTexture(GL_TEXTURE_2D_ARRAY, s.texture);
+          glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, sub_format, GLsizei(w), GLsizei(h), 1);
+          glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0);
+          glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
+          s.format = sub_format;
+          s.serial = UINT64_MAX;
+        }
+        if (s.serial != serial) {
+          glCopyImageSubData(snap, GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, s.texture, GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0,
+                             GLsizei(w), GLsizei(h), 1);
+          s.serial = serial;
+        }
+        s.last_used_frame = frame_;
+        snapshot_tex_.id = s.texture;
         snapshot_tex_.target = GL_TEXTURE_2D_ARRAY;
         snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
         snapshot_tex_.valid = true;

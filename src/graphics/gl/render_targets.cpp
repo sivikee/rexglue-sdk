@@ -385,6 +385,7 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
       if (rw && rh) {
         PendingResolve pr;
         pr.frame = frame_;
+        pr.serial = resolve_count_;
         pr.dest_base = ri.copy_dest_base;
         pr.extent_start = ri.copy_dest_extent_start;
         pr.extent_length = ri.copy_dest_extent_length;
@@ -1430,6 +1431,24 @@ bool GlRenderTargets::FindSnapshot(uint32_t base, uint32_t width, uint32_t heigh
         ((pr.dest_pitch + 31) & ~31u) == ((pitch + 31) & ~31u) && uint32_t(pr.endian) == endian) {
       texture_out = pr.snapshot;
       swap_rb_out = pr.swap_rb;
+      return true;
+    }
+    if (pr.extent_start <= base && base < uint64_t(pr.extent_start) + pr.extent_length) return false;
+  }
+  return false;
+}
+
+bool GlRenderTargets::FindSnapshotContaining(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch,
+                                             uint32_t endian, uint32_t snap_kind, GLuint& texture_out,
+                                             bool& swap_rb_out, GLenum& format_out, uint64_t& serial_out) const {
+  for (size_t i = pending_.size(); i-- > 0;) {
+    const PendingResolve& pr = pending_[i];
+    if (pr.snapshot && pr.snap_kind == snap_kind && pr.dest_base == base && pr.rw >= width && pr.rh >= height &&
+        ((pr.dest_pitch + 31) & ~31u) == ((pitch + 31) & ~31u) && uint32_t(pr.endian) == endian) {
+      texture_out = pr.snapshot;
+      swap_rb_out = pr.swap_rb;
+      format_out = pr.snapshot_format;
+      serial_out = pr.serial;
       return true;
     }
     if (pr.extent_start <= base && base < uint64_t(pr.extent_start) + pr.extent_length) return false;

@@ -95,6 +95,12 @@ class GlRenderTargets {
   // snap_kind: 1 = RGBA8, 2 = RGBA16F, 3 = RGB10A2 (see PendingResolve::snap_kind).
   bool FindSnapshot(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t endian,
                     uint32_t snap_kind, GLuint& texture_out, bool& swap_rb_out) const;
+  // Like FindSnapshot, but the newest resolve at `base` may be LARGER than the texture (resolve rectangles are
+  // multiples of 8: Oblivion's HDR luminance chain resolves 256x152 / 8x8 and samples 256x150 / 1x1). The caller
+  // copies the top-left width x height part (same tiling: same base and pitch, origin 0).
+  bool FindSnapshotContaining(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t endian,
+                              uint32_t snap_kind, GLuint& texture_out, bool& swap_rb_out, GLenum& format_out,
+                              uint64_t& serial_out) const;
   // Rate-limited diagnostic: why did a consumer's lookup (who = "tex" / "front") not match any resolve?
   void LogLookupMiss(const char* who, uint32_t base, uint32_t width, uint32_t height, uint32_t pitch,
                      uint32_t endian, uint32_t format, uint32_t snap_kind) const;
@@ -131,6 +137,7 @@ class GlRenderTargets {
     bool dl_started = false; // gpu: store -> PBO copy issued, fence pending
     int gpu_kind = -1;       // gpu: dest layout (see kGpuKind*)
     bool lazy = false;       // gpu: compute write into the store deferred (data only in the snapshot)
+    uint64_t serial = 0;     // resolve number (snapshot contents identity for consumers' derived copies)
   };
   struct Snapshot {
     GLuint texture = 0;

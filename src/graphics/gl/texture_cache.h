@@ -38,7 +38,7 @@ class GlTextureCache {
 
   bool Initialize();
   void Shutdown();
-  void EndFrame() { ++frame_; }
+  void EndFrame();
   void SetRenderTargets(GlRenderTargets* render_targets) { render_targets_ = render_targets; }
   void SetStreamRing(StreamRing* ring) { ring_ = ring; }
 
@@ -79,6 +79,14 @@ class GlTextureCache {
   GlRenderTargets* render_targets_ = nullptr;
   StreamRing* ring_ = nullptr;
   Texture snapshot_tex_;
+  // Top-left parts of larger resolve snapshots (gl_snapshot_subrect), keyed by snapshot texture + size.
+  struct SubSnapshot {
+    GLuint texture = 0;
+    GLenum format = 0;
+    uint64_t serial = UINT64_MAX;
+    uint64_t last_used_frame = 0;
+  };
+  std::unordered_map<uint64_t, SubSnapshot> sub_snapshots_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   std::unordered_map<SamplerKey, GLuint, SamplerKeyHash> samplers_;
   GLuint dummy_2d_array_ = 0, dummy_3d_ = 0, dummy_cube_ = 0, dummy_sampler_ = 0;
