@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 
 #include <switch.h>
 #include <rex/input/switch/switch_input_driver.h>
@@ -64,6 +65,9 @@ REXCVAR_DEFINE_INT32(gl_log_draws_from, 0, "GPU", "GL backend: also log 12 draws
 REXCVAR_DEFINE_INT32(gl_debug_raster, 0, "GPU", "GL debug bitmask: 1=no scissor 2=no cull 4=force colour write/no blend 8=no depth/stencil 16=viewport=full RT");
 REXCVAR_DEFINE_INT32(gl_max_viewport, 16384, "GPU", "GL backend: max viewport dimension used when computing the host viewport");
 REXCVAR_DEFINE_INT32(gl_dump_rt_swaps, 0, "GPU", "GL backend: dump colour RT 0 to rt_<swap>.ppm every N swaps");
+REXCVAR_DEFINE_INT32(gl_gpu_draw_profile, 0, "GPU",
+                     "GL backend: every N swaps (0 = off) time each draw of one frame on the GPU (timestamp queries "
+                     "around every draw) and log the most expensive draws and pixel shaders to log.txt");
 
 namespace rex::graphics {
 extern std::atomic<uint32_t> g_switch_vdswap_count;  // base command_processor.cpp, bumped by VdSwap
@@ -328,6 +332,17 @@ struct GlCommandProcessor::Impl {
   int overlay_cur = 0;
   uint32_t overlay_w = 0, overlay_h = 0;
   int gpu_frame_begin = -1;  // GPU timestamp handle issued after the previous present
+  // gl_gpu_draw_profile: per-draw GPU timestamps of one frame.
+  struct DrawProf {
+    uint64_t vs, ps;
+    uint32_t draw, verts, rt_w, rt_h, tex_mask, prim;
+    int q;  // index of the query pair in draw_prof_q
+  };
+  static constexpr int kDrawProfMax = 2048;
+  GLuint draw_prof_q[2 * kDrawProfMax + 2] = {};
+  std::vector<DrawProf> draw_prof;
+  bool draw_prof_active = false;
+  uint32_t draw_prof_next_swap = 0;
   std::string overlay_text_cached;
   uint32_t front_w = 0, front_h = 0;
   std::vector<uint32_t> front_pixels;
@@ -1221,6 +1236,15 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
                                     uint32_t(vertex_shader->ucode_data_hash()),
                                     pixel_shader ? uint32_t(pixel_shader->ucode_data_hash()) : 0);
   const uint64_t first_use_t0 = first_use ? armGetSystemTick() : 0;
+  int draw_prof_q = -1;
+  if (impl_->draw_prof_active && impl_->draw_prof.size() < size_t(Impl::kDrawProfMax)) {
+    draw_prof_q = int(impl_->draw_prof.size());
+    impl_->draw_prof.push_back(Impl::DrawProf{
+        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0, draw_count_,
+        ppr.host_draw_vertex_count, impl_->render_targets->bound_width(), impl_->render_targets->bound_height(),
+        used_texture_mask, uint32_t(ppr.host_primitive_type), draw_prof_q});
+    glQueryCounter(impl_->draw_prof_q[2 + 2 * draw_prof_q], GL_TIMESTAMP);
+  }
   if (ppr.index_buffer_type == IBT::kNone) {
     glDrawArrays(mode, 0, GLsizei(ppr.host_draw_vertex_count));
   } else {
@@ -1255,6 +1279,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
                    ppr.host_index_format == xenos::IndexFormat::kInt16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
                    reinterpret_cast<const void*>(offset));
   }
+  if (draw_prof_q >= 0) glQueryCounter(impl_->draw_prof_q[3 + 2 * draw_prof_q], GL_TIMESTAMP);
   if (first_use) {
     perf::Add(perf::kFirstUseDraws);
     perf::Add(perf::kFirstUseTicks, armGetSystemTick() - first_use_t0);
@@ -1515,6 +1540,67 @@ void GlCommandProcessor::ShaderPrecompileScreen() {
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), pc->binary_hits());
 }
 
+void GlCommandProcessor::DrawProfileOnSwap() {
+  Impl& im = *impl_;
+  const int every = REXCVAR_GET(gl_gpu_draw_profile);
+  if (im.draw_prof_active) {
+    // The profiled frame ends here: wait for its queries (diagnostic frame only) and log the costs.
+    im.draw_prof_active = false;
+    glQueryCounter(im.draw_prof_q[1], GL_TIMESTAMP);
+    double sc = REXCVAR_GET(gl_gpu_timestamp_scale);
+    if (sc <= 0.0) sc = 625.0 / 384.0;
+    auto ts = [&](int i) {
+      GLuint64 v = 0;
+      glGetQueryObjectui64v(im.draw_prof_q[i], GL_QUERY_RESULT, &v);
+      return double(v) * sc / 1e6;  // ms
+    };
+    const double t_begin = ts(0), t_end = ts(1);
+    struct Cost { double ms; size_t i; };
+    std::vector<Cost> costs;
+    costs.reserve(im.draw_prof.size());
+    double draws_ms = 0.0;
+    std::unordered_map<uint64_t, std::pair<double, uint32_t>> by_ps, by_vs;
+    for (size_t i = 0; i < im.draw_prof.size(); ++i) {
+      const auto& d = im.draw_prof[i];
+      const double ms = std::max(0.0, ts(3 + 2 * d.q) - ts(2 + 2 * d.q));
+      costs.push_back({ms, i});
+      draws_ms += ms;
+      auto& p = by_ps[d.ps];
+      p.first += ms;
+      ++p.second;
+      auto& v = by_vs[d.vs];
+      v.first += ms;
+      ++v.second;
+    }
+    REXGPU_INFO("GL draw profile (swap {}): GPU frame {:.2f} ms, {} draws {:.2f} ms ({:.2f} ms outside draws: "
+                "resolves / copies / clears / waits)",
+                swap_count_, t_end - t_begin, im.draw_prof.size(), draws_ms, (t_end - t_begin) - draws_ms);
+    std::sort(costs.begin(), costs.end(), [](const Cost& a, const Cost& b) { return a.ms > b.ms; });
+    for (size_t k = 0; k < std::min<size_t>(costs.size(), 20); ++k) {
+      const auto& d = im.draw_prof[costs[k].i];
+      REXGPU_INFO("  draw #{} {:.3f} ms vs={:016X} ps={:016X} verts={} prim={} rt={}x{} tex={:08X}", d.draw,
+                  costs[k].ms, d.vs, d.ps, d.verts, d.prim, d.rt_w, d.rt_h, d.tex_mask);
+    }
+    auto top = [&](const char* what, std::unordered_map<uint64_t, std::pair<double, uint32_t>>& m) {
+      std::vector<std::pair<uint64_t, std::pair<double, uint32_t>>> v(m.begin(), m.end());
+      std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+      for (size_t k = 0; k < std::min<size_t>(v.size(), 10); ++k) {
+        REXGPU_INFO("  {} {:016X}: {:.2f} ms in {} draws", what, v[k].first, v[k].second.first, v[k].second.second);
+      }
+    };
+    top("ps", by_ps);
+    top("vs", by_vs);
+    im.draw_prof.clear();
+    im.draw_prof_next_swap = swap_count_ + uint32_t(std::max(every, 1));
+    return;
+  }
+  if (every <= 0 || swap_count_ < im.draw_prof_next_swap) return;
+  if (!im.draw_prof_q[0]) glGenQueries(GLsizei(2 * Impl::kDrawProfMax + 2), im.draw_prof_q);
+  im.draw_prof.clear();
+  im.draw_prof_active = true;
+  glQueryCounter(im.draw_prof_q[0], GL_TIMESTAMP);
+}
+
 void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                    uint32_t frontbuffer_height) {
   ++swap_count_;
@@ -1537,6 +1623,7 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   }
   perf::GpuSegEnd(perf::kGpuSegFrame, impl_->gpu_frame_begin);
   impl_->gpu_frame_begin = -1;
+  DrawProfileOnSwap();
   perf::GpuLagMark();
   const int gpu_swap_begin = perf::GpuStamp();
 #if REX_PLATFORM_SWITCH

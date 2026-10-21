@@ -118,6 +118,10 @@ bool GetHostFormat(xenos::TextureFormat format, HostFormat& out) {
     case F::k_DXN:
       out = {GL_COMPRESSED_RG_RGTC2, 0, 0, 16, true, RGGG, Convert::kCopy};
       return true;
+    case F::k_DXT5A:
+      // One DXT5 alpha block per 4x4 = BC4 (was unsupported: the textures were missing and retried every draw).
+      out = {GL_COMPRESSED_RED_RGTC1, 0, 0, 8, true, RRRR, Convert::kCopy};
+      return true;
     case F::k_24_8:
       out = {GL_R32F, GL_RED, GL_FLOAT, 4, false, RRRR, Convert::kDepth24};
       return true;
@@ -221,6 +225,20 @@ void GlTextureCache::Shutdown() {
 
 void GlTextureCache::EndFrame() {
   ++frame_;
+  if ((frame_ & 127) == 0 && (census_fresh_ || census_changed_)) {
+    std::vector<std::pair<uint32_t, UploadStat>> v(upload_census_.begin(), upload_census_.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.uploads > b.second.uploads; });
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(v.size(), 8); ++i) {
+      const UploadStat& u = v[i].second;
+      top += fmt::format(" {:08X}:{}x{}f{}={}{}{}", v[i].first, u.w, u.h, u.fmt, u.uploads, u.fresh ? "n" : "",
+                         u.bytes_zero ? "z" : "");
+    }
+    REXGPU_INFO("GL tex census (128 frames): uploads new={} changed={} distinct bases={} cache entries={} | top{}",
+                census_fresh_, census_changed_, upload_census_.size(), textures_.size(), top);
+    upload_census_.clear();
+    census_fresh_ = census_changed_ = 0;
+  }
   if ((frame_ & 63) == 0) {
     for (auto it = sub_snapshots_.begin(); it != sub_snapshots_.end();) {
       if (frame_ - it->second.last_used_frame > 120) {
@@ -320,8 +338,8 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     tex = it->second.get();
   }
   tex->last_used_frame = frame_;
-  if (tex->checked_frame == frame_ && tex->valid) {
-    return tex;
+  if (tex->checked_frame == frame_ && (tex->valid || tex->failed)) {
+    return tex->valid ? tex : nullptr;
   }
   // Stable textures are re-checked every gl_tex_stable_interval frames, staggered by key.
   const uint32_t interval = uint32_t(std::max(1, REXCVAR_GET(gl_tex_stable_interval)));
@@ -355,9 +373,23 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
   } else {
     tex->stable_checks = 0;
   }
+  if (tex->failed && h == tex->content_hash) {
+    return nullptr;  // same content that failed before (e.g. unsupported format): do not retry every draw
+  }
   if (!tex->valid || h != tex->content_hash) {
+    const bool fresh = !tex->id;
+    (fresh ? census_fresh_ : census_changed_)++;
+    UploadStat& us = upload_census_[info.memory.base_address];
+    us.w = info.width + 1;
+    us.h = info.height + 1;
+    us.fmt = uint32_t(info.format);
+    ++us.uploads;
+    us.fresh += fresh;
+    const uint64_t bytes_before = perf::Get(perf::kTexUploadBytes);
     tex->content_hash = h;
     tex->valid = Upload(*tex);
+    tex->failed = !tex->valid;
+    if (perf::Get(perf::kTexUploadBytes) == bytes_before) ++us.bytes_zero;
   }
   return tex->valid ? tex : nullptr;
 }

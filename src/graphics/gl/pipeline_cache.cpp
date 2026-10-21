@@ -55,8 +55,8 @@ REXCVAR_DEFINE_INT32(gl_link_thread_watchdog_ms, 3000, "GPU",
 REXCVAR_DEFINE_INT32(gl_compile_threads, 2, "GPU",
                      "GL backend: number of shader compile threads (1-3), each with its own shared GL context. Mesa "
                      "compiles + links one program in 0.5-10 s on the Switch and the first in-game frame needs dozens");
-REXCVAR_DEFINE_INT32(gl_compile_thread_priority, 0x2C, "GPU",
-                     "GL backend: Horizon priority of the compile thread for programs a draw is waiting for (0x2C = like the GPU thread)");
+REXCVAR_DEFINE_INT32(gl_compile_thread_priority, 0x2E, "GPU",
+                     "GL backend: Horizon priority of the compile thread for programs a draw is waiting for (0x2E = below the game and GPU threads (0x2C): in-game compiles no longer take 2 of the 3 cores; 0x2C = old behaviour)");
 REXCVAR_DEFINE_INT32(gl_warm_thread_priority, 0x2E, "GPU",
                      "GL backend: compile thread priority while it pre-compiles programs from the program cache (higher = lower priority)");
 REXCVAR_DEFINE_BOOL(gl_program_cache, true, "GPU",

@@ -59,6 +59,7 @@ class GlTextureCache {
     uint64_t checked_frame = UINT64_MAX;
     uint32_t stable_checks = 0;  // consecutive content checks without a change
     bool valid = false;
+    bool failed = false;  // Upload failed for content_hash (retried only when the content changes)
     uint64_t last_used_frame = 0;
   };
   struct SamplerKey {
@@ -89,6 +90,12 @@ class GlTextureCache {
   };
   std::unordered_map<uint64_t, SubSnapshot> sub_snapshots_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
+  // Upload census (logged every 128 frames): which textures are (re)uploaded in steady state.
+  struct UploadStat {
+    uint32_t w, h, fmt, uploads, fresh, bytes_zero;
+  };
+  std::unordered_map<uint32_t, UploadStat> upload_census_;
+  uint32_t census_fresh_ = 0, census_changed_ = 0, census_keys_ = 0;
   std::unordered_map<SamplerKey, GLuint, SamplerKeyHash> samplers_;
   GLuint dummy_2d_array_ = 0, dummy_3d_ = 0, dummy_cube_ = 0, dummy_sampler_ = 0;
   float max_anisotropy_ = 1.0f;

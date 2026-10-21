@@ -46,6 +46,7 @@ class GlCommandProcessor : public CommandProcessor {
   // Bulk register writes (SET_CONSTANT / type-0 runs): plain registers are byte-swapped straight into the register
   // file; ranges touching a register with a side effect go through CommandProcessor::WriteRegister.
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  void DrawProfileOnSwap();  // gl_gpu_draw_profile
   void DrawFpsOverlay(int sw, int sh);
   void ShaderPrecompileScreen();
   void ValidateBufferByHash(uint32_t address, uint32_t size);

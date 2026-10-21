@@ -46,8 +46,12 @@ bool CreateDirectories(const std::filesystem::path& path) {
     if (next == std::string::npos) next = s.size();
     if (next > pos) {
       std::string prefix = s.substr(0, next);
+      struct stat st;
+      if (stat(prefix.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        pos = next + 1;  // exists: no CreateDirectory request (Eden crashes in some of them)
+        continue;
+      }
       if (mkdir(prefix.c_str(), 0777) != 0 && errno != EEXIST) {
-        struct stat st;
         if (stat(prefix.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
           REXFS_ERROR("CreateDirectories: mkdir '{}' failed (errno {})", prefix, errno);
           return false;

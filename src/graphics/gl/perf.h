@@ -50,6 +50,7 @@ enum Counter : int {
 #if REX_PLATFORM_SWITCH
 inline std::atomic<uint64_t> g_counters[kCounterCount];
 inline void Add(Counter c, uint64_t n = 1) { g_counters[c].fetch_add(n, std::memory_order_relaxed); }
+inline uint64_t Get(Counter c) { return g_counters[c].load(std::memory_order_relaxed); }
 struct Scope {
   Counter c;
   uint64_t t;
@@ -132,6 +133,7 @@ inline void MemAdd(MemKind k, int64_t bytes) { g_mem[k].fetch_add(bytes, std::me
 std::string MemoryString();
 #else
 inline void Add(Counter, uint64_t = 1) {}
+inline uint64_t Get(Counter) { return 0; }
 struct Scope { explicit Scope(Counter) {} };
 inline void OnSwap() {}
 inline const std::string* OverlayLines() { return nullptr; }

@@ -745,6 +745,13 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+#if REX_PLATFORM_SWITCH
+  // Register ranges in one call (the GL backend stores plain ranges straight into the register file).
+  if (!write_one_reg) {
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
+#endif
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
