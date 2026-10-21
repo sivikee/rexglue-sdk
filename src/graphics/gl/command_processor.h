@@ -45,6 +45,7 @@ class GlCommandProcessor : public CommandProcessor {
   bool IssueCopy() override;
   void DrawFpsOverlay(int sw, int sh);
   void ShaderPrecompileScreen();
+  void ValidateBufferByHash(uint32_t address, uint32_t size);
 
  private:
   struct Impl;

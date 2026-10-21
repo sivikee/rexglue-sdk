@@ -57,6 +57,7 @@ class GlTextureCache {
     uint32_t host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
     uint64_t content_hash = 0;
     uint64_t checked_frame = UINT64_MAX;
+    uint32_t stable_checks = 0;  // consecutive content checks without a change
     bool valid = false;
     uint64_t last_used_frame = 0;
   };

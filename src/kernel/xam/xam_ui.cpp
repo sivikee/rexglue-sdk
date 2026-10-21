@@ -23,6 +23,8 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+REXCVAR_DEFINE_STRING(headless_keyboard_text, "", "Kernel",
+                      "Debug: with headless, XamShowKeyboardUI returns this text instead of the default text");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -483,9 +485,13 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   }
 #endif
   if (REXCVAR_GET(headless)) {
-    auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+    const std::string forced = REXCVAR_GET(headless_keyboard_text);
+    auto run = [default_text, buffer, buffer_length, buffer_size, forced]() -> X_RESULT {
       // Redirect default_text back into the buffer.
-      if (!default_text) {
+      if (!forced.empty()) {
+        std::memset(buffer, 0, buffer_size);
+        rex::string::copy_and_swap_truncating(buffer, rex::string::to_utf16(forced), buffer_length);
+      } else if (!default_text) {
         std::memset(buffer, 0, buffer_size);
       } else {
         rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);

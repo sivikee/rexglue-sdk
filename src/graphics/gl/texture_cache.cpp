@@ -18,6 +18,9 @@
 
 #include <rex/cvar.h>
 
+REXCVAR_DEFINE_INT32(gl_tex_stable_interval, 4, "GPU",
+                     "GL backend: a texture whose contents did not change for 16 checks is content-checked only every N "
+                     "frames (1 = every frame)");
 REXCVAR_DEFINE_BOOL(gl_snapshot_subrect, true, "GPU",
                     "GL backend: textures that are the top-left part of a larger GPU resolve snapshot use a GPU copy of "
                     "that part instead of a synchronous readback through guest memory (HDR luminance chain)");
@@ -320,6 +323,12 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
   if (tex->checked_frame == frame_ && tex->valid) {
     return tex;
   }
+  // Stable textures are re-checked every gl_tex_stable_interval frames, staggered by key.
+  const uint32_t interval = uint32_t(std::max(1, REXCVAR_GET(gl_tex_stable_interval)));
+  if (tex->valid && tex->stable_checks >= 16 && interval > 1 && tex->checked_frame != UINT64_MAX &&
+      frame_ - tex->checked_frame < interval && ((frame_ + (key >> 7)) % interval) != 0) {
+    return tex;
+  }
   // Content check (no write watches on the Switch memory layer).
   uint64_t h = 0;
   auto hash_range = [&](uint32_t address, uint32_t size) {
@@ -341,6 +350,11 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
     perf::Add(perf::kTexHashBytes, info.memory.base_size + (info.mip_max_level > 0 ? info.memory.mip_size : 0));
   }
   tex->checked_frame = frame_;
+  if (tex->valid && h == tex->content_hash) {
+    if (tex->stable_checks < 0xFFFF) ++tex->stable_checks;
+  } else {
+    tex->stable_checks = 0;
+  }
   if (!tex->valid || h != tex->content_hash) {
     tex->content_hash = h;
     tex->valid = Upload(*tex);

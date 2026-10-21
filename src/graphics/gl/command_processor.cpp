@@ -45,6 +45,7 @@ REXCVAR_DEFINE_BOOL(gl_stream_uploads, true, "GPU", "GL backend: upload constant
 REXCVAR_DEFINE_BOOL(gl_sync_resolve, false, "GPU", "GL backend: resolve (EDRAM copy) readback is synchronous like the original implementation (debugging)");
 REXCVAR_DEFINE_BOOL(gl_resolve_gpu_copy, true, "GPU", "GL backend: textures / front buffer matching a pending resolve use a GPU-side copy of the render target instead of guest memory");
 REXCVAR_DEFINE_INT32(gl_resolve_max_age, 3, "GPU", "GL backend: a pending async resolve is written to guest memory after at most this many swaps");
+REXCVAR_DEFINE_BOOL(gl_hash_validate, true, "GPU", "GL backend: vertex / index buffers in the shared memory store are re-validated by content hash (persistent across frames) instead of being re-uploaded every frame / every draw");
 REXCVAR_DEFINE_BOOL(gl_state_cache, true, "GPU", "GL backend: skip redundant raster state GL calls");
 REXCVAR_DEFINE_BOOL(gl_gpu_resolve, true, "GPU", "GL backend: resolves (EDRAM copies) are done by a compute shader into the shared memory store; guest memory is written back lazily (false = CPU readback + conversion)");
 REXCVAR_DEFINE_BOOL(gl_gpu_front, true, "GPU", "GL backend: the front buffer is detiled / endian swapped by a fragment shader reading the shared memory store (false = other paths)");
@@ -353,6 +354,12 @@ struct GlCommandProcessor::Impl {
   GLint blit_store_a_loc = -1, blit_store_b_loc = -1, blit_store_sel_loc = -1;
   GlTextureCache::FetchInfo fetch_info[32];
   std::unordered_map<uint64_t, uint64_t> vertex_buffer_hashes;
+  // gl_hash_validate: content hash of each (address, size) buffer range drawn from and the swap it was last hashed in.
+  struct BufferHash {
+    uint64_t hash;
+    uint32_t swap;
+  };
+  std::unordered_map<uint64_t, BufferHash> buffer_hashes;
   uint32_t texture_bound_mask = 0;
 };
 
@@ -612,7 +619,9 @@ bool GlCommandProcessor::PrepareVertexBuffers(const Shader& vertex_shader) {
       size = std::min(size, SharedMemory::kBufferSize - address);
       // No write watches on this platform: re-validate small dynamic buffers by content, larger ones
       // are refreshed once per frame (SetSystemPageBlocksValidWithGpuDataWritten in IssueSwap).
-      if (size <= (256u << 10)) {
+      if (REXCVAR_GET(gl_hash_validate)) {
+        ValidateBufferByHash(address, size);
+      } else if (size <= (256u << 10)) {
         uint64_t key = (uint64_t(address) << 32) | size;
         uint64_t hash = XXH3_64bits(memory_->TranslatePhysical(address), size);
         auto it = impl_->vertex_buffer_hashes.find(key);
@@ -1038,9 +1047,12 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   if (index_buffer_info && index_buffer_info->length) {
     uint32_t base = index_buffer_info->guest_base;
     if (base < SharedMemory::kBufferSize) {
-      impl_->shared_memory->MemoryInvalidationCallback(
-          base, uint32_t(std::min<size_t>(index_buffer_info->length, SharedMemory::kBufferSize - base)),
-          true);
+      const uint32_t length = uint32_t(std::min<size_t>(index_buffer_info->length, SharedMemory::kBufferSize - base));
+      if (REXCVAR_GET(gl_hash_validate)) {
+        ValidateBufferByHash(base, length);
+      } else {
+        impl_->shared_memory->MemoryInvalidationCallback(base, length, true);
+      }
     }
   }
   PrimitiveProcessor::ProcessingResult ppr;
@@ -1362,6 +1374,29 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
   (void)sw;
   (void)sh;
 #endif
+}
+
+// No write watches on this platform: a buffer range the guest draws from is invalidated in the store only when its
+// contents changed since it was last hashed. Ranges up to 256 KiB are hashed on every draw (the guest rewrites
+// dynamic buffers between draws); larger ones once per swap.
+void GlCommandProcessor::ValidateBufferByHash(uint32_t address, uint32_t size) {
+  if (!size) return;
+  auto& map = impl_->buffer_hashes;
+  if (map.size() > 65536) map.clear();  // ring-allocated dynamic buffers: bounded, costs one re-upload each
+  const uint64_t key = (uint64_t(address) << 32) | size;
+  auto it = map.find(key);
+  if (it != map.end() && size > (256u << 10) && it->second.swap == swap_count_) return;
+  const uint64_t hash = XXH3_64bits(memory_->TranslatePhysical(address), size);
+  if (it == map.end()) {
+    map.emplace(key, Impl::BufferHash{hash, swap_count_});
+    impl_->shared_memory->MemoryInvalidationCallback(address, size, true);
+    return;
+  }
+  it->second.swap = swap_count_;
+  if (it->second.hash != hash) {
+    it->second.hash = hash;
+    impl_->shared_memory->MemoryInvalidationCallback(address, size, true);
+  }
 }
 
 // Start-up screen while the compile threads load (program binaries) or compile the programs of the program cache. The
@@ -1725,7 +1760,9 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   impl_->gpu_frame_begin = perf::GpuStamp();
 
   // Per-frame housekeeping.
-  impl_->shared_memory->SetSystemPageBlocksValidWithGpuDataWritten();
+  if (!REXCVAR_GET(gl_hash_validate)) {
+    impl_->shared_memory->SetSystemPageBlocksValidWithGpuDataWritten();
+  }
   impl_->primitive_processor->EndFrame();
   impl_->texture_cache->EndFrame();
   impl_->render_targets->PollPending();
