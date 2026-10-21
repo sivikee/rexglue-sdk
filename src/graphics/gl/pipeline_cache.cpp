@@ -64,6 +64,9 @@ REXCVAR_DEFINE_BOOL(gl_program_cache, true, "GPU",
                     "and pre-compile them in the background at the next start");
 REXCVAR_DEFINE_STRING(gl_program_cache_path, "sdmc:/oblivion/cache/gl_programs.bin", "GPU",
                       "GL backend: program cache file (delete it to start over)");
+REXCVAR_DEFINE_STRING(gl_program_binary_path, "sdmc:/oblivion/cache/gl_binaries.bin", "GPU",
+                      "GL backend: Mesa program binaries (gl_program_binaries), keyed by the GLSL source; a program found "
+                      "here is loaded instead of compiled. Shipped with the package = prebuilt shaders");
 REXCVAR_DEFINE_INT32(gl_program_warm_max, 800, "GPU", "GL backend: at most this many cached programs are pre-compiled per start (0 = none)");
 REXCVAR_DEFINE_INT32(gl_warm_min_headroom_mb, 512, "GPU",
                      "GL backend: background pre-compilation pauses while less than this much malloc memory is left");
@@ -103,6 +106,8 @@ constexpr char kCacheMagic[8] = {'R', 'X', 'G', 'L', 'P', 'C', '0', '1'};
 constexpr uint32_t kCacheFormat = 1;
 constexpr uint32_t kCacheGenTag = 1;
 constexpr uint8_t kRecShader = 'S', kRecProgram = 'P';
+// Program binary file: magic, u64 Mesa fingerprint, then records {u64 GLSL key, u32 format, u32 size, size bytes}.
+constexpr char kBinaryMagic[8] = {'R', 'X', 'G', 'L', 'P', 'B', '0', '1'};
 
 uint64_t MallocHeadroom() {
   struct mallinfo mi = mallinfo();
@@ -802,7 +807,7 @@ void GlPipelineCache::WorkerMain(Worker& self_worker) {
     bool skipped_warm = false;
     if (link_on_worker_.load() && self_worker.share_ok && !job_translate_only &&
         program->state.load() == GlProgram::kGlslReady) {
-      if (!urgent && !WarmLinkAllowed()) {
+      if (!urgent && !startup_precompile_.load() && !WarmLinkAllowed()) {
         skipped_warm = true;  // left translated; linked when a draw asks for it
       } else {
         perf::SetWorkerActivity(perf::kWCompileLink, vh, ph);
@@ -829,8 +834,10 @@ void GlPipelineCache::WorkerMain(Worker& self_worker) {
         }
       } else if (skipped_warm) {
         ++warm_skipped_;
+        ++warm_done_;
       } else {
         ++warm_linked_;
+        ++warm_done_;
       }
       (void)urgent;
       if (!warm_logged_done_ && warm_.empty() && (warm_linked_ || warm_skipped_)) {
@@ -938,7 +945,6 @@ void GlPipelineCache::StartLink(GlProgram& program) {
       vs_source += "void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);"; vs_source += extra; vs_source += " }\n";
     }
   }
-  program.vs_id = make(GL_VERTEX_SHADER, vs_source);
   std::string ps_source = ps_glsl ? ps_glsl->source : std::string();
   if (ps_glsl && REXCVAR_GET(gl_debug_ps) == 9) {
     ps_source = "#version 430\nlayout(location = 0) out vec4 xe_out_fragment_data_0;\nvoid main() { xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
@@ -992,6 +998,18 @@ void GlPipelineCache::StartLink(GlProgram& program) {
       ps_source += "void main() { xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
     }
   }
+  program.binary_key = 0;
+  program.from_binary = false;
+  if (binaries_loaded_.load() && ProgramBinariesOnThisThread()) {
+    program.binary_key = XXH3_64bits_withSeed(ps_source.data(), ps_source.size(),
+                                              XXH3_64bits(vs_source.data(), vs_source.size()));
+    if (!program.binary_key) program.binary_key = 1;
+    if (TryLoadBinary(program)) {
+      program.state = GlProgram::kLinking;  // FinishLink only checks the link status
+      return;
+    }
+  }
+  program.vs_id = make(GL_VERTEX_SHADER, vs_source);
   program.fs_id = ps_glsl ? make(GL_FRAGMENT_SHADER, ps_source) : 0;
   program.program = glCreateProgram();
   glAttachShader(program.program, program.vs_id);
@@ -1068,7 +1086,14 @@ bool GlPipelineCache::FinishLink(GlProgram& program, bool block, bool* done_out)
                                                           program.link_start)
                     .count();
     uint32_t n = ++linked_count_;
-    if (n <= 8 || n % 25 == 0 || ms >= 3000.0) {
+    if (program.from_binary) {
+      const uint32_t hits = binary_hits_.load();
+      if (hits <= 8 || hits % 25 == 0 || ms >= 1000.0) {
+        REXGPU_INFO("GL: program #{} (vs {:016X} ps {:016X}) loaded from its binary in {:.0f} ms on the {} thread ({} binaries loaded)",
+                    n, vertex->shader().ucode_data_hash(), pixel ? pixel->shader().ucode_data_hash() : uint64_t(0), ms,
+                    tl_compile_thread ? "compile" : "GPU", hits);
+      }
+    } else if (n <= 8 || n % 25 == 0 || ms >= 3000.0) {
       REXGPU_INFO("GL: program #{} (vs {:016X} ps {:016X}{}) compiled+linked in {:.0f} ms on the {} thread (GLSL {} + {} bytes)",
                   n, vertex->shader().ucode_data_hash(), pixel ? pixel->shader().ucode_data_hash() : uint64_t(0),
                   program.from_disk && !program.urgent ? ", warm-up" : "", ms,
@@ -1077,7 +1102,7 @@ bool GlPipelineCache::FinishLink(GlProgram& program, bool block, bool* done_out)
     }
     const size_t big = size_t(std::max(0, REXCVAR_GET(gl_dump_big_glsl_kb))) << 10;
     const size_t vs_bytes = vertex->glsl()->source.size(), ps_bytes = pixel ? pixel->glsl()->source.size() : 0;
-    if (big && (vs_bytes > big || ps_bytes > big) && dumped_big_ < 8) {
+    if (!program.from_binary && big && (vs_bytes > big || ps_bytes > big) && dumped_big_ < 8) {
       ++dumped_big_;
       REXGPU_INFO("GL: big program (vs {:016X} {} bytes, ps {:016X} {} bytes) linked in {:.0f} ms; dumping it",
                   vertex->shader().ucode_data_hash(), vs_bytes, pixel ? pixel->shader().ucode_data_hash() : uint64_t(0),
@@ -1100,14 +1125,153 @@ bool GlPipelineCache::FinishLink(GlProgram& program, bool block, bool* done_out)
     }
     program.sm_base_location = glGetUniformLocation(program.program, "xe_sm_base");
     perf::MemAdd(perf::kMemPrograms, 1);
+    if (!program.from_binary && program.binary_key) SaveBinary(program);
     result = true;
   }
-  glDeleteShader(program.vs_id);
+  if (program.vs_id) glDeleteShader(program.vs_id);
   if (program.fs_id) {
     glDeleteShader(program.fs_id);
   }
   program.vs_id = program.fs_id = 0;
   return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Program binaries (gl_program_binaries)
+// ---------------------------------------------------------------------------------------------
+
+bool GlPipelineCache::TryLoadBinary(GlProgram& program) {
+  ProgramBinary bin;
+  {
+    std::lock_guard<std::mutex> lock(binary_mutex_);
+    auto it = binaries_.find(program.binary_key);
+    if (it == binaries_.end()) return false;
+    bin = std::move(it->second);  // a loaded program is not saved again; the file keeps it
+    binaries_.erase(it);
+  }
+  DrainGlErrors();
+  program.program = glCreateProgram();
+  glProgramBinary(program.program, bin.format, bin.data.data(), GLsizei(bin.data.size()));
+  GLint ok = 0;
+  glGetProgramiv(program.program, GL_LINK_STATUS, &ok);
+  const GLenum err = DrainGlErrors();
+  if (!ok || err != GL_NO_ERROR) {
+    if (++binary_rejects_ <= 8) {
+      REXGPU_WARN("GL: program binary {:016X} ({} bytes) rejected (link status {}, GL error {:x}); compiling it",
+                  program.binary_key, bin.data.size(), ok, err);
+    }
+    glDeleteProgram(program.program);
+    program.program = 0;
+    return false;
+  }
+  ++binary_hits_;
+  program.from_binary = true;
+  program.vs_id = program.fs_id = 0;
+  return true;
+}
+
+void GlPipelineCache::SaveBinary(GlProgram& program) {
+  DrainGlErrors();
+  GLint len = 0;
+  glGetProgramiv(program.program, GL_PROGRAM_BINARY_LENGTH, &len);
+  if (len <= 0 || len > (16 << 20)) {
+    const GLenum err = DrainGlErrors();
+    static std::atomic<int> logged{0};
+    if (logged++ < 4) {
+      REXGPU_WARN("GL: no program binary for {:016X} (length {}, GL error {:x})", program.binary_key, len, err);
+    }
+    return;
+  }
+  std::vector<uint8_t> data(static_cast<size_t>(len));
+  GLsizei got = 0;
+  GLenum format = 0;
+  glGetProgramBinary(program.program, len, &got, &format, data.data());
+  const GLenum err = DrainGlErrors();
+  if (got <= 0 || err != GL_NO_ERROR) {
+    static std::atomic<int> logged{0};
+    if (logged++ < 4) {
+      REXGPU_WARN("GL: glGetProgramBinary failed for {:016X} (length {}, got {}, GL error {:x})", program.binary_key,
+                  len, got, err);
+    }
+    return;
+  }
+  data.resize(size_t(got));
+  std::lock_guard<std::mutex> lock(binary_mutex_);
+  if (binary_path_.empty()) return;
+  Put<uint64_t>(binary_pending_, program.binary_key);
+  Put<uint32_t>(binary_pending_, uint32_t(format));
+  Put<uint32_t>(binary_pending_, uint32_t(data.size()));
+  binary_pending_.insert(binary_pending_.end(), data.begin(), data.end());
+  const uint32_t saves = ++binary_saves_;
+  if (saves <= 4) {
+    REXGPU_INFO("GL: program binary {:016X} saved ({} bytes, format {:x})", program.binary_key, data.size(), format);
+  }
+}
+
+// GPU thread, before any program is queued (WarmUpFromDisk).
+void GlPipelineCache::LoadBinaries() {
+  const uint64_t fingerprint = MesaBinaryFingerprint();
+  if (!fingerprint || !ProgramBinariesOnThisThread()) {
+    REXGPU_INFO("GL program binaries: off (gl_program_binaries = false or the Mesa patch was not applied)");
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::string path = REXCVAR_GET(gl_program_binary_path);
+  std::vector<uint8_t> file;
+  if (FILE* f = std::fopen(path.c_str(), "rb")) {
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size > 0 && size < (256l << 20)) {
+      file.resize(size_t(size));
+      if (std::fread(file.data(), 1, file.size(), f) != file.size()) file.clear();
+    }
+    std::fclose(f);
+  }
+  constexpr size_t kHeader = sizeof(kBinaryMagic) + 8;
+  uint64_t file_fp = 0;
+  if (file.size() >= kHeader) std::memcpy(&file_fp, file.data() + sizeof(kBinaryMagic), 8);
+  const bool header_ok =
+      file.size() >= kHeader && !std::memcmp(file.data(), kBinaryMagic, sizeof(kBinaryMagic)) && file_fp == fingerprint;
+  if (!header_ok) {
+    if (!file.empty()) {
+      REXGPU_INFO("GL program binaries: {} is from another Mesa build (fingerprint {:016X}, this one {:016X}), starting over",
+                  path, file_fp, fingerprint);
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+      REXGPU_WARN("GL program binaries: cannot create {} (binaries off)", path);
+      return;
+    }
+    std::fwrite(kBinaryMagic, 1, sizeof(kBinaryMagic), f);
+    std::fwrite(&fingerprint, 8, 1, f);
+    std::fclose(f);
+    file.clear();
+  }
+  size_t pos = header_ok ? kHeader : file.size();
+  uint32_t records = 0;
+  uint64_t bytes = 0;
+  {
+    std::lock_guard<std::mutex> lock(binary_mutex_);
+    while (pos + 16 <= file.size()) {
+      uint64_t key;
+      uint32_t format, size;
+      std::memcpy(&key, &file[pos], 8);
+      std::memcpy(&format, &file[pos + 8], 4);
+      std::memcpy(&size, &file[pos + 12], 4);
+      if (!size || pos + 16 + size > file.size()) break;  // truncated tail
+      ProgramBinary& bin = binaries_[key];  // a later record of the same key replaces the earlier one
+      bin.format = format;
+      bin.data.assign(file.begin() + long(pos + 16), file.begin() + long(pos + 16 + size));
+      pos += 16 + size;
+      ++records;
+      bytes += size;
+    }
+    binary_path_ = path;
+  }
+  binaries_loaded_ = true;
+  REXGPU_INFO("GL program binaries: {}: {} binaries ({} KiB) loaded in {:.0f} ms (Mesa fingerprint {:016X})", path,
+              records, bytes >> 10, MsSince(t0), fingerprint);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1144,6 +1308,19 @@ void GlPipelineCache::RecordProgram(const GlProgram& program) {
 }
 
 void GlPipelineCache::FlushCacheWrites() {
+  std::vector<uint8_t> bin_data;
+  std::string bin_path;
+  {
+    std::lock_guard<std::mutex> lock(binary_mutex_);
+    bin_data.swap(binary_pending_);
+    bin_path = binary_path_;
+  }
+  if (!bin_data.empty() && !bin_path.empty()) {
+    if (FILE* f = std::fopen(bin_path.c_str(), "ab")) {
+      std::fwrite(bin_data.data(), 1, bin_data.size(), f);
+      std::fclose(f);
+    }
+  }
   std::vector<uint8_t> data;
   std::string path;
   {
@@ -1159,6 +1336,7 @@ void GlPipelineCache::FlushCacheWrites() {
 }
 
 void GlPipelineCache::WarmUpFromDisk() {
+  LoadBinaries();
   if (!REXCVAR_GET(gl_program_cache)) {
     REXGPU_INFO("GL program cache: off (gl_program_cache = false)");
     return;
@@ -1268,6 +1446,7 @@ void GlPipelineCache::WarmUpFromDisk() {
     cache_path_ = path;
     cache_enabled_ = true;
   }
+  warm_total_ = programs_queued;
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   REXGPU_INFO("GL program cache: {} ({} bytes): {} shaders, {} programs ({} queued for background compilation{}), {} bad records, "
               "loaded in {:.0f} ms; malloc headroom {} MiB",

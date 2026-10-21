@@ -16,6 +16,10 @@
 #include <rex/system/kernel_state.h>
 
 #include <imgui.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_SWITCH
+#include <switch.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
@@ -434,6 +438,50 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
 
   X_RESULT result;
+#if REX_PLATFORM_SWITCH
+  if (!REXCVAR_GET(headless)) {
+    // Switch: no ImGui window; show the system software keyboard applet instead. swkbdShow blocks until the player
+    // is done, so it runs in the deferred completion like the headless path (XN_SYS_UI is broadcast around it).
+    auto guest_utf8 = [](const mapped_wstring& s) {
+      return s ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                     REX_KERNEL_MEMORY()->TranslateVirtual(s.guest_address())))
+               : std::string();
+    };
+    std::string title_str = guest_utf8(title), desc_str = guest_utf8(description), def_text_str = guest_utf8(default_text);
+    auto run = [buffer, buffer_length, buffer_size, title_str, desc_str, def_text_str](
+                   uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+      length = 0;
+      SwkbdConfig kbd;
+      Result rc = swkbdCreate(&kbd, 0);
+      if (R_FAILED(rc)) {
+        REXKRNL_WARN("XamShowKeyboardUI: swkbdCreate failed ({:x}), returning the default text", rc);
+        auto text = rex::string::to_utf16(def_text_str);
+        rex::string::copy_and_swap_truncating(buffer, text, buffer_length);
+        extended_error = X_ERROR_SUCCESS;
+        return X_ERROR_SUCCESS;
+      }
+      swkbdConfigMakePresetDefault(&kbd);
+      if (!title_str.empty()) swkbdConfigSetHeaderText(&kbd, title_str.c_str());
+      if (!desc_str.empty()) swkbdConfigSetSubText(&kbd, desc_str.c_str());
+      if (!def_text_str.empty()) swkbdConfigSetInitialText(&kbd, def_text_str.c_str());
+      if (buffer_length > 1) swkbdConfigSetStringLenMax(&kbd, buffer_length - 1);
+      std::vector<char> out(size_t(buffer_length) * 4 + 4, 0);
+      rc = swkbdShow(&kbd, out.data(), out.size());
+      swkbdClose(&kbd);
+      if (R_FAILED(rc)) {  // the player cancelled
+        REXKRNL_INFO("XamShowKeyboardUI: software keyboard cancelled ({:x})", rc);
+        extended_error = X_ERROR_CANCELLED;
+        return X_ERROR_SUCCESS;
+      }
+      std::memset(buffer, 0, buffer_size);
+      auto text = rex::string::to_utf16(std::string(out.data()));
+      rex::string::copy_and_swap_truncating(buffer, text, buffer_length);
+      extended_error = X_ERROR_SUCCESS;
+      return X_ERROR_SUCCESS;
+    };
+    return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
+  }
+#endif
   if (REXCVAR_GET(headless)) {
     auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
       // Redirect default_text back into the buffer.

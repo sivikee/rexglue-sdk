@@ -39,6 +39,8 @@ REXCVAR_DEFINE_INT32(gl_screenshot_from_every, 5, "GPU", "GL backend: interval u
 REXCVAR_DEFINE_INT32(gl_screenshot_first, 1, "GPU",
                      "GL backend: also screenshot the swap with this index (1-based, 0 = none)");
 REXCVAR_DEFINE_BOOL(switch_fps_overlay, true, "GPU", "Switch: draw an FPS / frame-time overlay in the top-left corner");
+REXCVAR_DEFINE_BOOL(gl_precompile_screen, true, "GPU", "GL backend: at start-up, show a \"recompiling shaders\" screen and hold the game until every program of the program cache is loaded or compiled");
+REXCVAR_DEFINE_INT32(gl_precompile_max_s, 0, "GPU", "GL backend: stop waiting on the start-up pre-compilation after this many seconds (0 = wait until done)");
 REXCVAR_DEFINE_BOOL(gl_stream_uploads, true, "GPU", "GL backend: upload constants / shared memory / textures through unsynchronised streaming rings (avoids nouveau pipeline stalls); false = old glBufferSubData paths");
 REXCVAR_DEFINE_BOOL(gl_sync_resolve, false, "GPU", "GL backend: resolve (EDRAM copy) readback is synchronous like the original implementation (debugging)");
 REXCVAR_DEFINE_BOOL(gl_resolve_gpu_copy, true, "GPU", "GL backend: textures / front buffer matching a pending resolve use a GPU-side copy of the render target instead of guest memory");
@@ -64,6 +66,9 @@ REXCVAR_DEFINE_INT32(gl_dump_rt_swaps, 0, "GPU", "GL backend: dump colour RT 0 t
 
 namespace rex::graphics {
 extern std::atomic<uint32_t> g_switch_vdswap_count;  // base command_processor.cpp, bumped by VdSwap
+// Set once the GPU thread is set up and the start-up shader pre-compilation is over; the Switch harness starts the
+// guest main thread only after that, so the intro does not play while programs compile.
+std::atomic<bool> g_switch_shaders_ready{false};
 }  // namespace rex::graphics
 
 namespace rex::graphics::gl {
@@ -187,7 +192,8 @@ const uint8_t* OverlayGlyph(char ch) {
       {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}}, {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
       {'N', {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}}, {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
       {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}}, {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
-      {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
+      {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}}, {'/', {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}},
+      {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}}, {'%', {0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13}},
   };
   for (const auto& g : kGlyphs) {
     if (g.c == ch) return g.r;
@@ -359,6 +365,9 @@ GlCommandProcessor::GlCommandProcessor(GraphicsSystem* graphics_system,
 GlCommandProcessor::~GlCommandProcessor() = default;
 
 bool GlCommandProcessor::SetupContext() {
+  struct ReadyOnExit {
+    ~ReadyOnExit() { g_switch_shaders_ready = true; }  // also on failure: the guest must not wait forever
+  } ready_on_exit;
   if (!context_.Initialize()) {
     return false;
   }
@@ -514,6 +523,7 @@ void main() {
   // Fixed GL buffers (Mesa nouveau allocates GPU memory from the newlib heap on the Switch).
   perf::MemAdd(perf::kMemBuffers, int64_t(Impl::kUboRingSize) + (impl_->stream ? int64_t((16u + 48u) << 20) : 0));
   impl_->pipeline_cache->WarmUpFromDisk();
+  ShaderPrecompileScreen();
   {
     const int interval = std::clamp(REXCVAR_GET(gl_swap_interval), 0, 4);
     if (interval != 1) context_.SetSwapInterval(interval);
@@ -1352,6 +1362,101 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
   (void)sw;
   (void)sh;
 #endif
+}
+
+// Start-up screen while the compile threads load (program binaries) or compile the programs of the program cache. The
+// guest has not started yet (g_switch_shaders_ready), so nothing else needs the GPU thread meanwhile.
+void GlCommandProcessor::ShaderPrecompileScreen() {
+  auto* pc = impl_->pipeline_cache.get();
+  const uint32_t total = pc ? pc->warm_total() : 0;
+  if (!REXCVAR_GET(gl_precompile_screen) || !total) {
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const int max_s = REXCVAR_GET(gl_precompile_max_s);
+  REXGPU_INFO("GL: pre-compiling {} programs before the game starts", total);
+  pc->SetStartupPrecompile(true);
+  constexpr uint32_t kW = 320, kH = 180;  // canvas, scaled to the whole screen
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glActiveTexture(GL_TEXTURE0);
+  glBindSampler(0, 0);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kW, kH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  std::vector<uint32_t> buf(size_t(kW) * kH);
+  auto text = [&](const std::string& str, int scale, int y, uint32_t color) {
+    const int cell = 6 * scale;
+    int x = (int(kW) - int(str.size()) * cell + scale) / 2;
+    for (char ch : str) {
+      if (const uint8_t* g = OverlayGlyph(ch)) {
+        for (int ry = 0; ry < 7; ++ry) {
+          for (int rx = 0; rx < 5; ++rx) {
+            if (!((g[ry] >> (4 - rx)) & 1)) continue;
+            for (int sy = 0; sy < scale; ++sy) {
+              for (int sx = 0; sx < scale; ++sx) {
+                const int px = x + rx * scale + sx, py = y + ry * scale + sy;
+                if (px >= 0 && px < int(kW) && py >= 0 && py < int(kH)) buf[size_t(py) * kW + size_t(px)] = color;
+              }
+            }
+          }
+        }
+      }
+      x += cell;
+    }
+  };
+  auto rect = [&](int x0, int y0, int w, int h, uint32_t color) {
+    for (int y = y0; y < y0 + h; ++y) {
+      for (int x = x0; x < x0 + w; ++x) buf[size_t(y) * kW + size_t(x)] = color;
+    }
+  };
+  glDisable(GL_SCISSOR_TEST);
+  glDisable(GL_BLEND);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_STENCIL_TEST);
+  glDisable(GL_CULL_FACE);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  uint32_t done = 0;
+  while (true) {
+    done = std::min(pc->warm_done(), total);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const bool timed_out = max_s > 0 && secs >= max_s;
+    // ABGR (GL_RGBA bytes, little endian).
+    std::fill(buf.begin(), buf.end(), 0xFF140C08u);
+    text("RECOMPILING SHADERS", 2, 52, 0xFFD0E8F0u);
+    text(std::to_string(done) + " / " + std::to_string(total), 2, 78, 0xFFFFFFFFu);
+    const int bar_w = 240, bar_x = (int(kW) - bar_w) / 2, bar_y = 102;
+    rect(bar_x - 2, bar_y - 2, bar_w + 4, 12, 0xFF605048u);
+    rect(bar_x, bar_y, bar_w, 8, 0xFF201810u);
+    rect(bar_x, bar_y, int(uint64_t(bar_w) * done / total), 8, 0xFF40B0E0u);
+    text("PLEASE WAIT", 1, 128, 0xFF8090A0u);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kW, kH, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+    int sw = 1280, sh = 720;
+    context_.QuerySurfaceSize(sw, sh);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, sw, sh);
+    glUseProgram(impl_->blit_program);
+    glBindVertexArray(impl_->empty_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    context_.SwapBuffers();
+    if (done >= total || timed_out) {
+      if (timed_out) REXGPU_WARN("GL: pre-compilation stopped after {} s (gl_precompile_max_s)", max_s);
+      break;
+    }
+    svcSleepThread(100'000'000);
+  }
+  pc->SetStartupPrecompile(false);
+  glDeleteTextures(1, &tex);
+  glUseProgram(0);
+  glBindVertexArray(0);
+  impl_->raster_cache.Invalidate();
+  REXGPU_INFO("GL: pre-compilation done: {} of {} programs in {:.1f} s ({} from program binaries)", done, total,
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), pc->binary_hits());
 }
 
 void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,

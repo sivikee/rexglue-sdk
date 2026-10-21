@@ -30,6 +30,7 @@ set(REXGPU_GL_SOURCES
 
     # GL backend
     gl/gl_context.cpp
+    gl/nvc0_cache.cpp
     gl/graphics_system.cpp
     gl/command_processor.cpp
     gl/perf.cpp

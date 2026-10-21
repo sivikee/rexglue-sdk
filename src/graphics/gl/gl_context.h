@@ -47,7 +47,14 @@ class GlContext {
   GlCaps caps_;
   // nouveau: grow the shader code segment once at start-up (gl_nvc0_code_area_mb).
   void GrowShaderCodeArea();
+  // Mesa: enable GL_ARB_get_program_binary on the context current on this thread (gl_program_binaries).
+  void EnableProgramBinaries(const char* who);
 };
+
+// Fingerprint of the linked Mesa's program (de)serialiser (0 until a context enabled program binaries).
+uint64_t MesaBinaryFingerprint();
+// The context current on this thread accepts glGetProgramBinary / glProgramBinary.
+bool ProgramBinariesOnThisThread();
 
 // Returns the GL error string for glGetError values.
 const char* GlErrorString(unsigned int err);

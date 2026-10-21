@@ -52,6 +52,8 @@ struct GlProgram {
   bool urgent = false;   // requested by a draw
   bool busy = false;     // being processed by the compile thread
   bool from_disk = false;
+  uint64_t binary_key = 0;   // hash of the GLSL sources (gl_program_binaries), 0 = binaries unavailable
+  bool from_binary = false;  // loaded with glProgramBinary instead of compiled
   size_t glsl_bytes = 0;  // VS + PS GLSL size once translated (link cost estimate for small-first scheduling)
   // GPU thread only.
   mutable bool used = false;  // a draw has used it (first-use draw accounting)
@@ -67,6 +69,13 @@ class GlPipelineCache {
   // Loads the persistent program list (gl_program_cache) and queues its programs for background compilation.
   // GPU thread, after Initialize.
   void WarmUpFromDisk();
+  // Start-up pre-compilation progress of the programs WarmUpFromDisk queued (any thread).
+  uint32_t warm_total() const { return warm_total_.load(); }
+  uint32_t warm_done() const { return warm_done_.load(); }
+  uint32_t binary_hits() const { return binary_hits_.load(); }
+  // While the start-up screen waits (the guest has not started), warm programs are linked regardless of
+  // gl_warm_min_headroom_mb: the game's memory is not in use yet.
+  void SetStartupPrecompile(bool on) { startup_precompile_ = on; }
 
   GlShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                        uint32_t dword_count);
@@ -176,6 +185,8 @@ class GlPipelineCache {
   uint32_t dumped_ = 0;
   uint32_t dumped_big_ = 0;
   uint32_t warm_linked_ = 0, warm_skipped_ = 0;
+  std::atomic<uint32_t> warm_total_{0}, warm_done_{0};
+  std::atomic<bool> startup_precompile_{false};
   bool warm_logged_done_ = false;
 
   std::mutex cache_mutex_;
@@ -183,6 +194,21 @@ class GlPipelineCache {
   std::string cache_path_;
   std::vector<uint8_t> cache_pending_;
   std::unordered_set<uint64_t> cache_shaders_written_;
+
+  // Program binaries (gl_program_binaries): GLSL source hash -> Mesa program binary, kept in gl_program_binary_path.
+  struct ProgramBinary {
+    uint32_t format = 0;
+    std::vector<uint8_t> data;
+  };
+  void LoadBinaries();
+  bool TryLoadBinary(GlProgram& program);  // any thread with a binary-capable context
+  void SaveBinary(GlProgram& program);
+  std::mutex binary_mutex_;
+  std::unordered_map<uint64_t, ProgramBinary> binaries_;
+  std::vector<uint8_t> binary_pending_;
+  std::string binary_path_;
+  std::atomic<bool> binaries_loaded_{false};
+  std::atomic<uint32_t> binary_hits_{0}, binary_saves_{0}, binary_rejects_{0};
 };
 
 }  // namespace rex::graphics::gl

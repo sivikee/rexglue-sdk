@@ -44,6 +44,7 @@ class GlCommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
   void DrawFpsOverlay(int sw, int sh);
+  void ShaderPrecompileScreen();
 
  private:
   struct Impl;

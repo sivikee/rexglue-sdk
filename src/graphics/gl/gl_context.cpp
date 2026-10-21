@@ -10,6 +10,7 @@
 #include <EGL/eglext.h>
 #include <glad/glad.h>
 #include <switch.h>
+#include <xxhash.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -173,6 +174,7 @@ bool GlContext::Initialize() {
               caps_.max_texture_size, caps_.max_ssbo_block_size);
   eglSwapInterval(display, 1);
   GrowShaderCodeArea();
+  EnableProgramBinaries("GPU thread");
   return true;
 }
 
@@ -357,10 +359,95 @@ void* GlContext::CreateSharedContext() {
   return ctx;
 }
 bool GlContext::MakeCurrentWorker(void* shared_context) {
-  return eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE,
-                        static_cast<EGLContext>(shared_context)) == EGL_TRUE;
+  if (eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE,
+                     static_cast<EGLContext>(shared_context)) != EGL_TRUE) {
+    return false;
+  }
+  EnableProgramBinaries("compile thread");
+  return true;
 }
 void GlContext::ReleaseCurrentWorker() {
   eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+}
+}  // namespace rex::graphics::gl
+
+// GL_ARB_get_program_binary on devkitPro Mesa 20.1. The library is built without ENABLE_SHADER_CACHE, so the screen has
+// no disk cache and st_extensions.c leaves ctx->Const.NumProgramBinaryFormats at 0: glGetProgramBinary /
+// glProgramBinary are rejected, although the whole (de)serialisation path (_mesa_get_program_binary,
+// serialize_glsl_program, st_serialise_tgsi_program_binary, st_deserialise_tgsi_program) is linked in and never touches
+// the cache. The only other cache use is the driver SHA1 (st_get_program_binary_driver_sha1 ->
+// disk_cache_compute_key, an empty stub here: the SHA1 stays uninitialised stack data).
+// gl_program_binaries sets NumProgramBinaryFormats = 1 and replaces ctx->Driver.GetProgramBinaryDriverSHA1 by a
+// function returning a fingerprint of the Mesa version, so binaries from another Mesa build are rejected
+// by Mesa (is_program_binary_valid) and simply recompiled. Offsets from the disassembly of _mesa_GetProgramBinary
+// (ldr w1,[ctx+0x10000+4876]) and _mesa_get_program_binary (ldr x2,[ctx+0x10000+2504]; blr x2); verified at run time:
+// the function pointer must be st_get_program_binary_driver_sha1 and GL_NUM_PROGRAM_BINARY_FORMATS must go 0 -> 1.
+REXCVAR_DEFINE_BOOL(gl_program_binaries, true, "GPU",
+                    "GL backend: enable GL program binaries on the Switch Mesa (disabled there because the build has no "
+                    "disk cache), so compiled programs are saved (gl_program_binary_path) and loaded instead of compiled");
+
+extern "C" void st_get_program_binary_driver_sha1(void* ctx, uint8_t* sha1);
+extern "C" void* _glapi_get_context(void);
+
+namespace {
+constexpr size_t kCtxGetProgramBinaryDriverSha1 = 0x10000 + 2504;
+constexpr size_t kCtxNumProgramBinaryFormats = 0x10000 + 4876;
+uint8_t g_mesa_sha1[20];
+uint64_t g_mesa_fingerprint = 0;
+thread_local bool tl_program_binaries = false;
+void FixedDriverSha1(void* /*ctx*/, uint8_t* sha1) { std::memcpy(sha1, g_mesa_sha1, sizeof(g_mesa_sha1)); }
+}  // namespace
+
+namespace rex::graphics::gl {
+uint64_t MesaBinaryFingerprint() { return g_mesa_fingerprint; }
+bool ProgramBinariesOnThisThread() { return tl_program_binaries; }
+
+void GlContext::EnableProgramBinaries(const char* who) {
+  if (!REXCVAR_GET(gl_program_binaries)) return;
+  if (!g_mesa_fingerprint) {
+    // Stable across relinks of this executable (code bytes are not: adrp/bl immediates move with the layout). The GL
+    // strings name the Mesa version; the context offsets this patch relies on are checked above at run time, so a Mesa
+    // with another layout never gets here. Bump kBinaryFormatRevision to invalidate shipped binaries by hand.
+    constexpr uint64_t kBinaryFormatRevision = 1;
+    const std::string id = caps_.renderer + "|" + caps_.version + "|" + caps_.glsl_version + "|" +
+                           std::to_string(kCtxGetProgramBinaryDriverSha1) + "|" +
+                           std::to_string(kCtxNumProgramBinaryFormats);
+    uint64_t h = XXH3_64bits_withSeed(id.data(), id.size(), kBinaryFormatRevision);
+    g_mesa_fingerprint = h ? h : 1;
+    for (int i = 0; i < 20; ++i) g_mesa_sha1[i] = uint8_t(XXH3_64bits_withSeed(&i, sizeof(i), h));
+  }
+  char* ctx = static_cast<char*>(_glapi_get_context());
+  if (!ctx) {
+    REXGPU_WARN("GL program binaries ({}): no current context", who);
+    return;
+  }
+  auto* sha1_fn = reinterpret_cast<void**>(ctx + kCtxGetProgramBinaryDriverSha1);
+  auto* formats = reinterpret_cast<uint32_t*>(ctx + kCtxNumProgramBinaryFormats);
+  GLint before = -1;
+  glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &before);
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  if (*sha1_fn == reinterpret_cast<void*>(&FixedDriverSha1) && *formats == 1) {
+    tl_program_binaries = true;
+    return;  // already done for this context
+  }
+  if (*sha1_fn != reinterpret_cast<void*>(&st_get_program_binary_driver_sha1) || *formats != 0 || before != 0) {
+    REXGPU_WARN("GL program binaries ({}): NOT enabled (layout check failed: sha1 fn {} vs {}, formats {}, query {})",
+                who, *sha1_fn, reinterpret_cast<void*>(&st_get_program_binary_driver_sha1), *formats, before);
+    return;
+  }
+  *sha1_fn = reinterpret_cast<void*>(&FixedDriverSha1);
+  *formats = 1;
+  GLint after = -1;
+  glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &after);
+  if (after != 1) {
+    *formats = 0;
+    *sha1_fn = reinterpret_cast<void*>(&st_get_program_binary_driver_sha1);
+    REXGPU_WARN("GL program binaries ({}): NOT enabled (GL_NUM_PROGRAM_BINARY_FORMATS reads {} after the patch)", who,
+                after);
+    return;
+  }
+  tl_program_binaries = true;
+  REXGPU_INFO("GL program binaries ({}): enabled (Mesa fingerprint {:016X})", who, g_mesa_fingerprint);
 }
 }  // namespace rex::graphics::gl
