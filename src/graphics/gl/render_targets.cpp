@@ -185,6 +185,10 @@ GlRenderTargets::ColorTarget* GlRenderTargets::GetColorTarget(uint32_t base,
                                                               bool create) {
   width = std::min(std::max(width, 1u), kMaxRtDimension);
   height = std::min(std::max(height, 1u), kMaxRtDimension);
+  // The _AS_ formats are other blending views of the same EDRAM data: one texture, or what a pass draws through
+  // one view never reaches the other (Oblivion draws its blended particles and hair through
+  // 2_10_10_10_FLOAT_AS_16_16_16_16 into the 2_10_10_10_FLOAT scene that is resolved).
+  format = xenos::GetStorageColorFormat(format);
   auto key = std::make_pair(base, uint32_t(format));
   auto it = color_targets_.find(key);
   if (it == color_targets_.end()) {

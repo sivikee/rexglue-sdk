@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <switch.h>
 #include <rex/input/switch/switch_input_driver.h>
@@ -61,6 +62,9 @@ REXCVAR_DEFINE_INT32(gl_swap_interval, 1, "GPU", "GL backend: eglSwapInterval (1
 REXCVAR_DEFINE_BOOL(gl_draw, true, "GPU", "GL backend: execute draws (false = swaps/resolves only)");
 REXCVAR_DEFINE_BOOL(gl_flip_front_face, false, "GPU", "GL backend: invert the front face winding");
 REXCVAR_DEFINE_INT32(gl_log_draws, 0, "GPU", "GL backend: log the first N draws in detail");
+REXCVAR_DEFINE_INT32(gl_log_alpha_draws, 0, "GPU",
+                     "GL debug: log up to N distinct alpha-tested / alpha-to-mask / blended draw states (shaders, "
+                     "alpha test, blend, color mask, depth, RT0 format)");
 REXCVAR_DEFINE_INT32(gl_log_draws_from, 0, "GPU", "GL backend: also log 12 draws starting at this draw index (0 = off)");
 REXCVAR_DEFINE_INT32(gl_debug_raster, 0, "GPU", "GL debug bitmask: 1=no scissor 2=no cull 4=force colour write/no blend 8=no depth/stencil 16=viewport=full RT");
 REXCVAR_DEFINE_INT32(gl_max_viewport, 16384, "GPU", "GL backend: max viewport dimension used when computing the host viewport");
@@ -355,6 +359,7 @@ struct GlCommandProcessor::Impl {
   std::unique_ptr<GlTextureCache> texture_cache;
   GLuint draw_vao = 0;
   GLuint ubo_ring = 0;
+  GLuint index_stream = 0;  // guest DMA index buffers the store cannot give as one range
   static constexpr uint32_t kUboRingSize = 8u << 20;
   uint32_t ubo_ring_offset = 0;
   std::vector<float> floats_vs, floats_ps;
@@ -1108,6 +1113,26 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
 
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets()) : 0;
+  if (REXCVAR_GET(gl_log_alpha_draws) > 0) {
+    static std::unordered_set<uint64_t> seen;
+    auto cc = regs.Get<reg::RB_COLORCONTROL>();
+    auto blend0 = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+    auto ci0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    const bool interesting = cc.alpha_test_enable || cc.alpha_to_mask_enable || blend0.value != 0x00010001u;
+    const uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    const uint64_t key = vertex_shader->ucode_data_hash() * 31 ^ ps_hash * 17 ^ (uint64_t(cc.value) << 32) ^
+                         blend0.value ^ (uint64_t(normalized_color_mask) << 40);
+    if (interesting && seen.size() < size_t(REXCVAR_GET(gl_log_alpha_draws)) && seen.insert(key).second) {
+      REXGPU_INFO("GL alpha draw #{}: vs={:016X} ps={:016X} prim={} n={} colorctl={:08X} (test={} func={} a2m={} "
+                  "ref={:.3f}) blend0={:08X} cmask={:X} depth={:08X} rt0 fmt={} vs_memexport={} ps_writes={:X}",
+                  draw_count_, vertex_shader->ucode_data_hash(), ps_hash, uint32_t(prim_type), index_count, cc.value,
+                  uint32_t(cc.alpha_test_enable), uint32_t(cc.alpha_func), uint32_t(cc.alpha_to_mask_enable),
+                  regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF), blend0.value, normalized_color_mask,
+                  regs.Get<reg::RB_DEPTHCONTROL>().value, uint32_t(ci0.color_format),
+                  uint32_t(vertex_shader->memexport_eM_written()),
+                  pixel_shader ? uint32_t(pixel_shader->writes_color_targets()) : 0);
+    }
+  }
 
   // Viewport and render targets.
   draw_util::ViewportInfo viewport_info;
@@ -1256,7 +1281,15 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
                          (ppr.host_index_format == xenos::IndexFormat::kInt16 ? 2u : 4u);
         impl_->render_targets->MaterializeLazy(ppr.guest_index_base, bytes);
         if (!impl_->shared_memory->GetHostRange(ppr.guest_index_base, bytes, buffer, offset)) {
-          return fail("index_buffer_not_contiguous");
+          // The indices cross a 1 MiB granule boundary into a store granule that is not adjacent (Oblivion's
+          // dynamic particle geometry, e.g. torch flames): stream them from guest memory, which the store
+          // mirrors, instead of dropping the draw.
+          if (!impl_->index_stream) glGenBuffers(1, &impl_->index_stream);
+          glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, impl_->index_stream);
+          glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(bytes), memory_->TranslatePhysical(ppr.guest_index_base),
+                       GL_STREAM_DRAW);
+          buffer = impl_->index_stream;
+          offset = 0;
         }
         break;
       }
