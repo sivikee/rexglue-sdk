@@ -37,8 +37,11 @@ class SwitchInputDriver final : public InputDriver {
 
  private:
   struct ScriptEntry {
-    uint32_t start_swap;
-    uint32_t hold_swaps;
+    uint32_t start_swap;  // absolute swap, or swaps after the previous entry's observed release ("+N")
+    bool relative;
+    uint32_t hold_swaps;  // counted from the first guest poll that saw the press
+    uint32_t seen_swap;      // swap of the first poll that saw it pressed (UINT32_MAX = not yet)
+    uint32_t released_swap;  // swap of the first poll that saw it released (UINT32_MAX = not yet)
     uint16_t buttons;  // X_INPUT_GAMEPAD_* bits
     uint8_t lt, rt;
     int16_t lx, ly;

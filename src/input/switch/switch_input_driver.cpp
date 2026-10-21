@@ -32,7 +32,8 @@ REXCVAR_DEFINE_STRING(switch_button_layout, "xbox", "Input",
     .allowed({"xbox", "nintendo"});
 REXCVAR_DEFINE_STRING(switch_input_script, "", "Input",
                       "Debug: scripted button presses merged into the pad, \"swap:button:hold,...\" "
-                      "(swap = GPU swap number, hold = swaps), e.g. \"1700:start:30,2000:a:10\". "
+                      "(swap = GPU swap number, hold = swaps the guest has seen it pressed; \"+N:...\" = N swaps after "
+                      "the guest saw the previous press released), e.g. \"1700:start:30,+300:a:10\". "
                       "Buttons (Xbox names): a b x y start back lb rb lt rt up down left right "
                       "lthumb rthumb lsup lsdown lsleft lsright");
 
@@ -110,7 +111,9 @@ void SwitchInputDriver::ParseScript() {
     size_t c2 = c1 == std::string::npos ? c1 : item.find(':', c1 + 1);
     if (c2 == std::string::npos) continue;
     ScriptEntry e{};
-    e.start_swap = uint32_t(std::strtoul(item.c_str(), nullptr, 10));
+    e.relative = !item.empty() && item[0] == '+';
+    e.start_swap = uint32_t(std::strtoul(item.c_str() + (e.relative ? 1 : 0), nullptr, 10));
+    e.seen_swap = e.released_swap = UINT32_MAX;
     std::string name = item.substr(c1 + 1, c2 - c1 - 1);
     for (auto& ch : name) ch = char(std::tolower((unsigned char)ch));
     e.hold_swaps = uint32_t(std::strtoul(item.c_str() + c2 + 1, nullptr, 10));
@@ -212,9 +215,25 @@ void SwitchInputDriver::PollLocked(X_INPUT_GAMEPAD* out) {
   int lx = l.x, ly = l.y, rx = r.x, ry = r.y;  // libnx: -32767..32767, +y = up (same as XInput)
   uint8_t lt = (h & HidNpadButton_ZL) ? 255 : 0, rt = (h & HidNpadButton_ZR) ? 255 : 0;
 
+  // A press stays down until a guest poll has seen it for hold_swaps swaps (presses during a loading screen that
+  // does not poll are not lost); "+N" entries start N swaps after the previous entry's release was seen.
   uint32_t swaps = g_swap_counter.load(std::memory_order_relaxed);
-  for (auto& e : script_) {
-    if (swaps >= e.start_swap && swaps < e.start_swap + e.hold_swaps) {
+  for (size_t i = 0; i < script_.size(); ++i) {
+    ScriptEntry& e = script_[i];
+    if (e.released_swap != UINT32_MAX) continue;
+    uint32_t start = e.start_swap;
+    if (e.relative) {
+      const uint32_t prev = i ? script_[i - 1].released_swap : 0;
+      if (prev == UINT32_MAX) continue;
+      start += prev;
+    }
+    if (swaps < start) continue;
+    if (e.seen_swap == UINT32_MAX) e.seen_swap = swaps;
+    if (swaps >= e.seen_swap + e.hold_swaps) {
+      e.released_swap = swaps;
+      continue;
+    }
+    {
       b |= e.buttons;
       lt = std::max(lt, e.lt);
       rt = std::max(rt, e.rt);

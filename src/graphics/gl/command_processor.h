@@ -43,6 +43,9 @@ class GlCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // Bulk register writes (SET_CONSTANT / type-0 runs): plain registers are byte-swapped straight into the register
+  // file; ranges touching a register with a side effect go through CommandProcessor::WriteRegister.
+  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   void DrawFpsOverlay(int sw, int sh);
   void ShaderPrecompileScreen();
   void ValidateBufferByHash(uint32_t address, uint32_t size);

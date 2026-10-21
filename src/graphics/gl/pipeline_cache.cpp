@@ -79,6 +79,8 @@ REXCVAR_DEFINE_INT32(gl_debug_ps, 0, "GPU",
                      "GL backend debug: 1 = pixel shaders output magenta, 2 = output interpolator 0, 3 = output yellow if system constants flags look sane");
 
 extern "C" char* fake_heap_end;  // libnx: end of the newlib malloc region
+extern "C" void oblivion_thread_started(uint32_t handle) __attribute__((weak));  // app host profiler
+extern "C" void oblivion_thread_named(uint32_t handle, const char* name) __attribute__((weak));
 
 namespace rex::graphics::gl {
 
@@ -683,6 +685,11 @@ void GlPipelineCache::CheckWorkerWatchdog() {
 
 void GlPipelineCache::WorkerThunk(void* worker) {
   Worker* w = static_cast<Worker*>(worker);
+  if (oblivion_thread_started) {
+    const uint32_t h = threadGetCurHandle();
+    oblivion_thread_started(h);
+    if (oblivion_thread_named) oblivion_thread_named(h, w->index ? "GL compile 2" : "GL compile 1");
+  }
   w->self->WorkerMain(*w);
 }
 

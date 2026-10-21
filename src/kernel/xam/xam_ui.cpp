@@ -24,7 +24,7 @@
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
 REXCVAR_DEFINE_STRING(headless_keyboard_text, "", "Kernel",
-                      "Debug: with headless, XamShowKeyboardUI returns this text instead of the default text");
+                      "Debug: XamShowKeyboardUI returns this text at once (no keyboard UI), also without headless");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -441,7 +441,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
 
   X_RESULT result;
 #if REX_PLATFORM_SWITCH
-  if (!REXCVAR_GET(headless)) {
+  if (!REXCVAR_GET(headless) && REXCVAR_GET(headless_keyboard_text).empty()) {
     // Switch: no ImGui window; show the system software keyboard applet instead. swkbdShow blocks until the player
     // is done, so it runs in the deferred completion like the headless path (XN_SYS_UI is broadcast around it).
     auto guest_utf8 = [](const mapped_wstring& s) {
@@ -484,7 +484,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
   }
 #endif
-  if (REXCVAR_GET(headless)) {
+  if (REXCVAR_GET(headless) || !REXCVAR_GET(headless_keyboard_text).empty()) {
     const std::string forced = REXCVAR_GET(headless_keyboard_text);
     auto run = [default_text, buffer, buffer_length, buffer_size, forced]() -> X_RESULT {
       // Redirect default_text back into the buffer.

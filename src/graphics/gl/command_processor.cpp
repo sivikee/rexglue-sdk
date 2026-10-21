@@ -1279,6 +1279,27 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   return true;
 }
 
+void GlCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) {
+  // The registers CommandProcessor::WriteRegister does more than store (scratch write-back, COHER status, gamma
+  // ramp), and nothing in this backend overrides WriteRegister. Constant uploads (hundreds of dwords per draw) were
+  // ~6% of the GPU thread one virtual call + register-info lookup at a time.
+  const uint32_t end = start_index + num_registers;
+  auto overlaps = [&](uint32_t first, uint32_t last) { return start_index <= last && first < end; };
+  if (end > RegisterFile::kRegisterCount || overlaps(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7) ||
+      overlaps(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST) ||
+      overlaps(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_RW_INDEX) ||
+      overlaps(XE_GPU_REG_DC_LUT_SEQ_COLOR, XE_GPU_REG_DC_LUT_SEQ_COLOR) ||
+      overlaps(XE_GPU_REG_DC_LUT_PWL_DATA, XE_GPU_REG_DC_LUT_PWL_DATA) ||
+      overlaps(XE_GPU_REG_DC_LUT_30_COLOR, XE_GPU_REG_DC_LUT_30_COLOR)) {
+    CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+    return;
+  }
+  uint32_t* dst = register_file_->values + start_index;
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    dst[i] = memory::load_and_swap<uint32_t>(base + i);
+  }
+}
+
 bool GlCommandProcessor::IssueCopy() {
   perf::Tick();
   perf::Activity copy_activity(perf::kPhCopy);

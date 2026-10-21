@@ -44,6 +44,11 @@ std::filesystem::path GetUserFolder();
 // attempting to create it.
 bool CreateParentFolder(const std::filesystem::path& path);
 
+// std::filesystem::create_directories. On Switch it creates each component with mkdir() instead:
+// libstdc++'s version stats every missing ancestor, which fsdev (and Eden) can fail with EIO/crash.
+// Returns true when the directory exists afterwards there; elsewhere the std return value.
+bool CreateDirectories(const std::filesystem::path& path);
+
 // Creates an empty file at the given path, overwriting if it exists.
 bool CreateEmptyFile(const std::filesystem::path& path);
 

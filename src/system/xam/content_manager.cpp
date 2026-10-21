@@ -203,7 +203,7 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   auto parent_path = header_path.parent_path();
 
   if (!std::filesystem::exists(parent_path)) {
-    if (!std::filesystem::create_directories(parent_path)) {
+    if (!rex::filesystem::CreateDirectories(parent_path)) {
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -268,7 +268,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
   if (std::filesystem::exists(package_path)) {
     return X_ERROR_ALREADY_EXISTS;
   }
-  if (!std::filesystem::create_directories(package_path)) {
+  if (!rex::filesystem::CreateDirectories(package_path)) {
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -352,7 +352,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
                                              std::vector<uint8_t> buffer) {
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
-  std::filesystem::create_directories(package_path);
+  rex::filesystem::CreateDirectories(package_path);
   if (std::filesystem::exists(package_path)) {
     auto thumb_path = package_path / kThumbnailFileName;
     auto file = rex::filesystem::OpenFile(thumb_path, "wb");
