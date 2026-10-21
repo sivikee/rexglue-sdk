@@ -184,6 +184,8 @@ class GlRenderTargets {
   // invalidated so they are re-read from guest memory.
   void ConvertLazyToCpu(PendingResolve& pr, const char* why);
   void MaterializeLazySlow(uint32_t start, uint32_t length);
+  // Removes superseded records (nothing to write, no snapshot) anywhere in the queue.
+  void CompactSuperseded();
   void ResidentAdd(uint32_t start, uint32_t length);
   void ResidentRemove(uint32_t start, uint32_t length);
   GLuint GetFramebuffer(const FbKey& key);

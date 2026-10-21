@@ -520,9 +520,11 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
         if (sync) {
           FlushAll(FlushReason::kSync);
         } else {
-          // In-game ~14 resolves per frame (4 shadow maps, HDR chain, reflections): 24 forced a CPU write-back of
-          // a still-needed resolve every other frame; most are superseded by the next frame's resolves.
-          while (pending_.size() > 64) {
+          // In-game ~14 resolves per frame (4 shadow maps, HDR chain, reflections), most superseded by the next
+          // frame's; lazy ones stay up to gl_lazy_max_age swaps (one 256x256 per character in view: 64 forced a
+          // synchronous ~30 ms readback per resolve in crowded scenes). The cap is only a safety net.
+          if (pending_.size() > 256) CompactSuperseded();
+          while (pending_.size() > 512) {
             static uint32_t cap_logs = 0;
             const PendingResolve& f = pending_.front();
             if (!f.done && cap_logs < 16) {
@@ -1438,26 +1440,24 @@ void GlRenderTargets::FlushAll(FlushReason reason) {
   while (!pending_.empty()) FlushFront(true, reason);
 }
 
-void GlRenderTargets::PollPending() {
-  const int64_t max_age = std::max(0, REXCVAR_GET(gl_resolve_max_age));
-  const int64_t lazy_age = std::max<int64_t>(max_age, REXCVAR_GET(gl_lazy_max_age));
-  // Kept lazy records at the head do not hold up the queue: superseded records behind them go away. (A lazy
-  // record never has a newer overlapping one: GpuResolve supersedes or materializes it, a CPU resolve flushes it.)
+void GlRenderTargets::CompactSuperseded() {
+  // Superseded records need no write-back, so their position does not matter.
   for (size_t i = 0; i < pending_.size();) {
     PendingResolve& pr = pending_[i];
-    const int64_t age = int64_t(frame_) - int64_t(pr.frame);
-    if (pr.gpu && pr.lazy && !pr.done && !pr.dl_started && age < lazy_age) {
-      ++i;
-      continue;
-    }
-    if (i == 0) break;
-    if (pr.gpu && pr.done && !pr.snapshot && age >= 1) {
+    if (pr.gpu && pr.done && !pr.snapshot && !pr.dl_started && pr.frame < frame_) {
       ReleasePending(pr);
       pending_.erase(pending_.begin() + ptrdiff_t(i));
       continue;
     }
-    break;
+    ++i;
   }
+}
+
+void GlRenderTargets::PollPending() {
+  const int64_t max_age = std::max(0, REXCVAR_GET(gl_resolve_max_age));
+  const int64_t lazy_age = std::max<int64_t>(max_age, REXCVAR_GET(gl_lazy_max_age));
+  // Kept lazy records at the head do not hold up the queue: superseded records anywhere go away.
+  CompactSuperseded();
   while (!pending_.empty()) {
     PendingResolve& pr = pending_.front();
     int64_t age = int64_t(frame_) - int64_t(pr.frame);
