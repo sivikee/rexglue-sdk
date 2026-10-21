@@ -25,6 +25,10 @@ REXCVAR_DEFINE_BOOL(gl_front_writeback, false, "GPU",
                     "GL backend: write front buffer resolves that a swap showed from their GPU snapshot back to guest "
                     "memory when they age out (a CPU readback per frame; only needed if the game reads its front "
                     "buffer on the CPU)");
+REXCVAR_DEFINE_INT32(gl_lazy_max_age, 30, "GPU",
+                     "GL backend: swaps a lazy resolve (data only in its GPU snapshot) is kept before it is written to "
+                     "guest memory, unless a newer resolve supersedes it first (Oblivion re-renders a shadow map slot "
+                     "less often than every 3 frames: with gl_resolve_max_age it was read back every frame)");
 REXCVAR_DEFINE_INT32(gl_gpu_resolve_debug, 0, "GPU",
                      "GL debug: GPU resolve compute shader variants (1 = empty main, 2 = no store, 3 = no source fetch)");
 
@@ -1436,6 +1440,24 @@ void GlRenderTargets::FlushAll(FlushReason reason) {
 
 void GlRenderTargets::PollPending() {
   const int64_t max_age = std::max(0, REXCVAR_GET(gl_resolve_max_age));
+  const int64_t lazy_age = std::max<int64_t>(max_age, REXCVAR_GET(gl_lazy_max_age));
+  // Kept lazy records at the head do not hold up the queue: superseded records behind them go away. (A lazy
+  // record never has a newer overlapping one: GpuResolve supersedes or materializes it, a CPU resolve flushes it.)
+  for (size_t i = 0; i < pending_.size();) {
+    PendingResolve& pr = pending_[i];
+    const int64_t age = int64_t(frame_) - int64_t(pr.frame);
+    if (pr.gpu && pr.lazy && !pr.done && !pr.dl_started && age < lazy_age) {
+      ++i;
+      continue;
+    }
+    if (i == 0) break;
+    if (pr.gpu && pr.done && !pr.snapshot && age >= 1) {
+      ReleasePending(pr);
+      pending_.erase(pending_.begin() + ptrdiff_t(i));
+      continue;
+    }
+    break;
+  }
   while (!pending_.empty()) {
     PendingResolve& pr = pending_.front();
     int64_t age = int64_t(frame_) - int64_t(pr.frame);
@@ -1449,7 +1471,7 @@ void GlRenderTargets::PollPending() {
         break;
       }
       if (!pr.dl_started) {
-        if (age < max_age) break;
+        if (age < (pr.lazy ? lazy_age : max_age)) break;
         // Shown already and not by this swap (a buffer presented again, e.g. while paused, is still written back
         // so later presents of it from guest memory are right); guest memory keeps its older contents.
         if (pr.lazy && pr.presented_frame != UINT64_MAX && pr.presented_frame != frame_ &&
