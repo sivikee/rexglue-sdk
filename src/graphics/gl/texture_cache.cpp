@@ -275,7 +275,13 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
       snap_kind = 2;
     } else if (bf == xenos::TextureFormat::k_2_10_10_10) {
       snap_kind = 3;
+    } else if (bf == xenos::TextureFormat::k_32_FLOAT) {
+      snap_kind = 4;
     }
+    // Host swizzle of a snapshot: as an uploaded texture of this format would have it (R32F -> RRRR).
+    HostFormat snap_hf;
+    const uint32_t snap_swizzle =
+        snap_kind == 4 && GetHostFormat(bf, snap_hf) ? snap_hf.swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
     if (snap_kind) {
       GLuint snap = 0;
       bool swap_rb = false;
@@ -283,7 +289,7 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
                                         uint32_t(info.endianness), snap_kind, snap, swap_rb)) {
         snapshot_tex_.id = snap;
         snapshot_tex_.target = GL_TEXTURE_2D_ARRAY;
-        snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+        snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : snap_swizzle;
         snapshot_tex_.valid = true;
         perf::Add(perf::kResolveGpuHits);
         return &snapshot_tex_;
@@ -317,7 +323,7 @@ GlTextureCache::Texture* GlTextureCache::GetTexture(const xenos::xe_gpu_texture_
         s.last_used_frame = frame_;
         snapshot_tex_.id = s.texture;
         snapshot_tex_.target = GL_TEXTURE_2D_ARRAY;
-        snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+        snapshot_tex_.host_swizzle = swap_rb ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A) : snap_swizzle;
         snapshot_tex_.valid = true;
         perf::Add(perf::kResolveGpuHits);
         return &snapshot_tex_;

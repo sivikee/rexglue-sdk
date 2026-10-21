@@ -1699,6 +1699,7 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
         fmt_8888 && impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), 1, snap_tex,
                                                         snap_swap_rb)) {
       use_snap = true;
+      impl_->render_targets->MarkPresented(base);
       perf::Add(perf::kResolveFrontHits);
     }
     if (!use_snap && !cpu_forced && REXCVAR_GET(gl_gpu_front) && impl_->blit_store_program && fetch.tiled &&
@@ -1718,6 +1719,7 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
         impl_->render_targets->FindSnapshot(base, w, h, pitch, uint32_t(fetch.endianness), 1, snap_tex,
                                             snap_swap_rb)) {
       use_snap = true;
+      impl_->render_targets->MarkPresented(base);
       perf::Add(perf::kResolveFrontHits);
     }
     if (!use_store && !use_snap) {

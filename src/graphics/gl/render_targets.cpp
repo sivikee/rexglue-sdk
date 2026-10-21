@@ -21,6 +21,10 @@ REXCVAR_DEFINE_BOOL(gl_gpu_resolve_compute, false, "GPU",
                     "GL backend: let GPU resolves write the shared memory store with a compute shader. false = resolves "
                     "stay GPU snapshots (lazy) and are read back + converted on the CPU only when memory needs them. "
                     "The compute dispatch crashed Eden's GPU emulation and was never exercised on hardware");
+REXCVAR_DEFINE_BOOL(gl_front_writeback, false, "GPU",
+                    "GL backend: write front buffer resolves that a swap showed from their GPU snapshot back to guest "
+                    "memory when they age out (a CPU readback per frame; only needed if the game reads its front "
+                    "buffer on the CPU)");
 REXCVAR_DEFINE_INT32(gl_gpu_resolve_debug, 0, "GPU",
                      "GL debug: GPU resolve compute shader variants (1 = empty main, 2 = no store, 3 = no source fetch)");
 
@@ -411,9 +415,13 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
                                 dest_format == xenos::TextureFormat::k_16_16_16_16_FLOAT;
           const bool r10_dest = rt->internal_format == GL_RGB10_A2 && bpp == 4 && !swap_rb &&
                                 dest_format == xenos::TextureFormat::k_2_10_10_10;
+          // Shadow maps: R32F colour targets resolved as k_32_FLOAT (4 x 1024x1024 per frame in-game; without a
+          // snapshot each one was read back, converted on the CPU and re-uploaded: ~2.5 fps in the prison cell).
+          const bool r32f_dest = rt->internal_format == GL_R32F && bpp == 4 && !swap_rb &&
+                                 dest_format == xenos::TextureFormat::k_32_FLOAT;
           if (!sync && ox == 0 && oy == 0 && REXCVAR_GET(gl_resolve_gpu_copy) &&
-              uint64_t(rw) * rh <= (1u << 21) && (rgba8_dest || f16_dest || r10_dest)) {
-            pr.snap_kind = rgba8_dest ? 1 : f16_dest ? 2 : 3;
+              uint64_t(rw) * rh <= (1u << 21) && (rgba8_dest || f16_dest || r10_dest || r32f_dest)) {
+            pr.snap_kind = rgba8_dest ? 1 : f16_dest ? 2 : r10_dest ? 3 : 4;
             pr.snapshot_format = rt->internal_format;
           }
         }
@@ -508,7 +516,19 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
         if (sync) {
           FlushAll(FlushReason::kSync);
         } else {
-          while (pending_.size() > 24) FlushFront(true, FlushReason::kCap);
+          // In-game ~14 resolves per frame (4 shadow maps, HDR chain, reflections): 24 forced a CPU write-back of
+          // a still-needed resolve every other frame; most are superseded by the next frame's resolves.
+          while (pending_.size() > 64) {
+            static uint32_t cap_logs = 0;
+            const PendingResolve& f = pending_.front();
+            if (!f.done && cap_logs < 16) {
+              ++cap_logs;
+              REXGPU_INFO("GL RT: pending cap flush of resolve 0x{:08X} {}x{} fmt={} snap_kind={} lazy={} age {} frames",
+                          f.dest_base, f.rw, f.rh, uint32_t(f.dest_format), f.snap_kind, f.lazy,
+                          int64_t(frame_) - int64_t(f.frame));
+            }
+            FlushFront(true, FlushReason::kCap);
+          }
         }
         extent_start_out = ri.copy_dest_extent_start;
         extent_length_out = ri.copy_dest_extent_length;
@@ -642,6 +662,26 @@ void GlRenderTargets::ConvertPending(PendingResolve& pr, const void* pixels) {
         uint32_t v;
         std::memcpy(&v, row + size_t(i) * 4, 4);
         if (swap_rb) v = (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
+        switch (endian) {
+          case xenos::Endian128::k8in16: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+          case xenos::Endian128::k8in32: v = __builtin_bswap32(v); break;
+          case xenos::Endian128::k16in32: v = (v << 16) | (v >> 16); break;
+          default: break;
+        }
+        std::memcpy(dest_base + TiledOffset2D(ox + i, oy + j, pitch_aligned, 2), &v, 4);
+      }
+    }
+    return;
+  }
+  if (!src_is_8888 && bpp == 4 && dest_format == xenos::TextureFormat::k_32_FLOAT &&
+      uint32_t(endian) <= uint32_t(xenos::Endian128::k16in32)) {
+    // Fast path (shadow maps): red channel of the RGBA float readback, endian swap, inline tiling.
+    const uint32_t pitch_aligned = (dest_pitch + 31) & ~31u;
+    for (uint32_t j = 0; j < rh; ++j) {
+      const float* row = pxf + size_t(j) * rw * 4;
+      for (uint32_t i = 0; i < rw; ++i) {
+        uint32_t v;
+        std::memcpy(&v, row + size_t(i) * 4, 4);
         switch (endian) {
           case xenos::Endian128::k8in16: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
           case xenos::Endian128::k8in32: v = __builtin_bswap32(v); break;
@@ -1014,7 +1054,7 @@ bool GlRenderTargets::GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x
       ReleaseSnapshot(o);
       perf::Add(perf::kResolveSuperseded);
     } else if (o.lazy && uint64_t(o.extent_start) < ne && uint64_t(o.extent_start) + o.extent_length > ns) {
-      Materialize(o);
+      Materialize(o, "partial overlap");
     }
   }
   if (!lazy) {
@@ -1080,10 +1120,17 @@ void GlRenderTargets::GpuResolveDispatch(PendingResolve& pr, GLuint texture, boo
   }
 }
 
-void GlRenderTargets::Materialize(PendingResolve& pr) {
+namespace {
+const char* FlushReasonName(GlRenderTargets::FlushReason r) {
+  static const char* const names[] = {"tex", "sm", "front", "age", "cap", "sync", "other"};
+  return names[int(r)];
+}
+}  // namespace
+
+void GlRenderTargets::Materialize(PendingResolve& pr, const char* why) {
   if (!pr.lazy) return;
   if (!REXCVAR_GET(gl_gpu_resolve_compute)) {
-    ConvertLazyToCpu(pr);
+    ConvertLazyToCpu(pr, why);
     return;
   }
   pr.lazy = false;
@@ -1102,13 +1149,19 @@ void GlRenderTargets::MaterializeLazySlow(uint32_t start, uint32_t length) {
   // Oldest first: the store must see the writes in resolve order.
   for (PendingResolve& pr : pending_) {
     if (pr.lazy && !pr.done && uint64_t(pr.extent_start) < e && uint64_t(pr.extent_start) + pr.extent_length > s) {
-      Materialize(pr);
+      Materialize(pr, "store read");
     }
   }
 }
 
-void GlRenderTargets::ConvertLazyToCpu(PendingResolve& pr) {
+void GlRenderTargets::ConvertLazyToCpu(PendingResolve& pr, const char* why) {
   if (!pr.lazy) return;
+  static uint32_t logged = 0;
+  if (++logged <= 32 || logged % 256 == 0) {
+    REXGPU_INFO("GL RT: lazy resolve read back #{} ({}): 0x{:08X} {}x{} fmt={} snap_kind={} age={} presented={}",
+                logged, why, pr.dest_base, pr.rw, pr.rh, uint32_t(pr.dest_format), pr.snap_kind,
+                int64_t(frame_) - int64_t(pr.frame), pr.presented_frame != UINT64_MAX);
+  }
   pr.lazy = false;
   --lazy_count_;
   perf::Add(perf::kLazyMaterialized);
@@ -1156,7 +1209,7 @@ void GlRenderTargets::ConvertLazyToCpu(PendingResolve& pr) {
 
 void GlRenderTargets::StartGpuDownload(PendingResolve& pr) {
   if (pr.lazy && !REXCVAR_GET(gl_gpu_resolve_compute)) {
-    ConvertLazyToCpu(pr);  // the caller sees pr.gpu == false and handles it as a CPU-path record
+    ConvertLazyToCpu(pr, "age-out");  // the caller sees pr.gpu == false and handles it as a CPU-path record
     return;
   }
   if (pr.lazy) {
@@ -1357,7 +1410,7 @@ void GlRenderTargets::FlushPending(uint32_t start, uint32_t length, FlushReason 
   };
   if (!REXCVAR_GET(gl_gpu_resolve_compute)) {
     for (PendingResolve& pr : pending_) {
-      if (pr.gpu && pr.lazy && !pr.done && overlaps(pr)) ConvertLazyToCpu(pr);
+      if (pr.gpu && pr.lazy && !pr.done && overlaps(pr)) ConvertLazyToCpu(pr, FlushReasonName(reason));
     }
   }
   // CPU-path resolves are written back strictly in order (up to the last overlapping one).
@@ -1397,6 +1450,18 @@ void GlRenderTargets::PollPending() {
       }
       if (!pr.dl_started) {
         if (age < max_age) break;
+        // Shown already and not by this swap (a buffer presented again, e.g. while paused, is still written back
+        // so later presents of it from guest memory are right); guest memory keeps its older contents.
+        if (pr.lazy && pr.presented_frame != UINT64_MAX && pr.presented_frame != frame_ &&
+            !REXCVAR_GET(gl_front_writeback)) {
+          pr.lazy = false;
+          --lazy_count_;
+          ResidentRemove(pr.extent_start, pr.extent_length);
+          ReleaseSnapshot(pr);
+          pr.done = true;
+          perf::Add(perf::kFrontDropped);
+          continue;
+        }
         StartGpuDownload(pr);
         if (pr.done || !pr.gpu) continue;  // (!gpu: converted to a CPU readback, handled as such next)
       }
@@ -1417,6 +1482,15 @@ void GlRenderTargets::PollPending() {
       if (pending_.size() == before) break;
     } else {
       break;
+    }
+  }
+}
+
+void GlRenderTargets::MarkPresented(uint32_t base) {
+  for (size_t i = pending_.size(); i-- > 0;) {
+    if (pending_[i].snapshot && pending_[i].dest_base == base) {
+      pending_[i].presented_frame = frame_;
+      return;
     }
   }
 }

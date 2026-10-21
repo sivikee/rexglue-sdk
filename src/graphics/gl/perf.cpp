@@ -330,11 +330,12 @@ void Report(uint64_t now, bool swapless) {
                 c[kSmUploadBytes] / 1048576.0, Ms(c[kSmUploadTicks]), Ms(c[kFinishTicks]));
   std::snprintf(l3, sizeof l3, "perf: sm copy %.0f ms resolve convert %.0f ms gpu-copy hits tex=%llu front=%llu", Ms(c[kSmCopyTicks]), Ms(c[kResolveConvTicks]), (unsigned long long)c[kResolveGpuHits], (unsigned long long)c[kResolveFrontHits]);
   std::snprintf(l4, sizeof l4,
-                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu deferred=%llu materialized=%llu | front snap=%llu store=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
+                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu deferred=%llu materialized=%llu front dropped=%llu | front snap=%llu store=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
                 "flushes: tex=%llu sm=%llu front=%llu age=%llu cap=%llu sync=%llu other=%llu",
                 (unsigned long long)c[kGpuResolves], Ms(c[kGpuResolveTicks]), (unsigned long long)c[kCpuResolves],
                 (unsigned long long)c[kResolveSuperseded], (unsigned long long)c[kLazyDeferred],
-                (unsigned long long)c[kLazyMaterialized], (unsigned long long)c[kResolveFrontHits],
+                (unsigned long long)c[kLazyMaterialized], (unsigned long long)c[kFrontDropped],
+                (unsigned long long)c[kResolveFrontHits],
                 (unsigned long long)c[kGpuFrontBlits],
                 (unsigned long long)c[kCpuFrontFrames], (unsigned long long)c[kLazyDownloads],
                 c[kLazyDownloadBytes] / 1048576.0, Ms(c[kLazyDownloadTicks]), (unsigned long long)c[kFlushTex],

@@ -93,6 +93,10 @@ class GlRenderTargets {
   // pixels, pitch in pixels, endian). Returns a GL_TEXTURE_2D_ARRAY (1 layer, RGBA8) snapshot of the
   // render target as it was at the resolve. swap_rb: guest byte0 is the snapshot blue channel.
   // snap_kind: 1 = RGBA8, 2 = RGBA16F, 3 = RGB10A2 (see PendingResolve::snap_kind).
+  // The swap showed the newest resolve at `base` from its snapshot. With gl_front_writeback = false such a lazy
+  // front buffer resolve is dropped when it ages out instead of being read back into guest memory (~40 ms per
+  // frame on Mesa nouveau: the two 1024x600 front buffers alternate and age out before being superseded).
+  void MarkPresented(uint32_t base);
   bool FindSnapshot(uint32_t base, uint32_t width, uint32_t height, uint32_t pitch, uint32_t endian,
                     uint32_t snap_kind, GLuint& texture_out, bool& swap_rb_out) const;
   // Like FindSnapshot, but the newest resolve at `base` may be LARGER than the texture (resolve rectangles are
@@ -131,12 +135,13 @@ class GlRenderTargets {
     GLuint snapshot = 0;
     uint32_t snapshot_w = 0, snapshot_h = 0;
     GLenum snapshot_format = 0;
-    uint32_t snap_kind = 0;  // 0 none, 1 RGBA8, 2 RGBA16F, 3 RGB10A2
+    uint32_t snap_kind = 0;  // 0 none, 1 RGBA8, 2 RGBA16F, 3 RGB10A2, 4 R32F
     bool gpu = false;        // data was resolved into the shared memory store by the compute shader
     bool done = false;       // nothing left to write back (superseded by a newer resolve)
     bool dl_started = false; // gpu: store -> PBO copy issued, fence pending
     int gpu_kind = -1;       // gpu: dest layout (see kGpuKind*)
     bool lazy = false;       // gpu: compute write into the store deferred (data only in the snapshot)
+    uint64_t presented_frame = UINT64_MAX;  // last swap that showed it straight from its snapshot (MarkPresented)
     uint64_t serial = 0;     // resolve number (snapshot contents identity for consumers' derived copies)
   };
   struct Snapshot {
@@ -173,11 +178,11 @@ class GlRenderTargets {
   bool GpuResolve(ColorTarget& rt, PendingResolve& pr, uint32_t x0, uint32_t y0);
   // Runs the resolve compute shader for pr, reading texture (2D render target at x0,y0 or the 2D array snapshot).
   void GpuResolveDispatch(PendingResolve& pr, GLuint texture, bool from_snapshot, uint32_t x0, uint32_t y0);
-  void Materialize(PendingResolve& pr);
+  void Materialize(PendingResolve& pr, const char* why);
   // gl_gpu_resolve_compute = false: a lazy GPU-snapshot resolve that must reach memory becomes a CPU-path record
   // (asynchronous glReadPixels of its snapshot into a PBO, CPU conversion when flushed); its store pages are
   // invalidated so they are re-read from guest memory.
-  void ConvertLazyToCpu(PendingResolve& pr);
+  void ConvertLazyToCpu(PendingResolve& pr, const char* why);
   void MaterializeLazySlow(uint32_t start, uint32_t length);
   void ResidentAdd(uint32_t start, uint32_t length);
   void ResidentRemove(uint32_t start, uint32_t length);
