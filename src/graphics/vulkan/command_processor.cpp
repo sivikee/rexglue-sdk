@@ -2280,6 +2280,12 @@ static uint64_t g_perf_draws = 0;
 static uint64_t g_perf_fence_syncs = 0;
 static uint64_t g_perf_rptr_syncs = 0;
 static uint64_t g_perf_swaps = 0;
+// OBLIVION_PERF_STATS: milliseconds spent blocked in the command processor thread.
+static double g_perf_queue_wait_ms = 0, g_perf_submit_ms = 0, g_perf_frame_await_ms = 0,
+              g_perf_swap_ms = 0;
+static double PerfMsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
 
 void VulkanCommandProcessor::OnGammaRamp256EntryTableValueWritten() {
   gamma_ramp_256_entry_table_current_frame_ = UINT32_MAX;
@@ -2292,6 +2298,10 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  struct PerfSwapScope {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~PerfSwapScope() { g_perf_swap_ms += PerfMsSince(t0); }
+  } perf_swap_scope;
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -5281,7 +5291,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
+  auto perf_await_t0 = std::chrono::steady_clock::now();
   CheckSubmissionFenceAndDeviceLoss(await_submission);
+  g_perf_frame_await_ms += PerfMsSince(perf_await_t0);
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
   }
@@ -5589,10 +5601,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     VkResult submit_result;
     {
+      auto perf_queue_t0 = std::chrono::steady_clock::now();
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      g_perf_queue_wait_ms += PerfMsSince(perf_queue_t0);
       rex::ui::WaitWhileAppInBackground();
+      auto perf_submit_t0 = std::chrono::steady_clock::now();
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+      g_perf_submit_ms += PerfMsSince(perf_submit_t0);
       if (submit_result == VK_SUCCESS && std::getenv("OBLIVION_SYNC_GPU")) {
         auto t0 = std::chrono::steady_clock::now();
         VkResult wr = dfn.vkWaitForFences(device, 1, &fence, VK_TRUE, 20000000000ull);
@@ -5617,11 +5633,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         double s = std::chrono::duration<double>(now - perf_time_last).count();
         REXGPU_WARN(
             "PERF 120 submissions in {:.2f} s: draws {} dispatches {} (groups {}) copies {} "
-            "({:.1f} MB) buf2img {} fences {} pending {} swaps {}",
+            "({:.1f} MB) buf2img {} fences {} pending {} swaps {} | blocked ms: queue {:.0f} "
+            "submit {:.0f} frame-await {:.0f} swap {:.0f}",
             s, g_perf_draws - perf_draws_last, g_perf_dispatches, g_perf_dispatch_groups,
             g_perf_copies, g_perf_copy_bytes / 1048576.0, g_perf_buf2img, g_perf_fence_syncs,
-            deferred_guest_gpu_progress_writes_.size(), g_perf_swaps);
+            deferred_guest_gpu_progress_writes_.size(), g_perf_swaps, g_perf_queue_wait_ms,
+            g_perf_submit_ms, g_perf_frame_await_ms, g_perf_swap_ms);
         g_perf_fence_syncs = g_perf_rptr_syncs = g_perf_swaps = 0;
+        g_perf_queue_wait_ms = g_perf_submit_ms = g_perf_frame_await_ms = g_perf_swap_ms = 0;
         perf_time_last = now;
         perf_draws_last = g_perf_draws;
         g_perf_dispatches = g_perf_dispatch_groups = g_perf_copies = g_perf_copy_bytes =
