@@ -411,13 +411,11 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
-      }
+      // Sleep for the sub-millisecond remainder too: truncating it to whole milliseconds made
+      // this sleep_for(0) for the whole of a 1 ms slice (the alertable wait's poll period), so
+      // every alertable WaitAny on several handles spun a core (the audio worker always did).
+      std::this_thread::sleep_for(
+          std::min<std::chrono::steady_clock::duration>(end_time - now, std::chrono::milliseconds(1)));
     }
   }
 
