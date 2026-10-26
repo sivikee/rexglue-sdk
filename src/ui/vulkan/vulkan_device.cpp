@@ -201,6 +201,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+#if REX_PLATFORM_MAC
+    // #312.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_metal_objects)
+#endif
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;

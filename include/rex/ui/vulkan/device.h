@@ -201,6 +201,8 @@ class VulkanDevice {
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
     // Importing host memory (the guest memory on unified memory systems).
     bool ext_EXT_external_memory_host = false;  // #179
+    // Exporting Metal objects (MoltenVK), to take CAMetalDrawables outside the queue lock.
+    bool ext_EXT_metal_objects = false;  // #312
   };
 
   const Extensions& extensions() const { return extensions_; }

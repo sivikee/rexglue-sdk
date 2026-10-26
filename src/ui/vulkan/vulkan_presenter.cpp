@@ -1595,6 +1595,29 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       return PaintResult::kNotPresented;
   }
 
+#if REX_PLATFORM_MAC
+  // MoltenVK takes the CAMetalDrawable from the layer lazily, the first time the swapchain image's
+  // texture is needed - in the submission or the present below, both made with the queue locked.
+  // nextDrawable blocks until the display returns a drawable (up to a refresh interval), and the
+  // command processor's submissions waited for the queue all that time. Take the drawable here,
+  // outside the queue lock, by exporting the image's Metal texture.
+  if (vulkan_device_->extensions().ext_EXT_metal_objects) {
+    auto export_metal_objects = PFN_vkExportMetalObjectsEXT(
+        vulkan_device_->vulkan_instance()->functions().vkGetDeviceProcAddr(
+            device, "vkExportMetalObjectsEXT"));
+    if (export_metal_objects) {
+      VkExportMetalTextureInfoEXT export_texture_info = {};
+      export_texture_info.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT;
+      export_texture_info.image = paint_context_.swapchain_images[swapchain_image_index];
+      export_texture_info.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+      VkExportMetalObjectsInfoEXT export_info = {};
+      export_info.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
+      export_info.pNext = &export_texture_info;
+      export_metal_objects(device, &export_info);
+    }
+  }
+#endif
+
   // Non-zero extents needed for both the viewport (width must not be zero) and
   // the guest output rectangle.
   assert_not_zero(paint_context_.swapchain_extent.width);
