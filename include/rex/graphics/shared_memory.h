@@ -112,6 +112,11 @@ class SharedMemory {
 
   memory::Memory& memory() const { return memory_; }
 
+  // An implementation may set this to let RequestRanges answer "everything is already valid" from the validity
+  // bitmap without entering the global critical region, sorting or merging (the common case once a scene's buffers are
+  // resident). A page invalidated concurrently with the check is treated exactly like one invalidated right after it.
+  bool lockless_valid_check_ = false;
+
   uint32_t page_size_log2() const { return page_size_log2_; }
 
   uint32_t host_gpu_memory_sparse_granularity_log2() const {

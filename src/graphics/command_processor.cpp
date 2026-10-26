@@ -47,6 +47,8 @@ inline uint8_t* PhysW(rex::memory::Memory* m, uint32_t addr) {
 
 #if REX_PLATFORM_SWITCH
 #include <atomic>
+#include <cstdio>
+#include <string>
 
 namespace rex::graphics {
 // Switch diagnostics read by the app heartbeat: what the command processor is doing right now.
@@ -67,10 +69,49 @@ inline uint64_t SwitchTick() {
   __asm__ __volatile__("mrs %x0, cntpct_el0" : "=r"(v));
   return v;
 }
+// WAIT_REG_MEM waits that slept, per (address, reference, info) - GPU thread only (the per-second report runs
+// on it too, from IssueSwap).
+struct WaitMemStat {
+  uint32_t info, addr, ref, mask, wait, first_value, last_value;
+  uint64_t ticks, n, polls;
+};
+constexpr int kWaitMemStats = 8;
+WaitMemStat g_waitmem_stats[kWaitMemStats];
+int g_waitmem_stat_count = 0;
+uint32_t g_waitmem_dropped = 0;
 }  // namespace
+namespace rex::graphics {
+// Per-second report line (GL backend perf): the slept WAIT_REG_MEM waits since the last call, then resets.
+std::string SwitchWaitMemReport() {
+  static const char* const kWaitFunc[8] = {"never", "<", "<=", "==", "!=", ">=", ">", "always"};
+  std::string s;
+  char b[200];
+  for (int i = 0; i < g_waitmem_stat_count; ++i) {
+    const WaitMemStat& w = g_waitmem_stats[i];
+    std::snprintf(b, sizeof b, " | %s %08X %s %08X mask %08X wait %X: %llu x %.2f ms, %.1f polls, value %08X -> %08X",
+                  (w.info & 0x10) ? "mem" : "reg", w.addr,
+                  kWaitFunc[w.info & 7], w.ref, w.mask,
+                  w.wait, (unsigned long long)w.n, double(w.ticks) / 19200.0 / double(w.n ? w.n : 1),
+                  double(w.polls) / double(w.n ? w.n : 1), w.first_value, w.last_value);
+    s += b;
+  }
+  if (g_waitmem_dropped) {
+    std::snprintf(b, sizeof b, " | (%u more)", g_waitmem_dropped);
+    s += b;
+  }
+  g_waitmem_stat_count = 0;
+  g_waitmem_dropped = 0;
+  return s;
+}
+}  // namespace rex::graphics
 #endif
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+#if REX_PLATFORM_SWITCH
+REXCVAR_DEFINE_BOOL(gpu_rptr_writeback_per_packet, true, "GPU",
+                    "Switch: write the ring read pointer back to the guest after every primary ring packet instead of "
+                    "once per batch");
+#endif
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -669,6 +710,15 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       assert_always();
       break;
     }
+#if REX_PLATFORM_SWITCH
+    // Report the read pointer after every primary packet (like the hardware, which advances it as it fetches)
+    // rather than once per batch: the guest's D3D waits on it for ring space, and a whole-batch writeback
+    // serialized the guest with the GPU thread (the guest spun for the full batch).
+    if (read_ptr_writeback_ptr_ && reader.read_count() && REXCVAR_GET(gpu_rptr_writeback_per_packet)) {
+      memory::store_and_swap<uint32_t>(PhysW(memory_, read_ptr_writeback_ptr_),
+                                       uint32_t(reader.read_offset() / sizeof(uint32_t)));
+    }
+#endif
   } while (reader.read_count());
 
   OnPrimaryBufferEnd();
@@ -1052,6 +1102,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool matched = false;
 #if REX_PLATFORM_SWITCH
   uint64_t waitmem_t0 = 0;
+  uint32_t waitmem_first_value = 0, waitmem_value = 0, waitmem_polls = 0;
 #endif
   do {
     uint32_t value = 0;
@@ -1092,8 +1143,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+#if REX_PLATFORM_SWITCH
+    waitmem_value = value;
+#endif
     if (!matched) {
 #if REX_PLATFORM_SWITCH
+      ++waitmem_polls;
       g_switch_gpu_waiting.store(1, std::memory_order_relaxed);
       g_switch_gpu_wait_info.store(wait_info, std::memory_order_relaxed);
       g_switch_gpu_wait_addr.store(poll_reg_addr, std::memory_order_relaxed);
@@ -1101,6 +1156,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       g_switch_gpu_wait_mask.store(mask, std::memory_order_relaxed);
       g_switch_gpu_wait_value.store(value, std::memory_order_relaxed);
       if (!waitmem_t0) {
+        waitmem_first_value = value;
         waitmem_t0 = SwitchTick();
         g_switch_cp_state.store(2, std::memory_order_relaxed);
       }
@@ -1129,7 +1185,25 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 #if REX_PLATFORM_SWITCH
   g_switch_gpu_waiting.store(0, std::memory_order_relaxed);
   if (waitmem_t0) {
-    g_switch_cp_waitmem_ticks.fetch_add(SwitchTick() - waitmem_t0, std::memory_order_relaxed);
+    const uint64_t waitmem_ticks = SwitchTick() - waitmem_t0;
+    WaitMemStat* ws = nullptr;
+    for (int i = 0; i < g_waitmem_stat_count; ++i) {
+      WaitMemStat& w = g_waitmem_stats[i];
+      if (w.info == wait_info && w.addr == poll_reg_addr && w.ref == ref && w.mask == mask) ws = &w;
+    }
+    if (!ws && g_waitmem_stat_count < kWaitMemStats) {
+      ws = &g_waitmem_stats[g_waitmem_stat_count++];
+      *ws = WaitMemStat{wait_info, poll_reg_addr, ref, mask, wait, waitmem_first_value, 0, 0, 0, 0};
+    }
+    if (ws) {
+      ws->last_value = waitmem_value;
+      ws->ticks += waitmem_ticks;
+      ++ws->n;
+      ws->polls += waitmem_polls;
+    } else {
+      ++g_waitmem_dropped;
+    }
+    g_switch_cp_waitmem_ticks.fetch_add(waitmem_ticks, std::memory_order_relaxed);
     g_switch_cp_waitmem_count.fetch_add(1, std::memory_order_relaxed);
     g_switch_cp_state.store(0, std::memory_order_relaxed);
   }

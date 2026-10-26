@@ -36,6 +36,12 @@ REXCVAR_DEFINE_INT32(gl_link_fence_timeout_ms, 500, "GPU",
 REXCVAR_DEFINE_INT32(gl_program_max_wait_ms, 2000, "GPU",
                      "GL backend: a program a draw has been waiting for longer than this is linked on the GPU thread "
                      "(at most one per frame; stalls that frame). 0 = always wait for the compile thread");
+REXCVAR_DEFINE_BOOL(gl_implicit_lod_bias, true, "GPU",
+                    "GL backend: pixel shader texture fetches with derivative LOD sample with implicit LOD + bias "
+                    "instead of explicit gradients (explicit-gradient sampling is slow on the Switch GPU)");
+REXCVAR_DEFINE_BOOL(gl_fetch_assume_plain, false, "GPU",
+                    "GL backend EXPERIMENT: pixel shader texture fetches skip the signedness / swizzle / exponent "
+                    "bias emulation (wrong colours on some textures; measures the emulation cost)");
 REXCVAR_DEFINE_BOOL(gl_compact_texture_fetch, true, "GPU",
                     "GL backend: translate texture fetch swizzles / signedness branch-free per fetch (much smaller GLSL; "
                     "Mesa compiled the per-component form of the in-game shaders for minutes)");
@@ -142,6 +148,8 @@ bool GlPipelineCache::Initialize(GlContext* gl_context) {
   features.image_view_format_swizzle = false;  // host swizzle done in the shader via system constants
   features.compact_texture_result = REXCVAR_GET(gl_compact_texture_fetch);
   features.cheap_mul_zero_rule = REXCVAR_GET(gl_cheap_mul_zero_rule);
+  features.implicit_lod_bias = REXCVAR_GET(gl_implicit_lod_bias);
+  features.fetch_assume_plain = REXCVAR_GET(gl_fetch_assume_plain);
   features.signed_zero_inf_nan_preserve_float32 = false;
   features.denorm_flush_to_zero_float32 = false;
   features.rounding_mode_rte_float32 = false;

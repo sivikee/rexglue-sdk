@@ -17,6 +17,9 @@
 
 #include <string>
 
+REXCVAR_DEFINE_INT32(gl_rt_trace_every, 0, "GPU",
+                     "GL backend (diagnostic): log every render target switch, resolve and clear of one frame every N "
+                     "frames (0 = off)");
 REXCVAR_DEFINE_BOOL(gl_gpu_resolve_compute, false, "GPU",
                     "GL backend: let GPU resolves write the shared memory store with a compute shader. false = resolves "
                     "stay GPU snapshots (lazy) and are read back + converted on the CPU only when memory needs them. "
@@ -29,6 +32,9 @@ REXCVAR_DEFINE_INT32(gl_lazy_max_age, 30, "GPU",
                      "GL backend: swaps a lazy resolve (data only in its GPU snapshot) is kept before it is written to "
                      "guest memory, unless a newer resolve supersedes it first (Oblivion re-renders a shadow map slot "
                      "less often than every 3 frames: with gl_resolve_max_age it was read back every frame)");
+REXCVAR_DEFINE_BOOL(gl_resolve_guest_check, true, "GPU",
+                    "GL backend: skip a deferred resolve write-back when the game changed the destination memory since "
+                    "the resolve (it freed and reused it; the late write corrupted its heap with many actors in view)");
 REXCVAR_DEFINE_INT32(gl_gpu_resolve_debug, 0, "GPU",
                      "GL debug: GPU resolve compute shader variants (1 = empty main, 2 = no store, 3 = no source fetch)");
 
@@ -300,6 +306,17 @@ GLuint GlRenderTargets::GetFramebuffer(const FbKey& key) {
   return fbo;
 }
 
+namespace {
+// gl_rt_trace_every: the frame being traced, its pass key and draws in the current pass.
+uint64_t g_trace_pass_key = 0;
+uint32_t g_trace_pass_draws = 0;
+}  // namespace
+
+bool GlRenderTargets::TraceFrame() const {
+  const int32_t every = REXCVAR_GET(gl_rt_trace_every);
+  return every > 0 && frame_ % uint64_t(every) == 0;
+}
+
 bool GlRenderTargets::BindForDraw(uint32_t color_mask, bool depth_stencil_used, uint32_t width_needed,
                                   uint32_t height_needed) {
   auto surface_info = regs_.Get<reg::RB_SURFACE_INFO>();
@@ -338,6 +355,56 @@ bool GlRenderTargets::BindForDraw(uint32_t color_mask, bool depth_stencil_used, 
   }
   GLuint fbo = GetFramebuffer(key);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  if (TraceFrame()) {
+    const uint64_t tk = (uint64_t(key.color[0]) << 40) ^ (uint64_t(key.color[1]) << 30) ^ (uint64_t(key.depth) << 10) ^
+                        (uint64_t(surface_info.surface_pitch) << 52) ^ key.color[2] ^ (uint64_t(key.color[3]) << 20);
+    if (tk != g_trace_pass_key) {
+      if (g_trace_pass_key) REXGPU_INFO("RT trace f{}:   ... {} draws", frame_, g_trace_pass_draws);
+      g_trace_pass_key = tk;
+      g_trace_pass_draws = 0;
+      std::string d;
+      char b[96];
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (!(used_colors & (1u << i))) continue;
+        auto ci = regs_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+        std::snprintf(b, sizeof b, " C%u base=%u fmt=%u tex=%u", i, uint32_t(ci.color_base), uint32_t(ci.color_format),
+                      key.color[i]);
+        d += b;
+      }
+      if (key.depth) {
+        auto di = regs_.Get<reg::RB_DEPTH_INFO>();
+        std::snprintf(b, sizeof b, " Z base=%u fmt=%u tex=%u", uint32_t(di.depth_base), uint32_t(di.depth_format),
+                      key.depth);
+        d += b;
+      }
+      REXGPU_INFO("RT trace f{}: bind pitch={} msaa={} need {}x{} -> fb {}x{}{}", frame_,
+                  uint32_t(surface_info.surface_pitch), uint32_t(surface_info.msaa_samples), width_needed,
+                  height_needed, min_w, min_h, d);
+    }
+    ++g_trace_pass_draws;
+  }
+  {
+    // Pass key: GL textures of the bound set (stable while the targets live) + size.
+    uint64_t pk = 0xcbf29ce484222325ull;
+    for (GLuint t : {key.color[0], key.color[1], key.color[2], key.color[3], key.depth, GLuint(min_w), GLuint(min_h)}) {
+      pk = (pk ^ t) * 0x100000001b3ull;
+    }
+    if (perf::GpuPassSwitch(pk)) {
+      // e.g. "C0F3 Z500 1040X600": first color target EDRAM base + format, depth base, size (overlay glyphs only).
+      char d[64];
+      int n = 0;
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets && n < 40; ++i) {
+        if (!(used_colors & (1u << i))) continue;
+        auto ci = regs_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+        n += std::snprintf(d + n, sizeof d - size_t(n), "C%XF%u ", ci.color_base, uint32_t(ci.color_format));
+      }
+      if (key.depth && n < 50) {
+        n += std::snprintf(d + n, sizeof d - size_t(n), "Z%X ", regs_.Get<reg::RB_DEPTH_INFO>().depth_base);
+      }
+      if (n < 54) std::snprintf(d + n, sizeof d - size_t(n), "%uX%u", min_w, min_h);
+      perf::GpuPassDescribe(pk, d);
+    }
+  }
   bound_width_ = min_w;
   bound_height_ = min_h;
   bound_color_mask_ = used_colors;
@@ -373,6 +440,17 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
                 ri.coordinate_info.edram_offset_y_div_8 * 8;
   uint32_t w = ri.coordinate_info.width_div_8 * 8;
   uint32_t h = ri.height_div_8 * 8;
+  if (TraceFrame()) {
+    auto ci = regs_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[ri.rb_copy_control.copy_src_select]);
+    REXGPU_INFO(
+        "RT trace f{}: resolve {} src C{} base={} fmt={} edram_base_tiles={} pitch_tiles={} rect=({},{}) {}x{} -> dest "
+        "0x{:08X}+0x{:X} fmt={} | clear color={} (0x{:08X} 0x{:08X}) depth={} (0x{:08X}) Z base={}",
+        frame_, is_depth ? "depth" : "color", uint32_t(ri.rb_copy_control.copy_src_select), uint32_t(ci.color_base),
+        uint32_t(ci.color_format), uint32_t(edram_info.base_tiles), pitch_tiles, x0, y0, w, h, ri.copy_dest_base,
+        ri.copy_dest_extent_length, uint32_t(ri.copy_dest_info.copy_dest_format), ri.IsClearingColor(),
+        ri.rb_color_clear, ri.rb_color_clear_lo, ri.IsClearingDepth(), ri.rb_depth_clear,
+        uint32_t(regs_.Get<reg::RB_DEPTH_INFO>().depth_base));
+  }
 
   // ---- Copy ----
   gpu_written_out = false;
@@ -520,7 +598,9 @@ bool GlRenderTargets::Resolve(uint32_t& extent_start_out, uint32_t& extent_lengt
                 ri.copy_dest_extent_length, uint32_t(endian), uint32_t(swap_rb), gpu_done, pr.snap_kind);
           }
         }
+        if (REXCVAR_GET(gl_resolve_guest_check)) pr.guest_fp = GuestFingerprint(pr.extent_start, pr.extent_length);
         pending_.push_back(pr);
+        ++snap_gen_;
         if (sync) {
           FlushAll(FlushReason::kSync);
         } else {
@@ -649,6 +729,51 @@ bool GlRenderTargets::DebugReadColor(uint32_t base, std::vector<uint8_t>& rgba, 
 }  // namespace rex::graphics::gl
 
 namespace rex::graphics::gl {
+
+uint64_t GlRenderTargets::GuestFingerprint(uint32_t start, uint32_t length) {
+  // Sampled (about 1024 words, the stride not a multiple of 64 so the samples walk through the cache line offsets):
+  // memory the game reuses is rewritten densely (vertex data, textures, heap headers).
+  const uint8_t* p = memory_.TranslatePhysical(start);
+  if (!p || length < 8) return 0;
+  const uint32_t stride = (std::max<uint32_t>(64, length / 1024) & ~7u) + 8;
+  uint64_t h = 0xCBF29CE484222325ull;
+  auto mix = [&](uint32_t o) {
+    uint64_t v;
+    std::memcpy(&v, p + o, 8);
+    h = (h ^ v) * 0x100000001B3ull;
+    h ^= h >> 29;
+  };
+  for (uint32_t o = 0; o + 8 <= length; o += stride) mix(o);
+  mix(length - 8);
+  return h;
+}
+
+bool GlRenderTargets::GuestUnchanged(const PendingResolve& pr) {
+  if (!REXCVAR_GET(gl_resolve_guest_check) || GuestFingerprint(pr.extent_start, pr.extent_length) == pr.guest_fp) {
+    return true;
+  }
+  static uint32_t logged = 0;
+  if (++logged <= 32 || logged % 256 == 0) {
+    REXGPU_WARN("GL RT: resolve write-back #{} skipped, the game reused 0x{:08X}+0x{:X} since ({}x{} fmt={} age={} "
+                "lazy={})",
+                logged, pr.extent_start, pr.extent_length, pr.rw, pr.rh, uint32_t(pr.dest_format),
+                int64_t(frame_) - int64_t(pr.frame), pr.lazy);
+  }
+  perf::Add(perf::kResolveGuestReused);
+  return false;
+}
+
+void GlRenderTargets::RefreshFingerprints(const PendingResolve& written) {
+  // The write-back changed guest memory under the other records overlapping it: their baseline moves with it.
+  if (!REXCVAR_GET(gl_resolve_guest_check)) return;
+  const uint64_t s = written.extent_start, e = s + written.extent_length;
+  for (PendingResolve& o : pending_) {
+    if (&o == &written || o.done || uint64_t(o.extent_start) >= e || uint64_t(o.extent_start) + o.extent_length <= s) {
+      continue;
+    }
+    o.guest_fp = GuestFingerprint(o.extent_start, o.extent_length);
+  }
+}
 
 void GlRenderTargets::ConvertPending(PendingResolve& pr, const void* pixels) {
   perf::Scope perf_conv_scope(perf::kResolveConvTicks);
@@ -822,6 +947,7 @@ void GlRenderTargets::ReleaseDownload(PendingResolve& pr) {
 }
 
 void GlRenderTargets::ReleaseSnapshot(PendingResolve& pr) {
+  ++snap_gen_;
   if (pr.snapshot) {
     free_snapshots_.push_back({pr.snapshot, pr.snapshot_w, pr.snapshot_h, pr.snapshot_format});
     pr.snapshot = 0;
@@ -1287,7 +1413,10 @@ void GlRenderTargets::FinishGpuDownload(PendingResolve& pr) {
   }
   if (data) {
     // The data is already in guest format (tiled, endian swapped): a plain copy.
-    std::memcpy(memory_.TranslatePhysical(pr.extent_start), data, pr.extent_length);
+    if (GuestUnchanged(pr)) {
+      std::memcpy(memory_.TranslatePhysical(pr.extent_start), data, pr.extent_length);
+      RefreshFingerprints(pr);
+    }
     glUnmapBuffer(GL_COPY_WRITE_BUFFER);
   }
   glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
@@ -1371,6 +1500,7 @@ void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
     if (pr.done) {
       ReleasePending(pr);
       pending_.pop_front();
+      ++snap_gen_;
       return;
     }
     if (!wait) return;
@@ -1380,11 +1510,13 @@ void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
       if (!pr.done) FinishGpuDownload(pr);
       ReleasePending(pr);
       pending_.pop_front();
+      ++snap_gen_;
       return;
     }
     if (pr.done) {
       ReleasePending(pr);
       pending_.pop_front();
+      ++snap_gen_;
       return;
     }
     // Converted to a CPU readback (gl_gpu_resolve_compute = false): finish it below.
@@ -1404,12 +1536,16 @@ void GlRenderTargets::FlushFront(bool wait, FlushReason reason) {
     data = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, pr.rw * pr.rh * (pr.src_is_8888 ? 4 : 16), GL_MAP_READ_BIT);
   }
   if (data) {
-    ConvertPending(pr, data);
+    if (GuestUnchanged(pr)) {
+      ConvertPending(pr, data);
+      RefreshFingerprints(pr);
+    }
     glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
   }
   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
   ReleasePending(pr);
   pending_.pop_front();
+  ++snap_gen_;
 }
 
 void GlRenderTargets::FlushPending(uint32_t start, uint32_t length, FlushReason reason) {
@@ -1451,6 +1587,7 @@ void GlRenderTargets::CompactSuperseded() {
     if (pr.gpu && pr.done && !pr.snapshot && !pr.dl_started && pr.frame < frame_) {
       ReleasePending(pr);
       pending_.erase(pending_.begin() + ptrdiff_t(i));
+      ++snap_gen_;
       continue;
     }
     ++i;

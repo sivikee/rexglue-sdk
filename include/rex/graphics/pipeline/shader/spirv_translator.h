@@ -417,6 +417,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // "min(|a|, |b|) == 0 -> 0". Identical unless an operand is already NaN (NaN * non-zero gives 0 instead of NaN).
     // Used by the OpenGL backend to keep the GLSL small for Mesa. Off for Vulkan.
     bool cheap_mul_zero_rule = false;
+
+    // Pixel shader fetches with derivative-based LOD (no register gradients, not 3D / stacked): sample with an
+    // implicit LOD and the LOD bias as the Bias operand instead of explicit gradients scaled by exp2(bias). Same mip
+    // selection (scaling the gradients by 2^b adds b to the LOD), but explicit-gradient sampling runs at a fraction
+    // of the texture rate on NVIDIA Maxwell (the Switch's Tegra X1). Off for Vulkan.
+    bool implicit_lod_bias = false;
+
+    // EXPERIMENT (upper bound of the texture fetch emulation cost): pixel shader fetches assume an unsigned texture,
+    // identity swizzle and no exponent bias - no signed sample, no swizzle / sign / gamma / exponent code. Wrong
+    // colours for textures that need any of those. Off for Vulkan.
+    bool fetch_assume_plain = false;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,

@@ -5,6 +5,8 @@
 
 #include <rex/logging.h>
 
+#include "gl_ext.h"
+
 namespace rex::graphics::gl {
 
 GlPrimitiveProcessor::~GlPrimitiveProcessor() {

@@ -81,6 +81,10 @@ class GlRenderTargets {
   bool Resolve(uint32_t& extent_start_out, uint32_t& extent_length_out, bool& gpu_written_out);
 
   void EndFrame() { ++frame_; }
+  // gl_rt_trace_every: this frame's render target switches, resolves and clears are logged.
+  bool TraceFrame() const;
+  // Changes whenever the set of pending resolves / their snapshots changes (consumers' cached FindSnapshot misses).
+  uint64_t snapshot_generation() const { return snap_gen_; }
 
   // ---- Asynchronous resolves ----
   // Resolves read the render target back through a PBO and are converted to guest memory later. Anything
@@ -143,6 +147,7 @@ class GlRenderTargets {
     bool lazy = false;       // gpu: compute write into the store deferred (data only in the snapshot)
     uint64_t presented_frame = UINT64_MAX;  // last swap that showed it straight from its snapshot (MarkPresented)
     uint64_t serial = 0;     // resolve number (snapshot contents identity for consumers' derived copies)
+    uint64_t guest_fp = 0;   // GuestFingerprint of the destination when resolved (gl_resolve_guest_check)
   };
   struct Snapshot {
     GLuint texture = 0;
@@ -153,6 +158,10 @@ class GlRenderTargets {
     uint32_t start, length;
   };
   void ConvertPending(PendingResolve& pr, const void* pixels);
+  // Deferred write-backs land frames after the resolve: the game may have freed and reused the memory meanwhile.
+  uint64_t GuestFingerprint(uint32_t start, uint32_t length);
+  bool GuestUnchanged(const PendingResolve& pr);
+  void RefreshFingerprints(const PendingResolve& written);
   void FlushFront(bool wait, FlushReason reason = FlushReason::kOther);
   void ReleasePending(PendingResolve& pr);
   void ReleaseDownload(PendingResolve& pr);
@@ -201,6 +210,7 @@ class GlRenderTargets {
   bool bound_depth_ = false;
   uint64_t frame_ = 0;
   uint32_t resolve_count_ = 0;
+  uint64_t snap_gen_ = 1;
   std::deque<PendingResolve> pending_;
   std::vector<std::pair<GLuint, uint32_t>> free_pbos_;
   std::vector<Snapshot> free_snapshots_;

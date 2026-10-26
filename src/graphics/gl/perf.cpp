@@ -4,10 +4,19 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <deque>
+#include <unordered_map>
 #include <vector>
 
 #include <glad/glad.h>
+// ARB_pipeline_statistics_query (not in the glad loader; Mesa nvc0 implements it).
+#ifndef GL_VERTEX_SHADER_INVOCATIONS_ARB
+#define GL_VERTEX_SHADER_INVOCATIONS_ARB 0x82F0
+#endif
+#ifndef GL_FRAGMENT_SHADER_INVOCATIONS_ARB
+#define GL_FRAGMENT_SHADER_INVOCATIONS_ARB 0x82F4
+#endif
 
 #include <rex/logging.h>
 
@@ -17,12 +26,13 @@ namespace rex::graphics {
 // command_processor.cpp (base): GPU thread idle / WAIT_REG_MEM time, guest VdSwap calls.
 extern std::atomic<uint64_t> g_switch_cp_idle_ticks, g_switch_cp_waitmem_ticks, g_switch_cp_waitmem_count;
 extern std::atomic<uint32_t> g_switch_vdswap_count;
+std::string SwitchWaitMemReport();
 }  // namespace rex::graphics
 
 namespace rex::graphics::gl::perf {
 
 namespace {
-std::string g_lines[3];
+std::string g_lines[kOverlayLines];
 uint64_t g_last_report = 0, g_last_swap = 0, g_sum_ft = 0, g_max_ft = 0, g_frames = 0;
 uint64_t g_last_thread_cpu = 0, g_last_vdswaps = 0;
 FILE* g_file = nullptr;
@@ -33,18 +43,34 @@ double Ms(uint64_t ticks) { return double(armTicksToNs(ticks)) / 1e6; }
 uint64_t NowNs() { return armTicksToNs(armGetSystemTick()); }
 
 // ---- GPU timer queries ----
-constexpr int kPool = 512;
+constexpr int kPool = 2048;  // render passes take two timestamps each
 bool g_timers = false;
 GLuint g_q[kPool];
 uint64_t g_q_cpu_ns[kPool];  // CPU time each timestamp was issued
 std::vector<int> g_free;
-enum RecKind { kRecSeg, kRecLag, kRecFrameEnd };
+enum RecKind { kRecSeg, kRecLag, kRecFrameEnd, kRecPass };
 struct Rec {
   RecKind kind;
   int a, b;  // query handles (b = end, -1 when single)
   GpuSeg seg;
-  uint64_t aux_cpu_ns;  // frame end: CPU time the next frame acquired its back buffer
+  uint64_t aux_cpu_ns;  // frame end: CPU time the next frame acquired its back buffer; pass: its key
+  int stat = -1;        // pass: pipeline statistics query pair (g_qs), -1 when none
 };
+// Pipeline statistics (ARB_pipeline_statistics_query): vertex / fragment shader invocations per render pass.
+constexpr int kStatPool = 256;
+bool g_stats = false;
+GLuint g_qs[kStatPool][2];
+std::vector<int> g_free_stats;
+int g_pass_stat = -1;
+// Render passes: running pass and per-report accumulators by key.
+struct PassStat {
+  uint64_t ns = 0, n = 0, draws = 0, vs = 0, fs = 0;
+};
+std::unordered_map<uint64_t, PassStat> g_pass;
+std::unordered_map<uint64_t, std::string> g_pass_desc;
+uint64_t g_pass_key = 0;
+int g_pass_begin = -1;
+uint64_t g_pass_draws = 0;
 std::deque<Rec> g_recs;
 int64_t g_min_offset = INT64_MAX;  // min(gpu_ns - cpu_ns) over all timestamps: clock offset when the GPU is idle
 // Per-report accumulators.
@@ -118,6 +144,20 @@ void GpuTimersInit() {
   g_free.clear();
   for (int i = kPool - 1; i >= 0; --i) g_free.push_back(i);
   g_timers = true;
+  g_stats = false;
+  {
+    GLint n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n && !g_stats; ++i) {
+      const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
+      g_stats = e && !std::strcmp(e, "GL_ARB_pipeline_statistics_query");
+    }
+  }
+  if (g_stats) {
+    glGenQueries(kStatPool * 2, &g_qs[0][0]);
+    for (int i = kStatPool - 1; i >= 0; --i) g_free_stats.push_back(i);
+  }
+  REXGPU_INFO("perf: pipeline statistics queries {}", g_stats ? "enabled" : "unavailable");
   REXGPU_INFO("perf: GPU timer queries enabled (GL_TIMESTAMP {} bits, pool {}, {:.6f} ns per tick)", bits, kPool, g_ts_scale);
 }
 
@@ -139,6 +179,44 @@ void GpuSegEnd(GpuSeg seg, int begin) {
   }
   g_recs.push_back(Rec{kRecSeg, begin, e, seg, 0});
 }
+
+bool GpuPassSwitch(uint64_t key) {
+  if (!g_timers || !REXCVAR_GET(gl_gpu_pass_timers)) return false;
+  if (key == g_pass_key) {
+    ++g_pass_draws;
+    return false;
+  }
+  if (g_pass_key) {
+    g_pass[g_pass_key].draws += g_pass_draws;
+    if (g_pass_stat >= 0) {
+      glEndQuery(GL_VERTEX_SHADER_INVOCATIONS_ARB);
+      glEndQuery(GL_FRAGMENT_SHADER_INVOCATIONS_ARB);
+    }
+    if (g_pass_begin >= 0) {
+      int e = GpuStamp();
+      if (e >= 0) {
+        g_recs.push_back(Rec{kRecPass, g_pass_begin, e, kGpuSegFrame, g_pass_key, g_pass_stat});
+        g_pass_stat = -1;
+      } else {
+        Give(g_pass_begin);
+      }
+    }
+    if (g_pass_stat >= 0) g_free_stats.push_back(g_pass_stat);
+    g_pass_stat = -1;
+  }
+  g_pass_key = key;
+  g_pass_draws = key ? 1 : 0;
+  g_pass_begin = key ? GpuStamp() : -1;
+  if (key && g_pass_begin >= 0 && g_stats && !g_free_stats.empty()) {
+    g_pass_stat = g_free_stats.back();
+    g_free_stats.pop_back();
+    glBeginQuery(GL_VERTEX_SHADER_INVOCATIONS_ARB, g_qs[g_pass_stat][0]);
+    glBeginQuery(GL_FRAGMENT_SHADER_INVOCATIONS_ARB, g_qs[g_pass_stat][1]);
+  }
+  return key && !g_pass_desc.count(key);
+}
+
+void GpuPassDescribe(uint64_t key, const std::string& desc) { g_pass_desc[key] = desc; }
 
 void GpuLagMark() {
   int h = GpuStamp();
@@ -170,6 +248,10 @@ void GpuPoll() {
     GLuint avail = 0;
     glGetQueryObjectuiv(g_q[last], GL_QUERY_RESULT_AVAILABLE, &avail);
     if (!avail) break;
+    if (r.stat >= 0) {
+      glGetQueryObjectuiv(g_qs[r.stat][1], GL_QUERY_RESULT_AVAILABLE, &avail);
+      if (!avail) break;
+    }
     GLuint64 ta = 0, tb = 0;
     glGetQueryObjectui64v(g_q[r.a], GL_QUERY_RESULT, &ta);
     ta = ScaleTs(ta);
@@ -182,6 +264,21 @@ void GpuPoll() {
       if (tb >= ta) {
         g_seg_ns[r.seg] += tb - ta;
         ++g_seg_n[r.seg];
+      }
+    } else if (r.kind == kRecPass) {
+      glGetQueryObjectui64v(g_q[r.b], GL_QUERY_RESULT, &tb);
+      tb = ScaleTs(tb);
+      if (tb >= ta) {
+        PassStat& ps = g_pass[r.aux_cpu_ns];
+        ps.ns += tb - ta;
+        ++ps.n;
+        if (r.stat >= 0) {
+          GLuint64 v = 0, f = 0;
+          glGetQueryObjectui64v(g_qs[r.stat][0], GL_QUERY_RESULT, &v);
+          glGetQueryObjectui64v(g_qs[r.stat][1], GL_QUERY_RESULT, &f);
+          ps.vs += v;
+          ps.fs += f;
+        }
       }
     } else if (r.kind == kRecLag) {
       uint64_t lag = uint64_t(off_a - g_min_offset);
@@ -204,6 +301,7 @@ void GpuPoll() {
     }
     Give(r.a);
     Give(r.b);
+    if (r.stat >= 0) g_free_stats.push_back(r.stat);
     g_recs.pop_front();
   }
   // Safety: never let the record list grow without bound (e.g. results never become available).
@@ -212,6 +310,7 @@ void GpuPoll() {
     if (&r == g_last_frame_end) g_last_frame_end = nullptr;
     Give(r.a);
     Give(r.b);
+    if (r.stat >= 0) g_free_stats.push_back(r.stat);
     g_recs.pop_front();
   }
 }
@@ -314,7 +413,7 @@ void Report(uint64_t now, bool swapless) {
   double fps = g_frames / secs;
   double avg = g_frames ? Ms(g_sum_ft) / g_frames : 0.0;
   double mx = Ms(g_max_ft);
-  char l1[360], l2[320], l3[160], l4[480], l5[480], l6[560], l7[800];
+  char l1[360], l2[480], l3[420], l4[480], l5[480], l6[560], l7[800], l8[900];
   std::snprintf(l1, sizeof l1,
                 "perf%s: fps=%.2f frame avg=%.1f max=%.1f ms | swap=%.0f ms swapbuf=%.0f detile=%.0f | draws=%llu (%.0f ms: const up %.0f, excl uploads %.0f) "
                 "copies=%llu (%.0f ms, readback %.0f ms)",
@@ -323,19 +422,21 @@ void Report(uint64_t now, bool swapless) {
                 Ms(c[kReadbackTicks]));
   std::snprintf(l2, sizeof l2,
                 "perf: xlate=%llu (%.0f ms) link=%llu (%.0f ms) | tex up=%llu %.1f MiB (%.0f ms) hash %.1f MiB (%.0f ms) | "
-                "sm up %.1f MiB (%.0f ms) finish %.0f ms",
+                "sm up %.1f MiB in %llu requests / %llu copies (%.0f ms) finish %.0f ms | binds skipped=%llu issued=%llu",
                 (unsigned long long)c[kXlateCount], Ms(c[kXlateTicks]), (unsigned long long)c[kLinkCount],
                 Ms(c[kLinkTicks]), (unsigned long long)c[kTexUploads], c[kTexUploadBytes] / 1048576.0,
                 Ms(c[kTexUploadTicks]), c[kTexHashBytes] / 1048576.0, Ms(c[kTexHashTicks]),
-                c[kSmUploadBytes] / 1048576.0, Ms(c[kSmUploadTicks]), Ms(c[kFinishTicks]));
-  std::snprintf(l3, sizeof l3, "perf: sm copy %.0f ms resolve convert %.0f ms gpu-copy hits tex=%llu front=%llu", Ms(c[kSmCopyTicks]), Ms(c[kResolveConvTicks]), (unsigned long long)c[kResolveGpuHits], (unsigned long long)c[kResolveFrontHits]);
+                c[kSmUploadBytes] / 1048576.0, (unsigned long long)c[kSmUploadCalls], (unsigned long long)c[kSmUploadCopies],
+                Ms(c[kSmUploadTicks]), Ms(c[kFinishTicks]), (unsigned long long)c[kShadowSkipped],
+                (unsigned long long)c[kShadowIssued]);
+  std::snprintf(l3, sizeof l3, "perf: sm copy %.0f ms resolve convert %.0f ms gpu-copy hits tex=%llu front=%llu | sm memcpy %.0f ms | sm upload direct n=%llu %.0f KiB %.0f ms, staged n=%llu %.0f KiB %.0f ms", Ms(c[kSmCopyTicks]), Ms(c[kResolveConvTicks]), (unsigned long long)c[kResolveGpuHits], (unsigned long long)c[kResolveFrontHits], Ms(c[kSmMemcpyTicks]), (unsigned long long)c[kSmAbDirectCalls], c[kSmAbDirectBytes] / 1024.0, Ms(c[kSmAbDirectTicks]), (unsigned long long)c[kSmAbStagedCalls], c[kSmAbStagedBytes] / 1024.0, Ms(c[kSmAbStagedTicks]));
   std::snprintf(l4, sizeof l4,
-                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu deferred=%llu materialized=%llu front dropped=%llu | front snap=%llu store=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
+                "perf: gpu resolves=%llu (%.0f ms) cpu resolves=%llu superseded=%llu deferred=%llu materialized=%llu front dropped=%llu reused=%llu | front snap=%llu store=%llu cpu=%llu | lazy downloads=%llu %.1f MiB (%.0f ms) | "
                 "flushes: tex=%llu sm=%llu front=%llu age=%llu cap=%llu sync=%llu other=%llu",
                 (unsigned long long)c[kGpuResolves], Ms(c[kGpuResolveTicks]), (unsigned long long)c[kCpuResolves],
                 (unsigned long long)c[kResolveSuperseded], (unsigned long long)c[kLazyDeferred],
                 (unsigned long long)c[kLazyMaterialized], (unsigned long long)c[kFrontDropped],
-                (unsigned long long)c[kResolveFrontHits],
+                (unsigned long long)c[kResolveGuestReused], (unsigned long long)c[kResolveFrontHits],
                 (unsigned long long)c[kGpuFrontBlits],
                 (unsigned long long)c[kCpuFrontFrames], (unsigned long long)c[kLazyDownloads],
                 c[kLazyDownloadBytes] / 1048576.0, Ms(c[kLazyDownloadTicks]), (unsigned long long)c[kFlushTex],
@@ -389,12 +490,47 @@ void Report(uint64_t now, bool swapless) {
   REXGPU_INFO("{}", l5);
   REXGPU_INFO("{}", l6);
   REXGPU_INFO("{}", l7);
+  REXGPU_INFO("perf: waitmem (slept){}", SwitchWaitMemReport());
+  // Render passes by GPU time (ms per second of wall time, passes, draws); top ones also go to the overlay.
+  std::vector<std::pair<uint64_t, uint64_t>> passes;  // (ns, key)
+  uint64_t pass_total = 0;
+  for (auto& kv : g_pass) {
+    passes.push_back({kv.second.ns, kv.first});
+    pass_total += kv.second.ns;
+  }
+  std::sort(passes.begin(), passes.end(), [](auto& a, auto& b) { return a.first > b.first; });
+  int l8n = std::snprintf(l8, sizeof l8,
+                          "perf: gpu passes (ms/s, passes, draws, M vertex / M fragment shader invocations/s) total "
+                          "%.1f ms:", pass_total / 1e6);
+  std::string ov[4];
+  for (size_t i = 0; i < passes.size() && i < 8; ++i) {
+    const PassStat& ps = g_pass[passes[i].second];
+    auto d = g_pass_desc.find(passes[i].second);
+    const char* desc = d != g_pass_desc.end() ? d->second.c_str() : "?";
+    if (l8n > 0 && l8n < int(sizeof l8)) {
+      l8n += std::snprintf(l8 + l8n, sizeof l8 - size_t(l8n), " | %s %.1f (%llu, %llu, V%.2f F%.2f)", desc,
+                           ps.ns / 1e6, (unsigned long long)ps.n, (unsigned long long)ps.draws, ps.vs / 1e6,
+                           ps.fs / 1e6);
+    }
+    if (i < 4) {
+      // Per frame: GPU ms, draws, vertex / fragment shader invocations (millions).
+      char o[80];
+      const double nfr = g_frames ? double(g_frames) : 1.0;
+      std::snprintf(o, sizeof o, "%s %.1fMS %.0fD V%.2fM F%.2fM", desc, ps.ns / 1e6 / nfr, ps.draws / nfr,
+                    ps.vs / 1e6 / nfr, ps.fs / 1e6 / nfr);
+      ov[i] = o;
+    }
+  }
+  g_pass.clear();
+  const bool pass_line = g_timers && REXCVAR_GET(gl_gpu_pass_timers);
+  if (pass_line) REXGPU_INFO("{}", l8);
   if (!g_file_tried) {
     g_file_tried = true;
     g_file = std::fopen("sdmc:/oblivion/perf.txt", "a");
   }
   if (g_file) {
     std::fprintf(g_file, "%s\n%s\n%s\n%s\n%s\n%s\n%s\n", l1, l2, l3, l4, l5, l6, l7);
+    if (pass_line) std::fprintf(g_file, "%s\n", l8);
     std::fflush(g_file);
   }
   char o1[64], o2[64], o3[80];
@@ -420,6 +556,7 @@ void Report(uint64_t now, bool swapless) {
   g_lines[0] = o1;
   g_lines[1] = o2;
   g_lines[2] = o3;
+  for (int i = 0; i < 4; ++i) g_lines[3 + i] = ov[i];
   g_last_report = now;
   g_sum_ft = g_max_ft = g_frames = 0;
   for (int i = 0; i < kGpuSegCount; ++i) g_seg_ns[i] = g_seg_n[i] = 0;

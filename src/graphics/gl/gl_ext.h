@@ -49,3 +49,5 @@ extern void (*glMaxShaderCompilerThreadsKHR_)(GLuint count);
 void LoadGlExtensions(void* (*get_proc_address)(const char*));
 
 }  // namespace rex::graphics::gl
+
+#include "gl_shadow.h"

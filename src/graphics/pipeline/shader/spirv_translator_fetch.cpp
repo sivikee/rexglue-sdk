@@ -1407,6 +1407,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
         spv::Id is_any_unsigned =
             builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
+        // features_.fetch_assume_plain: unsigned only, components taken as sampled.
+        const bool fetch_plain = features_.fetch_assume_plain && is_pixel_shader();
+        if (fetch_plain) {
+          is_any_signed = builder_->makeBoolConstant(false);
+          is_any_unsigned = builder_->makeBoolConstant(true);
+        }
 
         // Load the fetch constant word 4, needed unconditionally for LOD
         // biasing, for result exponent biasing, and conditionally for stacked
@@ -1449,12 +1455,18 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->makeFloatConstant(instr.attributes.lod_bias));
         }
 
+        // Implicit LOD + Bias instead of explicit gradients (features_.implicit_lod_bias). 3D / stacked fetches
+        // keep the gradients: the stacked path needs the layer gradient to pick the filter.
+        const bool implicit_lod_bias = features_.implicit_lod_bias && use_computed_lod && is_pixel_shader() &&
+                                       !instr.attributes.use_register_gradients &&
+                                       instr.dimension != xenos::FetchOpDimension::k3DOrStacked;
+
         // Calculate the gradients for sampling the texture if needed.
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        if (use_computed_lod) {
+        if (use_computed_lod && !implicit_lod_bias) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1837,7 +1849,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (implicit_lod_bias) {
+            texture_parameters.bias = lod;
+          } else if (use_computed_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
@@ -1861,7 +1875,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // and gamma) swizzling.
         const bool compact_result =
             features_.compact_texture_result && !features_.image_view_format_swizzle;
-        if (!features_.image_view_format_swizzle) {
+        if (fetch_plain) {
+          uint32_t result_remaining_components = used_result_nonzero_components;
+          uint32_t result_component_index;
+          while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
+            result_remaining_components &= ~(UINT32_C(1) << result_component_index);
+            result[result_component_index] = builder_->createCompositeExtract(
+                sample_result_unsigned, type_float_, result_component_index);
+          }
+        } else if (!features_.image_view_format_swizzle) {
           id_vector_temp_.clear();
           id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTextureSwizzles));
           id_vector_temp_.push_back(builder_->makeIntConstant(fetch_constant_index >> 3));
@@ -1972,7 +1994,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // to gamma-correct.
         spv::Id const_float_2 = builder_->makeFloatConstant(2.0f);
         spv::Id const_float_minus_1 = builder_->makeFloatConstant(-1.0f);
-        if (compact_result) {
+        if (fetch_plain) {
+        } else if (compact_result) {
           // Signedness as one vector pass: signed was already selected while swizzling; unsigned biased and
           // gamma only behind one (rarely taken) branch per fetch.
           // Only the used components, packed: n = 1..4 (a scalar for 1).
@@ -2142,6 +2165,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // Apply the exponent bias from the bits 13:18 of the fetch constant
         // word 4.
+        if (!fetch_plain) {
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
             builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
@@ -2154,6 +2178,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             result[result_component_index] = builder_->createNoContractionBinOp(
                 spv::OpFMul, type_float_, result[result_component_index], result_exponent_bias);
           }
+        }
         }
       }
     }

@@ -100,6 +100,7 @@ void* StreamRing::Alloc(uint32_t size, uint32_t alignment, uint32_t& offset_out)
     for (int s = cur_seg_; s < int(segment_count_); ++s) Leave(s);
     start = 0;
     cur_seg_ = -1;
+    ++wraps_;
   }
   int last = int((start + size - 1) / segment_size_);
   for (int s = cur_seg_ + 1; s <= last; ++s) {

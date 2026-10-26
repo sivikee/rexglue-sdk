@@ -12,8 +12,22 @@
 
 namespace rex::graphics::gl {
 
+REXCVAR_DEFINE_INT32(gl_sm_direct_max_kib, 0, "GPU",
+                     "GL backend: shared memory uploads up to this many KiB use glBufferSubData straight from guest memory "
+                     "instead of the persistent staging ring (0 = always staged)");
+REXCVAR_DEFINE_BOOL(gl_sm_upload_ab, false, "GPU",
+                    "GL backend (diagnostic): alternate staged / direct shared memory uploads of up to 64 KiB and log "
+                    "their cost separately");
+REXCVAR_DEFINE_BOOL(gl_sm_copy_barrier, true, "GPU",
+                    "GL backend: glTextureBarrier after shared memory uploads that issued GPU copies (nouveau: serializes "
+                    "the copy against later draws and invalidates the texture cache the store is read through)");
+REXCVAR_DEFINE_BOOL(gl_sm_lockless_check, true, "GPU",
+                    "GL backend: shared memory requests whose pages are all valid return without taking the guest global "
+                    "lock, sorting or merging");
+
 bool GlSharedMemory::Initialize() {
   InitializeCommon();
+  lockless_valid_check_ = REXCVAR_GET(gl_sm_lockless_check);
   if (REXCVAR_GET(gl_stream_uploads)) {
     if (!staging_.Initialize(32u << 20, 16, GL_COPY_READ_BUFFER, true)) staging_.Shutdown();
     if (staging_.valid()) perf::MemAdd(perf::kMemBuffers, int64_t(32u << 20));
@@ -142,45 +156,85 @@ bool GlSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocation
 
 bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   perf::Scope perf_sm_scope(perf::kSmUploadTicks);
+  perf::Add(perf::kSmUploadCalls);
   perf::Activity act(perf::kPhSmUpload, upload_page_ranges.empty() ? 0 : upload_page_ranges.front().first << page_size_log2(),
                      uint32_t(upload_page_ranges.size()));
-  const bool staged = staging_.valid();
+  uint32_t request_bytes = 0;
+  for (const auto& range : upload_page_ranges) request_bytes += range.second << page_size_log2();
+  bool direct = !staging_.valid();
+  bool measured = false;
+  if (!direct) {
+    if (REXCVAR_GET(gl_sm_upload_ab) && request_bytes <= (64u << 10)) {
+      static uint32_t toggle = 0;
+      direct = (toggle++ & 1) != 0;
+      measured = true;
+    } else if (request_bytes <= uint32_t(std::max(0, REXCVAR_GET(gl_sm_direct_max_kib))) * 1024u) {
+      direct = true;
+    }
+  }
+  struct AbTimer {
+    bool on, direct;
+    uint32_t bytes;
+    uint64_t t0 = armGetSystemTick();
+    ~AbTimer() {
+      if (!on) return;
+      perf::Add(direct ? perf::kSmAbDirectCalls : perf::kSmAbStagedCalls);
+      perf::Add(direct ? perf::kSmAbDirectBytes : perf::kSmAbStagedBytes, bytes);
+      perf::Add(direct ? perf::kSmAbDirectTicks : perf::kSmAbStagedTicks, armGetSystemTick() - t0);
+    }
+  } ab_timer{measured, direct, request_bytes};
+  const bool staged = !direct;
   uint8_t* block = nullptr;  // current staging block
   uint32_t block_off = 0, block_used = 0, block_cap = 0;
   uint32_t total_remaining = 0;
-  if (staged) {
-    for (const auto& range : upload_page_ranges) total_remaining += range.second << page_size_log2();
-  }
+  if (staged) total_remaining = request_bytes;
+  // Destination of the copy being collected: consecutive source bytes that are also consecutive in the store (granules
+  // allocated one after the other) are copied with one glCopyBufferSubData.
+  GLintptr run_src = 0, run_dst = 0;
+  uint32_t run_len = 0;
+  auto flush_run = [&]() {
+    if (run_len) {
+      glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, run_src, run_dst, run_len);
+      perf::Add(perf::kSmUploadCopies);
+      run_len = 0;
+    }
+  };
   for (const auto& range : upload_page_ranges) {
     uint32_t start = range.first << page_size_log2();
     uint32_t length = range.second << page_size_log2();
+    flush_run();  // (the hook below may rebind the copy targets)
     if (pre_read_hook_) pre_read_hook_(start, length);
     MakeRangeValid(start, length, false);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
+    if (staged) glBindBuffer(GL_COPY_READ_BUFFER, staging_.buffer());
     while (length) {
       uint32_t g = start >> kGranuleLog2;
       uint32_t in = start & (kGranuleSize - 1);
       uint32_t part = std::min(length, kGranuleSize - in);
       if (g >= kGranuleCount || page_table_[g] == 0xFFFFFFFFu) {
         REXGPU_ERROR("GL shared memory: upload outside resident granule (address {:08X}+{:X})", start, part);
-        if (staged) staging_.Commit();
+        if (staged) {
+          flush_run();
+          staging_.Commit();
+        }
         return false;
       }
       perf::Add(perf::kSmUploadBytes, part);
       GLintptr dst_offset = GLintptr(page_table_[g]) * 4 + in;
       if (!staged) {
-        glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
+        perf::Add(perf::kSmUploadCopies);
         glBufferSubData(GL_COPY_WRITE_BUFFER, dst_offset, part, memory().TranslatePhysical(start));
       } else {
         const uint8_t* src = memory().TranslatePhysical(start);
         uint32_t left = part;
         while (left) {
           if (!block || block_used >= block_cap) {
+            flush_run();
             block_cap = std::min(total_remaining, staging_.segment_size());
             block_used = 0;
             block = static_cast<uint8_t*>(staging_.Alloc(block_cap, 16, block_off));
             if (!block) {
               // Staging failed (should not happen): direct upload of the rest.
-              glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
               glBufferSubData(GL_COPY_WRITE_BUFFER, dst_offset + (part - left), left, src + (part - left));
               total_remaining -= left;
               left = 0;
@@ -189,11 +243,19 @@ bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t
             }
           }
           uint32_t n = std::min(left, block_cap - block_used);
-          std::memcpy(block + block_used, src + (part - left), n);
-          glBindBuffer(GL_COPY_READ_BUFFER, staging_.buffer());
-          glBindBuffer(GL_COPY_WRITE_BUFFER, store_);
-          glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, block_off + block_used,
-                              dst_offset + (part - left), n);
+          {
+            perf::Scope perf_memcpy_scope(perf::kSmMemcpyTicks);
+            std::memcpy(block + block_used, src + (part - left), n);
+          }
+          const GLintptr dst = dst_offset + (part - left);
+          if (run_len && run_src + run_len == GLintptr(block_off + block_used) && run_dst + run_len == dst) {
+            run_len += n;
+          } else {
+            flush_run();
+            run_src = GLintptr(block_off + block_used);
+            run_dst = dst;
+            run_len = n;
+          }
           block_used += n;
           total_remaining -= n;
           left -= n;
@@ -204,9 +266,11 @@ bool GlSharedMemory::UploadRanges(const std::vector<std::pair<uint32_t, uint32_t
     }
   }
   if (staged) {
+    flush_run();
     staging_.Commit();
     glBindBuffer(GL_COPY_READ_BUFFER, 0);
   }
+  if (glTextureBarrier_ && REXCVAR_GET(gl_sm_copy_barrier)) glTextureBarrier_();
   return true;
 }
 
@@ -239,13 +303,10 @@ bool GlSharedMemory::StoreOffset(uint32_t address, GLintptr& offset, uint32_t& b
 
 void GlSharedMemory::BindStorageBuffers(uint32_t first_binding) {
   (void)first_binding;
-  glActiveTexture(GL_TEXTURE0 + kSharedMemoryTboUnitBase);
-  glBindTexture(GL_TEXTURE_BUFFER, store_tbo_);
-  glBindSampler(kSharedMemoryTboUnitBase, 0);
-  glActiveTexture(GL_TEXTURE0 + kSharedMemoryTboUnitBase + 1);
-  glBindTexture(GL_TEXTURE_BUFFER, pt_tbo_);
-  glBindSampler(kSharedMemoryTboUnitBase + 1, 0);
-  glActiveTexture(GL_TEXTURE0);
+  shadow::BindTexUnit(kSharedMemoryTboUnitBase, GL_TEXTURE_BUFFER, store_tbo_);
+  shadow::BindSamplerUnit(kSharedMemoryTboUnitBase, 0);
+  shadow::BindTexUnit(kSharedMemoryTboUnitBase + 1, GL_TEXTURE_BUFFER, pt_tbo_);
+  shadow::BindSamplerUnit(kSharedMemoryTboUnitBase + 1, 0);
 }
 
 }  // namespace rex::graphics::gl

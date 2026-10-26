@@ -49,11 +49,18 @@ REXCVAR_DEFINE_BOOL(gl_resolve_gpu_copy, true, "GPU", "GL backend: textures / fr
 REXCVAR_DEFINE_INT32(gl_resolve_max_age, 3, "GPU", "GL backend: a pending async resolve is written to guest memory after at most this many swaps");
 REXCVAR_DEFINE_BOOL(gl_hash_validate, true, "GPU", "GL backend: vertex / index buffers in the shared memory store are re-validated by content hash (persistent across frames) instead of being re-uploaded every frame / every draw");
 REXCVAR_DEFINE_BOOL(gl_state_cache, true, "GPU", "GL backend: skip redundant raster state GL calls");
+REXCVAR_DEFINE_INT32(gl_vb_stable_interval, 1, "GPU", "GL backend: a vertex / index buffer range whose contents were unchanged for 16 frames is re-hashed only every N frames (1 = hash on every draw)");
+REXCVAR_DEFINE_BOOL(gl_state_shadow, true, "GPU", "GL backend: skip redundant texture unit / sampler / program / VAO / element buffer binds in the draw path (Mesa takes a mutex + hash lookup per name-based bind)");
+REXCVAR_DEFINE_BOOL(gl_ubo_fetch_prefix, false, "GPU", "GL backend: write only the fetch constant groups the draw's shaders use into the fetch uniform block");
+REXCVAR_DEFINE_BOOL(gl_ubo_skip_unchanged, true, "GPU", "GL backend: do not re-upload / re-bind a draw's uniform block when its contents equal the previous draw's");
 REXCVAR_DEFINE_BOOL(gl_gpu_resolve, true, "GPU", "GL backend: resolves (EDRAM copies) are done by a compute shader into the shared memory store; guest memory is written back lazily (false = CPU readback + conversion)");
 REXCVAR_DEFINE_BOOL(gl_gpu_front, true, "GPU", "GL backend: the front buffer is detiled / endian swapped by a fragment shader reading the shared memory store (false = other paths)");
 REXCVAR_DEFINE_BOOL(gl_cpu_frontbuffer, false, "GPU", "GL backend: force the old CPU detile + upload of the front buffer (debugging)");
 REXCVAR_DEFINE_INT32(gl_resolve_log, 12, "GPU", "GL backend: log budget for resolve configurations and failed GPU-copy lookups (0 = off)")
 ;
+REXCVAR_DEFINE_BOOL(gl_gpu_pass_timers, true, "GPU",
+                    "GL backend: GPU time per render pass (consecutive draws into the same targets) in the perf "
+                    "report and the overlay (needs gl_gpu_timers)");
 REXCVAR_DEFINE_BOOL(gl_gpu_timers, true, "GPU", "GL backend: GPU timestamp queries + frame fences for the perf report (GPU-side present / resolve time, GPU lag)");
 REXCVAR_DEFINE_BOOL(gl_lazy_resolve, true, "GPU", "GL backend: resolves with an exact GPU snapshot defer the compute write into the shared memory store until the range is read (store / guest memory) or ages out; superseded ones are never written");
 REXCVAR_DEFINE_BOOL(gl_present_snapshot, true, "GPU", "GL backend: present the front buffer straight from the resolve snapshot when one matches (plain textured blit) before trying the store detile blit / CPU path");
@@ -368,6 +375,14 @@ struct GlCommandProcessor::Impl {
   StreamRing tex_ring;    // pixel-unpack streaming (textures, front buffer)
   bool stream = false;
   uint32_t ubo_align = 256;
+  // gl_ubo_skip_unchanged: contents + size of the five uniform blocks as last uploaded (their binding still points at them
+  // as long as the stream ring has not wrapped).
+  struct UboShadow {
+    bool valid[5] = {};
+    uint32_t size[5] = {};
+    std::vector<uint8_t> data[5];
+    uint64_t epoch = ~0ull;
+  } ubo_shadow;
   GLuint blit_array_program = 0;
   GLint blit_array_sel_loc = -1;
   GLuint blit_store_program = 0;
@@ -378,6 +393,7 @@ struct GlCommandProcessor::Impl {
   struct BufferHash {
     uint64_t hash;
     uint32_t swap;
+    uint32_t stable;  // frames in a row the hash was unchanged
   };
   std::unordered_map<uint64_t, BufferHash> buffer_hashes;
   uint32_t texture_bound_mask = 0;
@@ -825,34 +841,87 @@ void GlCommandProcessor::UploadAndBindConstants(const Shader* vertex_shader, con
   struct Item {
     uint32_t binding;
     const void* data;
-    uint32_t size;
+    uint32_t size;  // bound size
+    uint32_t copy;  // bytes written (<= size: the part of the block the shader can read)
   };
+  // Fetch constants: only the groups up to the highest one the shaders use are written (texture fetch constants are 6
+  // dwords each, vertex fetch constants 2 dwords: three per group).
+  uint32_t fetch_copy = sizeof(uint32_t) * 6 * 32;
+  if (REXCVAR_GET(gl_ubo_fetch_prefix)) {
+    uint32_t groups = 0;
+    uint32_t tex_mask = static_cast<const GlShader*>(vertex_shader)->GetUsedTextureMaskAfterTranslation();
+    if (pixel_shader) tex_mask |= static_cast<const GlShader*>(pixel_shader)->GetUsedTextureMaskAfterTranslation();
+    if (tex_mask) groups = 32 - uint32_t(__builtin_clz(tex_mask));
+    const Shader::ConstantRegisterMap& vmap = vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < rex::countof(vmap.vertex_fetch_bitmap); ++i) {
+      if (vmap.vertex_fetch_bitmap[i]) {
+        const uint32_t top = i * 32 + (31 - uint32_t(__builtin_clz(vmap.vertex_fetch_bitmap[i])));
+        groups = std::max(groups, top / 3 + 1);
+      }
+    }
+    fetch_copy = std::min(fetch_copy, std::max(groups, 1u) * 24u);
+  }
   const Item items[5] = {
-      {kUboBindingSystem, &system_constants_, uint32_t(sizeof(system_constants_))},
-      {kUboBindingFloatVertex, floats_vs.data(), uint32_t(floats_vs.size() * 4)},
-      {kUboBindingFloatPixel, floats_ps.data(), uint32_t(floats_ps.size() * 4)},
-      {kUboBindingBoolLoop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], uint32_t(sizeof(uint32_t) * (8 + 32))},
-      {kUboBindingFetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], uint32_t(sizeof(uint32_t) * 6 * 32)},
+      {kUboBindingSystem, &system_constants_, uint32_t(sizeof(system_constants_)), uint32_t(sizeof(system_constants_))},
+      {kUboBindingFloatVertex, floats_vs.data(), uint32_t(floats_vs.size() * 4), uint32_t(floats_vs.size() * 4)},
+      {kUboBindingFloatPixel, floats_ps.data(), uint32_t(floats_ps.size() * 4), uint32_t(floats_ps.size() * 4)},
+      {kUboBindingBoolLoop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], uint32_t(sizeof(uint32_t) * (8 + 32)), uint32_t(sizeof(uint32_t) * (8 + 32))},
+      {kUboBindingFetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], uint32_t(sizeof(uint32_t) * 6 * 32), fetch_copy},
   };
   const uint32_t align = std::max<uint32_t>(impl_->ubo_align, 16);
   auto aligned_size = [&](uint32_t size) { return (size + 255) & ~255u; };
   if (impl_->stream) {
-    // One contiguous streamed block for all five uniform ranges (never touches memory the GPU still reads).
+    // One contiguous streamed block for the uniform ranges that changed since the previous draw (never touches memory
+    // the GPU still reads). The others stay bound to their earlier ring allocation, which nothing overwrites until the
+    // ring wraps.
+    Impl::UboShadow& sh = impl_->ubo_shadow;
+    const bool skip = REXCVAR_GET(gl_ubo_skip_unchanged);
+    if (sh.epoch != impl_->const_ring.wraps() || !skip) {
+      for (bool& v : sh.valid) v = false;
+      sh.epoch = impl_->const_ring.wraps();
+    }
+    bool changed[5];
     uint32_t total = 0;
-    for (const Item& it : items) total += (aligned_size(it.size) + align - 1) / align * align;
+    for (int i = 0; i < 5; ++i) {
+      const Item& it = items[i];
+      changed[i] = !sh.valid[i] || sh.size[i] != it.copy || std::memcmp(sh.data[i].data(), it.data, it.copy) != 0;
+      if (changed[i]) total += (aligned_size(it.size) + align - 1) / align * align;
+    }
+    if (!total) return;
     uint32_t base = 0;
     uint8_t* dst = static_cast<uint8_t*>(impl_->const_ring.Alloc(total, align, base));
+    if (dst && sh.epoch != impl_->const_ring.wraps()) {
+      // Alloc wrapped the ring: everything bound earlier may be overwritten from now on, so upload the unchanged ones
+      // again too (the first allocation is simply abandoned).
+      for (bool& v : sh.valid) v = false;
+      sh.epoch = impl_->const_ring.wraps();
+      for (int i = 0; i < 5; ++i) {
+        if (!changed[i]) {
+          changed[i] = true;
+          total += (aligned_size(items[i].size) + align - 1) / align * align;
+        }
+      }
+      dst = static_cast<uint8_t*>(impl_->const_ring.Alloc(total, align, base));
+    }
     if (dst) {
       uint32_t off = 0;
-      for (const Item& it : items) {
-        std::memcpy(dst + off, it.data, it.size);
-        glBindBufferRange(GL_UNIFORM_BUFFER, it.binding, impl_->const_ring.buffer(), base + off, aligned_size(it.size));
+      for (int i = 0; i < 5; ++i) {
+        if (!changed[i]) continue;
+        const Item& it = items[i];
+        std::memcpy(dst + off, it.data, it.copy);
+        glad_glBindBufferRange(GL_UNIFORM_BUFFER, it.binding, impl_->const_ring.buffer(), base + off, aligned_size(it.size));
         off += (aligned_size(it.size) + align - 1) / align * align;
+        if (skip) {
+          sh.data[i].assign(static_cast<const uint8_t*>(it.data), static_cast<const uint8_t*>(it.data) + it.copy);
+          sh.size[i] = it.copy;
+          sh.valid[i] = true;
+        }
       }
       impl_->const_ring.Commit();
       return;
     }
   }
+  for (bool& v : impl_->ubo_shadow.valid) v = false;
   for (const Item& it : items) {
     uint32_t aligned = aligned_size(it.size);
     if (impl_->ubo_ring_offset + aligned > Impl::kUboRingSize) {
@@ -1029,6 +1098,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   }
   perf::Add(perf::kDraws);
   perf::Scope perf_draw_scope(perf::kDrawTicks);
+  shadow::g.enabled = REXCVAR_GET(gl_state_shadow);
   if (!REXCVAR_GET(gl_draw)) {
     return true;
   }
@@ -1165,14 +1235,15 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   const GlslShader* vs_glsl = vs_translation->glsl();
   const GlslShader* ps_glsl = ps_translation ? ps_translation->glsl() : nullptr;
   perf::Activity bind_activity(perf::kPhBindTextures);
-  impl_->texture_cache->BindStage(vs_glsl->samplers, vertex_shader->GetTextureBindingsAfterTranslation(),
-                                  vertex_shader->GetSamplerBindingsAfterTranslation(), impl_->fetch_info);
+  impl_->texture_cache->PrepareStage(vs_glsl->samplers, vertex_shader->GetTextureBindingsAfterTranslation(),
+                                     vertex_shader->GetSamplerBindingsAfterTranslation(), impl_->fetch_info);
   uint32_t used_texture_mask = vertex_shader->GetUsedTextureMaskAfterTranslation();
   if (pixel_shader && ps_glsl) {
-    impl_->texture_cache->BindStage(ps_glsl->samplers, pixel_shader->GetTextureBindingsAfterTranslation(),
-                                    pixel_shader->GetSamplerBindingsAfterTranslation(), impl_->fetch_info);
+    impl_->texture_cache->PrepareStage(ps_glsl->samplers, pixel_shader->GetTextureBindingsAfterTranslation(),
+                                       pixel_shader->GetSamplerBindingsAfterTranslation(), impl_->fetch_info);
     used_texture_mask |= pixel_shader->GetUsedTextureMaskAfterTranslation();
   }
+  impl_->texture_cache->CommitBinds();
 
   bool log_this = (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12);
   auto chk = [&](const char* what) { if (log_this) { GLenum e = glGetError(); if (e != GL_NO_ERROR) REXGPU_WARN("GL draw #{}: error {} after {}", draw_count_, GlErrorString(e), what); } };
@@ -1180,7 +1251,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
   UpdateSystemConstants(primitive_polygonal, ppr, viewport_info, used_texture_mask, normalized_depth_control);
   { static int isp_logged = 0; if (isp_logged++ < 3) REXGPU_INFO("GL: program {} glIsProgram={} (async)", program->program, int(glIsProgram(program->program))); }
   chk("sysconst");
-  glUseProgram(program->program);
+  shadow::UseProgram(program->program);
   if (log_this) { static int up_logged = 0; GLenum e = glGetError(); if (e != GL_NO_ERROR && up_logged++ < 6) { GLint ls = -1, att = -1; glGetProgramiv(program->program, GL_LINK_STATUS, &ls); glGetProgramiv(program->program, GL_ATTACHED_SHADERS, &att); std::string ex; for (GLuint i = 1; i <= 12; ++i) ex += glIsProgram(i) ? "1" : "0"; REXGPU_WARN("GL: glUseProgram({}) error {} link={} attached={} isprog={} exists[1..12]={}", program->program, GlErrorString(e), ls, att, int(glIsProgram(program->program)), ex); } }
   UploadAndBindConstants(vertex_shader, pixel_shader);
   chk("ubo");
@@ -1214,12 +1285,8 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     default:
       return fail("unsupported_host_primitive");
   }
-  glBindVertexArray(impl_->draw_vao);
-  if (ppr.host_primitive_reset_enabled) {
-    glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
-  } else {
-    glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
-  }
+  shadow::BindVertexArray(impl_->draw_vao);
+  shadow::PrimitiveRestartFixed(ppr.host_primitive_reset_enabled);
 
   if ((REXCVAR_GET(gl_log_draws) > 0 && int(draw_count_) <= REXCVAR_GET(gl_log_draws)) || (REXCVAR_GET(gl_log_draws_from) > 0 && int(draw_count_) >= REXCVAR_GET(gl_log_draws_from) && int(draw_count_) < REXCVAR_GET(gl_log_draws_from) + 12)) {
     REXGPU_INFO(
@@ -1285,7 +1352,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
           // dynamic particle geometry, e.g. torch flames): stream them from guest memory, which the store
           // mirrors, instead of dropping the draw.
           if (!impl_->index_stream) glGenBuffers(1, &impl_->index_stream);
-          glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, impl_->index_stream);
+          shadow::BindElementArray(impl_->index_stream);
           glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(bytes), memory_->TranslatePhysical(ppr.guest_index_base),
                        GL_STREAM_DRAW);
           buffer = impl_->index_stream;
@@ -1307,7 +1374,7 @@ bool GlCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t inde
     if (!buffer) {
       return fail("index_buffer_null");
     }
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffer);
+    shadow::BindElementArray(buffer);
     glDrawElements(mode, GLsizei(ppr.host_draw_vertex_count),
                    ppr.host_index_format == xenos::IndexFormat::kInt16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
                    reinterpret_cast<const void*>(offset));
@@ -1391,7 +1458,7 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
   constexpr int kScale = 2, kCell = 6 * kScale, kLineH = 8 * kScale, kPad = 3;
   size_t max_chars = 0;
   int nlines = 0;
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < perf::kOverlayLines; ++i) {
     if (lines[i].empty()) continue;
     ++nlines;
     max_chars = std::max(max_chars, lines[i].size());
@@ -1400,7 +1467,8 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
   if (!impl_->overlay_tex[0]) glGenTextures(2, impl_->overlay_tex);
   glActiveTexture(GL_TEXTURE0);
   glBindSampler(0, 0);
-  std::string key = lines[0] + "|" + lines[1] + "|" + lines[2];
+  std::string key;
+  for (int i = 0; i < perf::kOverlayLines; ++i) key += lines[i] + "|";
   if (impl_->overlay_w != w || impl_->overlay_h != h) {
     for (int k = 0; k < 2; ++k) {
       glBindTexture(GL_TEXTURE_2D, impl_->overlay_tex[k]);
@@ -1421,7 +1489,7 @@ void GlCommandProcessor::DrawFpsOverlay(int sw, int sh) {
     impl_->overlay_text_cached = key;
     std::vector<uint32_t> buf(size_t(w) * h, 0xFF000000u);  // opaque black box, row 0 = top
     int line_y = kPad;
-    for (int li = 0; li < 3; ++li) {
+    for (int li = 0; li < perf::kOverlayLines; ++li) {
       if (lines[li].empty()) continue;
       for (size_t ci = 0; ci < lines[li].size(); ++ci) {
         const uint8_t* g = OverlayGlyph(lines[li][ci]);
@@ -1465,16 +1533,28 @@ void GlCommandProcessor::ValidateBufferByHash(uint32_t address, uint32_t size) {
   const uint64_t key = (uint64_t(address) << 32) | size;
   auto it = map.find(key);
   if (it != map.end() && size > (256u << 10) && it->second.swap == swap_count_) return;
+  // A range whose contents were identical in 16 consecutive frames is re-hashed once per frame at most, and then only
+  // every gl_vb_stable_interval frames (staggered by key), like stable textures (1 = hash on every draw).
+  const uint32_t interval = uint32_t(std::max(1, REXCVAR_GET(gl_vb_stable_interval)));
+  if (it != map.end() && interval > 1 && it->second.stable >= 16) {
+    if (it->second.swap == swap_count_) return;
+    if (swap_count_ - it->second.swap < interval && ((swap_count_ + uint32_t(key >> 7)) % interval) != 0) return;
+  }
   const uint64_t hash = XXH3_64bits(memory_->TranslatePhysical(address), size);
   if (it == map.end()) {
-    map.emplace(key, Impl::BufferHash{hash, swap_count_});
+    map.emplace(key, Impl::BufferHash{hash, swap_count_, 0});
     impl_->shared_memory->MemoryInvalidationCallback(address, size, true);
     return;
   }
-  it->second.swap = swap_count_;
-  if (it->second.hash != hash) {
-    it->second.hash = hash;
+  Impl::BufferHash& bh = it->second;
+  const bool new_frame = bh.swap != swap_count_;
+  bh.swap = swap_count_;
+  if (bh.hash != hash) {
+    bh.hash = hash;
+    bh.stable = 0;
     impl_->shared_memory->MemoryInvalidationCallback(address, size, true);
+  } else if (new_frame && bh.stable < 0xFFFF) {
+    ++bh.stable;
   }
 }
 
@@ -1638,6 +1718,10 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
                                    uint32_t frontbuffer_height) {
   ++swap_count_;
   perf::Activity swap_activity(perf::kPhSwap, swap_count_);
+  perf::GpuPassSwitch(0);  // ends the frame's last render pass (present work is timed separately)
+  perf::Add(perf::kShadowSkipped, shadow::g.skipped);
+  perf::Add(perf::kShadowIssued, shadow::g.issued);
+  shadow::g.skipped = shadow::g.issued = 0;
   perf::OnSwap();
   if (impl_->pipeline_cache) impl_->pipeline_cache->OnFrame();
   perf::Scope perf_swap_scope(perf::kSwapTicks);
@@ -1703,6 +1787,7 @@ void GlCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffe
   glDisable(GL_DEPTH_CLAMP);
   glDisable(GL_POLYGON_OFFSET_FILL);
   glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+  shadow::DirtyRestart();
   glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
   impl_->raster_cache.Invalidate();
   float pulse = float(swap_count_ & 63) / 63.0f;

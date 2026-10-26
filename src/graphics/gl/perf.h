@@ -19,7 +19,7 @@ enum Counter : int {
   kLinkCount, kLinkTicks,                       // GL compile/link issue + finish (GL thread)
   kTexUploads, kTexUploadBytes, kTexUploadTicks,
   kTexHashBytes, kTexHashTicks,
-  kSmUploadBytes, kSmUploadTicks,
+  kSmUploadBytes, kSmUploadTicks, kSmUploadCalls, kSmUploadCopies,
   kFinishTicks,
   kConstUpTicks,                                // per-draw uniform upload (nested inside draw ticks)
   kResolveConvTicks, kResolveGpuHits, kResolveFrontHits,  // deferred resolve CPU conversion, GPU-copy consumers
@@ -31,6 +31,7 @@ enum Counter : int {
   kResolveSuperseded, kGpuResolveTicks,
   kLazyDeferred, kLazyMaterialized,             // lazy GPU resolves: compute write deferred / run later on demand
   kFrontDropped,                                // shown lazy front buffers aged out without a write-back
+  kResolveGuestReused,                          // write-backs skipped: the game reused the memory meanwhile
   // IssueSwap split (CPU wall time of each sub-step on the GPU thread)
   kSwapPreTicks, kSwapClearTicks, kSwapBlitTicks, kSwapMiscTicks, kSwapOverlayTicks, kSwapPostTicks,
   kSwapCpuTicks,      // CPU time the GPU thread actually consumed inside IssueSwap (svc ThreadTickCount)
@@ -44,6 +45,8 @@ enum Counter : int {
   kWLinkCount, kWLinkTicks,        // compile + link done on the compile thread (shared context), not blocking draws
   kSkippedDraws,                   // draws skipped because their program was not ready yet
   kHandoverCount,                  // compile-thread programs that became usable on the GPU thread
+  kSmMemcpyTicks, kSmAbDirectCalls, kSmAbDirectBytes, kSmAbDirectTicks, kSmAbStagedCalls, kSmAbStagedBytes, kSmAbStagedTicks,
+  kShadowSkipped, kShadowIssued,   // draw-path GL binds skipped / issued by the state shadow
   kDeadlineLinkCount, kDeadlineLinkTicks,  // programs linked on the GPU thread after waiting > gl_program_max_wait_ms
   kCounterCount
 };
@@ -61,7 +64,7 @@ struct Scope {
 // Call once per presented frame (start of the swap). Emits a report to the log and
 // sdmc:/oblivion/perf.txt about once per second.
 void OnSwap();
-// Text of the last report for the on-screen overlay (array of 3 strings).
+// Text of the last report for the on-screen overlay (array of kOverlayLines strings).
 const std::string* OverlayLines();
 
 // ---- GPU-side timing (GL_TIMESTAMP queries) and frame completion fences; GL thread only ----
@@ -91,6 +94,14 @@ void FrameFenceIssue();
 void FrameFencePoll();
 // Collects available query results (call once per swap).
 void GpuPoll();
+// Per render pass GPU time (a pass = consecutive draws into the same render target set). Call before each draw
+// with the bound target set's key; a changed key ends the running pass (GPU timestamps around it, plus vertex /
+// fragment shader invocation counts with ARB_pipeline_statistics_query). key 0 ends the
+// running pass without starting one (swap). Returns true when the key has no description yet (GpuPassDescribe).
+bool GpuPassSwitch(uint64_t key);
+void GpuPassDescribe(uint64_t key, const std::string& desc);
+// Number of overlay lines (OverlayLines()).
+constexpr int kOverlayLines = 7;
 // Waits on a fence like the backend's loops (GL_SYNC_FLUSH_COMMANDS_BIT, 1 s slices) and warns about long waits.
 void FenceWaitLogged(void* sync, const char* who);
 // CPU time consumed by the calling thread (svcGetInfo ThreadTickCount), in system ticks; 0 if unavailable.
@@ -148,6 +159,9 @@ inline void NotePresentAcquired() {}
 inline void FrameFenceIssue() {}
 inline void FrameFencePoll() {}
 inline void GpuPoll() {}
+inline bool GpuPassSwitch(uint64_t) { return false; }
+inline void GpuPassDescribe(uint64_t, const std::string&) {}
+constexpr int kOverlayLines = 7;
 inline void FenceWaitLogged(void*, const char*) {}
 inline uint64_t ThreadCpuTicks() { return 0; }
 inline void Tick() {}

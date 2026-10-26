@@ -21,6 +21,10 @@
 REXCVAR_DEFINE_INT32(gl_tex_stable_interval, 4, "GPU",
                      "GL backend: a texture whose contents did not change for 16 checks is content-checked only every N "
                      "frames (1 = every frame)");
+REXCVAR_DEFINE_BOOL(gl_tex_memo, true, "GPU",
+                    "GL backend: remember the texture a fetch constant resolved to for the rest of the frame while its six "
+                    "words and the resolve snapshots are unchanged (skips TextureInfo::Prepare, the snapshot lookup and the "
+                    "texture map lookup)");
 REXCVAR_DEFINE_BOOL(gl_snapshot_subrect, true, "GPU",
                     "GL backend: textures that are the top-left part of a larger GPU resolve snapshot use a GPU copy of "
                     "that part instead of a synchronous readback through guest memory (HDR luminance chain)");
@@ -683,10 +687,33 @@ GLuint GlTextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
   return s;
 }
 
-void GlTextureCache::BindStage(const std::vector<CombinedSampler>& combined,
-                               const std::vector<SpirvShader::TextureBinding>& texture_bindings,
-                               const std::vector<SpirvShader::SamplerBinding>& sampler_bindings,
-                               FetchInfo fetch_info[32]) {
+GlTextureCache::Texture* GlTextureCache::GetTextureMemo(uint32_t fetch_constant, const xenos::xe_gpu_texture_fetch_t& fetch) {
+  static_assert(sizeof(xenos::xe_gpu_texture_fetch_t) == sizeof(FetchMemo::dw), "fetch constant size");
+  if (!REXCVAR_GET(gl_tex_memo) || fetch_constant >= 32 || !render_targets_) {
+    return GetTexture(fetch);
+  }
+  FetchMemo& m = memo_[fetch_constant];
+  const uint64_t gen = render_targets_->snapshot_generation();
+  if (m.tex && m.frame == frame_ && m.gen == gen && m.tex->valid && m.tex->checked_frame == frame_ &&
+      std::memcmp(m.dw, &fetch, sizeof(m.dw)) == 0) {
+    return m.tex;
+  }
+  Texture* tex = GetTexture(fetch);
+  if (tex && tex != &snapshot_tex_ && tex->valid && tex->checked_frame == frame_) {
+    std::memcpy(m.dw, &fetch, sizeof(m.dw));
+    m.frame = frame_;
+    m.gen = gen;
+    m.tex = tex;
+  } else {
+    m.tex = nullptr;
+  }
+  return tex;
+}
+
+void GlTextureCache::PrepareStage(const std::vector<CombinedSampler>& combined,
+                                  const std::vector<SpirvShader::TextureBinding>& texture_bindings,
+                                  const std::vector<SpirvShader::SamplerBinding>& sampler_bindings,
+                                  FetchInfo fetch_info[32]) {
   for (const CombinedSampler& cs : combined) {
     if (cs.texture_binding < 0 || size_t(cs.texture_binding) >= texture_bindings.size()) {
       continue;
@@ -711,7 +738,7 @@ void GlTextureCache::BindStage(const std::vector<CombinedSampler>& combined,
     }
     Texture* tex = nullptr;
     if (fetch.type == xenos::FetchConstantType::kTexture) {
-      tex = GetTexture(fetch);
+      tex = GetTextureMemo(tb.fetch_constant, fetch);
       if (tex && tex->target != target) {
         tex = nullptr;
       }
@@ -720,8 +747,6 @@ void GlTextureCache::BindStage(const std::vector<CombinedSampler>& combined,
     fi.swizzled_signs = texture_util::SwizzleSigns(fetch);
     fi.host_swizzle = tex ? GuestToHostSwizzle(fetch.swizzle, tex->host_swizzle)
                           : GuestToHostSwizzle(fetch.swizzle, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA);
-    glActiveTexture(GL_TEXTURE0 + cs.unit);
-    glBindTexture(target, tex ? tex->id : dummy);
     GLuint sampler = dummy_sampler_;
     if (tex) {
       const SpirvShader::SamplerBinding* sb = nullptr;
@@ -730,8 +755,31 @@ void GlTextureCache::BindStage(const std::vector<CombinedSampler>& combined,
       }
       sampler = GetSampler(fetch, sb);
     }
-    glBindSampler(cs.unit, sampler);
+    if (pending_binds_count_ >= kMaxPendingBinds) {
+      CommitBinds();
+    }
+    // (snapshot_tex_ is rewritten by the next snapshot lookup: copy what the bind needs now.)
+    pending_binds_[pending_binds_count_++] = PendingBind{target, tex ? tex->id : dummy, sampler, cs.unit};
   }
+}
+
+// Texture uploads, render target flushes and snapshot copies triggered by the lookups bind textures themselves (on
+// whatever unit is active): all lookups of a draw are done before its units are bound.
+void GlTextureCache::CommitBinds() {
+  for (uint32_t i = 0; i < pending_binds_count_; ++i) {
+    const PendingBind& b = pending_binds_[i];
+    shadow::BindTexUnit(b.unit, b.target, b.texture);
+    shadow::BindSamplerUnit(b.unit, b.sampler);
+  }
+  pending_binds_count_ = 0;
+}
+
+void GlTextureCache::BindStage(const std::vector<CombinedSampler>& combined,
+                               const std::vector<SpirvShader::TextureBinding>& texture_bindings,
+                               const std::vector<SpirvShader::SamplerBinding>& sampler_bindings,
+                               FetchInfo fetch_info[32]) {
+  PrepareStage(combined, texture_bindings, sampler_bindings, fetch_info);
+  CommitBinds();
 }
 
 }  // namespace rex::graphics::gl

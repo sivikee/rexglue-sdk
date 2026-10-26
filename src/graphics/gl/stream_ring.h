@@ -26,6 +26,8 @@ class StreamRing {
   GLuint buffer() const { return buffer_; }
   uint32_t segment_size() const { return segment_size_; }
   bool persistent() const { return persistent_; }
+  // Number of times the allocation head wrapped to the start (older allocations may be overwritten after it changes).
+  uint64_t wraps() const { return wraps_; }
 
   // Reserves size bytes (size <= segment_size). Returns a CPU pointer to write to (valid until the next
   // Commit()) and the offset in the buffer. Blocks only if the GPU is still reading the segment.
@@ -42,6 +44,7 @@ class StreamRing {
   GLenum target_ = GL_ARRAY_BUFFER;
   uint32_t size_ = 0, segment_size_ = 0, segment_count_ = 0;
   uint32_t head_ = 0;
+  uint64_t wraps_ = 0;
   int cur_seg_ = 0;
   bool persistent_ = false;
   uint8_t* mapped_ = nullptr;

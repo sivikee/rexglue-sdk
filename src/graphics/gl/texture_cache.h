@@ -48,6 +48,13 @@ class GlTextureCache {
                  const std::vector<SpirvShader::TextureBinding>& texture_bindings,
                  const std::vector<SpirvShader::SamplerBinding>& sampler_bindings,
                  FetchInfo fetch_info[32]);
+  // Split form of BindStage for a draw with several stages: PrepareStage (texture lookups, uploads, fetch info) for every
+  // stage first, then one CommitBinds (the GL binds), so an upload in a later stage cannot clobber a unit bound for an
+  // earlier one.
+  void PrepareStage(const std::vector<CombinedSampler>& combined,
+                    const std::vector<SpirvShader::TextureBinding>& texture_bindings,
+                    const std::vector<SpirvShader::SamplerBinding>& sampler_bindings, FetchInfo fetch_info[32]);
+  void CommitBinds();
 
  private:
   struct Texture {
@@ -71,9 +78,27 @@ class GlTextureCache {
   };
 
   Texture* GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
+  Texture* GetTextureMemo(uint32_t fetch_constant, const xenos::xe_gpu_texture_fetch_t& fetch);
   bool Upload(Texture& texture);
   GLuint GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
                     const SpirvShader::SamplerBinding* binding);
+
+  struct FetchMemo {
+    uint32_t dw[6] = {};
+    uint64_t frame = UINT64_MAX;
+    uint64_t gen = 0;
+    Texture* tex = nullptr;
+  };
+  FetchMemo memo_[32];
+  struct PendingBind {
+    GLenum target;
+    GLuint texture;
+    GLuint sampler;
+    uint32_t unit;
+  };
+  static constexpr uint32_t kMaxPendingBinds = 64;
+  PendingBind pending_binds_[kMaxPendingBinds];
+  uint32_t pending_binds_count_ = 0;
 
   const RegisterFile& regs_;
   memory::Memory& memory_;
