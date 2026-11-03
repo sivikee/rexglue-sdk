@@ -29,6 +29,7 @@
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
+#include <rex/kernel/xam/module.h>
 #include <rex/string/numeric.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
@@ -264,6 +265,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
     if (input_sys) {
       input_sys->SetActiveCallback([this]() {
+        if (rex::kernel::xam::xeXamIsUIActive()) return false;
         if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
           return true;
         return !imgui_drawer_->GetIO().WantCaptureMouse;

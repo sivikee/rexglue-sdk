@@ -446,6 +446,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     };
     result = xeXamDispatchHeadless(run, overlapped.guest_address());
   } else {
+#if !REX_PLATFORM_IOS
     auto close = [buffer, buffer_length](KeyboardInputDialog* dialog, uint32_t& extended_error,
                                          uint32_t& length) -> X_RESULT {
       if (dialog->cancelled()) {
@@ -463,7 +464,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     };
     const Runtime* emulator = REX_KERNEL_STATE()->emulator();
     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
-
+#endif
     // Read and convert title/description/default_text from guest memory as utf16 to utf8 strings
     std::string title_str = title
                                 ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
@@ -478,6 +479,51 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
                            REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
                      : "";
 
+#if REX_PLATFORM_IOS
+    // UIKit keeps the name field and its dismissal controls above the keyboard
+    // on compact iPhone screens without moving SDL's game/render surface.
+    auto run = [buffer, buffer_length, title_str, desc_str, def_text_str](
+                   uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+      extended_error = X_ERROR_CANCELLED;
+      length = 0;
+      auto* emulator = REX_KERNEL_STATE()->emulator();
+      auto* app_context = emulator->app_context();
+      auto* window = emulator->display_window();
+      rex::thread::Fence fence;
+      bool shown = false;
+      ++xam_dialogs_shown_;
+      if (app_context && window && app_context->CallInUIThreadSynchronous([&]() {
+            shown = window->ShowNativeTextInput(
+                title_str, desc_str, def_text_str, buffer_length ? buffer_length - 1 : 0,
+                [&](bool accepted, std::string text) {
+                  if (accepted) {
+                    rex::string::copy_and_swap_truncating(
+                        buffer, rex::string::to_utf16(text), buffer_length);
+                    extended_error = X_ERROR_SUCCESS;
+                  }
+                  fence.Signal();
+                });
+          }) && shown) {
+        fence.Wait();
+      }
+      --xam_dialogs_shown_;
+      return X_ERROR_SUCCESS;
+    };
+    auto pre = [] { REX_KERNEL_STATE()->BroadcastNotification(0x9, true); };
+    auto post = [] {
+      rex::thread::Sleep(std::chrono::milliseconds(100));
+      REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
+    };
+    if (overlapped) {
+      REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped.guest_address(), pre, post);
+      result = X_ERROR_IO_PENDING;
+    } else {
+      pre();
+      uint32_t extended_error = 0, length = 0;
+      result = run(extended_error, length);
+      post();
+    }
+#else
     if (imgui_drawer) {
       uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
@@ -496,6 +542,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
       };
       result = xeXamDispatchHeadless(run, overlapped.guest_address());
     }
+#endif
   }
   return result;
 }

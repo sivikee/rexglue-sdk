@@ -34,6 +34,11 @@ class WindowSDL final : public Window {
   void* GetNativeWindowHandle() const override;
   bool SetRelativeMouseMode(bool enable) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
+#if REX_PLATFORM_IOS
+  bool ShowNativeTextInput(const std::string& title, const std::string& description,
+                           const std::string& default_text, size_t max_length,
+                           std::function<void(bool, std::string)> completion) override;
+#endif
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);

@@ -94,6 +94,13 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 add_library(rexui OBJECT ${REXUI_SOURCES})
+if(IOS)
+    target_sources(rexui PRIVATE text_input_ios.mm)
+    set_source_files_properties(text_input_ios.mm PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc"
+        SKIP_PRECOMPILE_HEADERS ON)
+    target_link_libraries(rexui PUBLIC "-framework UIKit")
+endif()
 add_library(rex::ui ALIAS rexui)
 
 rex_target_pch(rexui <rex/math.h>)

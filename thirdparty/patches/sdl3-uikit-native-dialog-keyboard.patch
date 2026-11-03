@@ -1,0 +1,28 @@
+diff --git a/src/video/uikit/SDL_uikitviewcontroller.m b/src/video/uikit/SDL_uikitviewcontroller.m
+index ffb822d91..dd4a54e21 100644
+--- a/src/video/uikit/SDL_uikitviewcontroller.m
++++ b/src/video/uikit/SDL_uikitviewcontroller.m
+@@ -534,6 +534,11 @@ - (bool)stopTextInput
+ 
+ - (void)keyboardWillShow:(NSNotification *)notification
+ {
++    /* Native UIKit dialogs have their own text fields. Their keyboard must not
++     * resize/pan the SDL render view or restart SDL's hidden text field. */
++    if (!textFieldFocused) {
++        return;
++    }
+ #ifndef SDL_PLATFORM_TVOS
+     CGRect kbrect = [[notification userInfo][UIKeyboardFrameEndUserInfoKey] CGRectValue];
+ 
+@@ -554,6 +559,11 @@ - (void)keyboardWillShow:(NSNotification *)notification
+ 
+ - (void)keyboardWillHide:(NSNotification *)notification
+ {
++    /* Still restore the view when SDL stopped input before its keyboard hid,
++     * but ignore hide notifications for keyboards SDL never owned. */
++    if (!textFieldFocused && !keyboardHeight) {
++        return;
++    }
+     hidingKeyboard = YES;
+     [self setKeyboardHeight:0];
+ 

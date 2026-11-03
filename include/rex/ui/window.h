@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -322,6 +323,14 @@ class Window {
   // windows and the on screen keyboard during button-only gameplay.
   bool IsTextInputActive() const { return text_input_active_; }
   void SetTextInputActive(bool active);
+
+  // UI thread only. On success, calls completion once after dismissal with
+  // (accepted, UTF-8 text). False means no dialog was presented.
+  virtual bool ShowNativeTextInput(const std::string& /*title*/, const std::string& /*description*/,
+                                   const std::string& /*default_text*/, size_t /*max_length*/,
+                                   std::function<void(bool, std::string)> /*completion*/) {
+    return false;
+  }
 
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
